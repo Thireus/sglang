@@ -1400,7 +1400,18 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        # Consumer Blackwell (SM120/121) allows ~101 KB of dynamic shared memory per
+        # block, far below the ~170-207 KB the stock tile requests; the smaller tile
+        # is the one validated on GB10 / RTX PRO 6000 (LibertAIDAI/GLM-5.3-Flash-NVFP4
+        # card) and on the RTX 5090 (rel err 2e-3 vs a float32 reference).
+        # v1 (NoPE, tail_dim == 0) only: v2 has no num_stages/threads/heads_per_block.
+        tile = {}
+        if tail_dim == 0 and torch.cuda.get_device_capability(q.device)[0] == 12:
+            # 64 heads/rank misses the ceiling by ~2 KB without heads_per_block=32
+            tile = dict(block_I=32, num_stages=1, threads=128, heads_per_block=32)
+        kernel = kernel_factory(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **tile
+        )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
