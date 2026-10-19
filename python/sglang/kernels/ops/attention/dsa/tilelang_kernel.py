@@ -1050,23 +1050,39 @@ def sparse_mla_fwd_decode_partial_fp8(
                 for bi_i in T.Parallel(BI):
                     idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
                     valid = idx >= 0
-                    page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
+                    # Masked slots keep -1 and load zeros, as the BF16 kernel
+                    # does. Loading row 0 for them let a non-finite value there
+                    # (CUDA-graph padding rows write it) turn the -inf mask NaN.
+                    page_idx_shared[bi_i] = T.if_then_else(valid, idx, -1)
                     mask[bi_i] = valid
 
                 for bi_i, j in T.Parallel(BI, group_size):
                     page = page_idx_shared[bi_i]
-                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, j]
-                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, group_size + j]
+                    row = T.if_then_else(page >= 0, page, 0)
+                    zero = T.cast(0, fp8_dtype)
+                    kv_tile0[bi_i, j] = T.if_then_else(
+                        page >= 0, kv_fp8[b_i, row, g_i, j], zero
+                    )
+                    kv_tile1[bi_i, j] = T.if_then_else(
+                        page >= 0, kv_fp8[b_i, row, g_i, group_size + j], zero
+                    )
                     if num_main_tiles == 4:
-                        kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
-                        kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
+                        kv_tile2[bi_i, j] = T.if_then_else(
+                            page >= 0, kv_fp8[b_i, row, g_i, 2 * group_size + j], zero
+                        )
+                        kv_tile3[bi_i, j] = T.if_then_else(
+                            page >= 0, kv_fp8[b_i, row, g_i, 3 * group_size + j], zero
+                        )
 
                 if has_tail:
                     for bi_i, j in T.Parallel(BI, d_tail):
                         page = page_idx_shared[bi_i]
-                        k_tail_shared[bi_i, j] = kv_fp8[
-                            b_i, page, g_i, rope_offset_fp8 + j
-                        ]
+                        row = T.if_then_else(page >= 0, page, 0)
+                        k_tail_shared[bi_i, j] = T.if_then_else(
+                            page >= 0,
+                            kv_fp8[b_i, row, g_i, rope_offset_fp8 + j],
+                            T.cast(0, fp8_dtype),
+                        )
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
