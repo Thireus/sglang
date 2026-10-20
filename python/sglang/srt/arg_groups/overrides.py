@@ -635,7 +635,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {}
     model_arch = hf_config.architectures[0]
     is_glm_sm12_fp8 = (
-        model_arch == "GlmMoeDsaForCausalLM"
+        model_arch
+        in (
+            "GlmMoeDsaForCausalLM",
+            "GlmMoeDsaForCausalLMNextN",
+            "Glm5NextForConditionalGeneration",
+            "Glm5NextForConditionalGenerationNextN",
+        )
         and major == 12
         and kv_cache_dtype == "fp8_e4m3"
         and not get_platform().is_hip
@@ -671,6 +677,22 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         logger.warning(
             "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
             f"prefill={backend}, decode={backend}."
+        )
+        prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
+        decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        if (prefill, decode) != (backend, backend):
+            logger.warning(
+                "Explicit DSA backends kept for GLM FP8 KV Cache on SM120/SM121: "
+                f"prefill={prefill}, decode={decode}."
+            )
+        # An explicit raw-layout TileLang pair still goes through the shared
+        # backend/kv-cache-dtype rules.
+        _check_dsa_backend_constraints(
+            kv_cache_dtype,
+            prefill,
+            decode,
+            hip=False,
+            dcp_size=getattr(view, "dcp_size", 1) or 1,
         )
         return declared
 
