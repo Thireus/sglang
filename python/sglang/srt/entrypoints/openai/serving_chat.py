@@ -1474,6 +1474,8 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         elif self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
+            if self._closes_opened_reasoning(request):
+                self._close_opened_reasoning(result)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
@@ -2417,8 +2419,8 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.reasoning_parser and request.separate_reasoning:
                 force_reasoning = (
                     self.template_manager.force_reasoning
-                    or self._get_reasoning_from_request(request)
-                )
+                    and not self._closes_opened_reasoning(request)
+                ) or self._get_reasoning_from_request(request)
                 try:
                     parser = ReasoningParser(
                         model_type=self.reasoning_parser,
@@ -2786,8 +2788,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
-                or self._get_reasoning_from_request(request)
-            )
+                and not self._closes_opened_reasoning(request)
+            ) or self._get_reasoning_from_request(request)
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
                 request.stream_reasoning,
@@ -2949,10 +2951,18 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         if is_always_on:
             if not enabled:
-                raise ValueError(
-                    f"Reasoning parser '{self.reasoning_parser}' is always-on "
-                    f"and cannot be disabled via Anthropic thinking"
-                )
+                if not self._generation_prompt_opens_reasoning():
+                    raise ValueError(
+                        f"Reasoning parser '{self.reasoning_parser}' is always-on "
+                        f"and cannot be disabled via Anthropic thinking"
+                    )
+                # The template opens the reasoning block itself (GLM-5.3 ends
+                # its generation prompt with <think>): close it right away.
+                # enable_thinking=False keeps the GLM tool-call grammar in step.
+                chat_template_kwargs = dict(request.chat_template_kwargs or {})
+                chat_template_kwargs["enable_thinking"] = False
+                request.chat_template_kwargs = chat_template_kwargs
+                request._close_opened_reasoning = True
             return
 
         toggle_param = self._get_reasoning_toggle_param()
@@ -2980,6 +2990,63 @@ class OpenAIServingChat(OpenAIServingBase):
         chat_template_kwargs[toggle_param] = enabled
         request.chat_template_kwargs = chat_template_kwargs
 
+    def _generation_prompt_opens_reasoning(self) -> bool:
+        """Whether the Jinja chat template ends its generation prompt with the
+        reasoning parser's start token (GLM-5.3: ``<|assistant|><think>``).
+
+        Such a template has no toggle of its own; reasoning can only be turned
+        off by closing the block it opened. Rendered once and cached.
+        """
+        cached = getattr(self, "_gen_prompt_opens_reasoning", None)
+        if cached is not None:
+            return cached
+        opens = False
+        detector = getattr(self, "_reasoning_detector", None)
+        if (
+            detector is not None
+            and getattr(self, "chat_encoding_spec", None) is None
+            and self.template_manager.chat_template_name is None
+        ):
+            try:
+                rendered = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": "x"}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                opens = isinstance(rendered, str) and rendered.endswith(
+                    detector.think_start_token
+                )
+            except Exception:
+                opens = False
+        self._gen_prompt_opens_reasoning = opens
+        return opens
+
+    @staticmethod
+    def _closes_opened_reasoning(request: ChatCompletionRequest) -> bool:
+        """Set by ``apply_reasoning_enabled(request, False)`` on an always-on
+        template that opens the reasoning block in its generation prompt."""
+        return bool(getattr(request, "_close_opened_reasoning", False))
+
+    def _close_opened_reasoning(self, result: MessageProcessingResult) -> None:
+        """Append the reasoning end token to a prompt that ends with the start
+        token, so the model answers at once and the output is content."""
+        start = self._reasoning_detector.think_start_token
+        end = self._reasoning_detector.think_end_token
+        tokenizer = self.tokenizer_manager.tokenizer
+        start_ids = list(tokenizer.encode(start, add_special_tokens=False))
+        end_ids = list(tokenizer.encode(end, add_special_tokens=False))
+        if isinstance(result.prompt, str) and result.prompt.endswith(start):
+            result.prompt = result.prompt + end
+        ids = result.prompt_ids
+        if isinstance(ids, str) and ids.endswith(start):
+            result.prompt_ids = ids + end
+        elif (
+            isinstance(ids, list)
+            and start_ids
+            and list(ids[-len(start_ids) :]) == start_ids
+        ):
+            result.prompt_ids = list(ids) + end_ids
+
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.
 
@@ -2992,6 +3059,9 @@ class OpenAIServingChat(OpenAIServingBase):
             return IQuestQ1ReasoningDetector.thinking_enabled(
                 request.chat_template_kwargs or {}
             )
+
+        if self._closes_opened_reasoning(request):
+            return False
 
         if self.reasoning_parser == "minimax-m3":
             # M3 template prefills <mm:think> for thinking_mode=enabled, so it never

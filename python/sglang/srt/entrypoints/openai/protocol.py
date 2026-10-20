@@ -1001,6 +1001,11 @@ class ChatCompletionRequest(PDRoutingFields):
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
+    # Not an API field: set by OpenAIServingChat.apply_reasoning_enabled when a
+    # /v1/messages thinking={"type": "disabled"} meets a template that opens
+    # the reasoning block itself; the prompt then gets the end token appended.
+    _close_opened_reasoning: bool = False
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
