@@ -566,7 +566,9 @@ class MambaComponent(TreeComponent):
         # None means donate nothing, not "no slot found".
         pool = self.cache.req_to_token_pool
         keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
-        cache_len = req.kv.mamba_last_track_seqlen or 0
+        cache_len = req.kv.mamba_last_track_seqlen
+        if cache_len is None:
+            cache_len = self._untracked_finish_len(req, token_ids_len)
 
         if cache_len <= token_ids_len:
             return cache_len, keep_idx
@@ -581,6 +583,40 @@ class MambaComponent(TreeComponent):
         ):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
+
+    def _untracked_finish_len(self, req: Req, token_ids_len: int) -> int:
+        """Insert length for a finished request that tracked no state of its own.
+
+        Its extend and decode stayed below the checkpoint grid, so it has no state
+        to donate and used to insert nothing. Then a reuse of a matched prefix was
+        never counted, and under write_through_selective a prefix whose every reuse
+        adds fewer than a grid of tokens never reached the host tier. Re-walking the
+        matched prefix counts the reuse; the insert ends on the matched node, whose
+        state wins (mamba_exist), so the untracked slot is never attached. Taken only
+        when that node ends exactly at cache_protected_len and still holds a device
+        state (it can be evicted under SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK); else 0.
+        """
+        protected = req.kv.cache_protected_len
+        node_id = req.last_node
+        if (
+            protected <= 0
+            or protected > token_ids_len
+            or protected % self.mamba_checkpoint_grid != 0
+            or not isinstance(node_id, int)
+        ):
+            return 0
+        tree_core = self.tree_core
+        try:
+            node = tree_core.node_by_id(node_id)
+        except (KeyError, IndexError):
+            return 0
+        if node.component_data[self.component_type].value is None:
+            return 0
+        depth = 0
+        while node is not None and node.parent is not None:
+            depth += len(node.key) if node.key is not None else 0
+            node = node.parent
+        return protected if depth == protected else 0
 
     def prepare_for_caching_req(
         self,
