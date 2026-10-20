@@ -439,6 +439,25 @@ def can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
+@with_nvml_context
+def _physical_device_ids(entries: Sequence[str]) -> List[int]:
+    """Physical device indices for the entries of CUDA_VISIBLE_DEVICES.
+
+    The variable may carry indices or GPU UUIDs (``GPU-xxxx``, ``MIG-xxxx``),
+    and the NVLink and P2P checks below want indices. A UUID is resolved
+    through NVML.
+    """
+    ids = []
+    for entry in entries:
+        entry = entry.strip()
+        if entry.lstrip("-").isdigit() or not _is_cuda:
+            ids.append(int(entry))
+        else:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(entry)
+            ids.append(int(pynvml.nvmlDeviceGetIndex(handle)))
+    return ids
+
+
 def can_use_custom_all_reduce_with_nvlink(
     group: torch.distributed.ProcessGroup,
     device: torch.device,
@@ -474,7 +493,7 @@ def can_use_custom_all_reduce_with_nvlink(
 
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
+        device_ids = _physical_device_ids(cuda_visible_devices.split(","))
     else:
         device_ids = list(range(torch.cuda.device_count()))
     physical_device_id = device_ids[device.index]
