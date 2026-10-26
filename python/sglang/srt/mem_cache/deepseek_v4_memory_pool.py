@@ -92,9 +92,14 @@ def resolve_compress_state_ring_size(compress_ratio: int) -> int:
 
 
 def collect_sources_by_ratio(
-    compression_ratios: Sequence[int], kv_source_layers: Sequence[int], stage: range
+    compression_ratios: Sequence[int],
+    kv_source_layers: Sequence[int],
+    stage: range,
+    replayed: Sequence[int] = (),
 ) -> dict[int, List[int]]:
-    """Layers owning compressed storage: all of ratios 4/128, kv_sources of 1/2."""
+    """Layers owning compressed storage: all of ratios 4/128, kv_sources of 1/2.
+    ``replayed`` are kv_sources of earlier pipeline stages this stage keeps a copy
+    of (deepseek_v41_pp_sources); they own storage here as well."""
     for idx in stage:
         ratio = compression_ratios[idx]
         if ratio not in (0, 1, 2, 4, 128):
@@ -106,7 +111,7 @@ def collect_sources_by_ratio(
             layers = [
                 l
                 for l in kv_source_layers
-                if l in stage and compression_ratios[l] == ratio
+                if (l in stage or l in replayed) and compression_ratios[l] == ratio
             ]
         else:
             layers = [l for l in stage if compression_ratios[l] == ratio]
@@ -977,6 +982,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        replayed_layers: Sequence[int] = (),
     ):
         super().__init__(
             swa_size,
@@ -1273,10 +1279,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         self.full_size = full_size
         self.kv_source_layers = list(kv_source_layers)
+        # Ratio-1/2 producers of earlier pipeline stages this stage replays.
+        self.replayed_layers = tuple(
+            sorted(l for l in replayed_layers if self.compression_ratios[l] in (1, 2))
+        )
         self.sources_by_ratio = collect_sources_by_ratio(
             self.compression_ratios,
             self.kv_source_layers,
             range(self._stage_start, self._stage_end),
+            self.replayed_layers,
         )
         self._init_compressed_pools(
             stage_ratios=stage_ratios,
@@ -1783,6 +1794,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             online=False,
         )
 
+    def _mapped_layers(self) -> List[int]:
+        """This stage's layers and the earlier-stage producers it replays."""
+        stage = range(self._stage_start, self._stage_end)
+        replayed = getattr(self, "replayed_layers", ())
+        return sorted(set(stage) | {l for l in replayed if l not in stage})
+
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         total_L = len(self.compression_ratios)
         self.compress_state_pools: List[Optional[CompressStatePool]] = [None] * total_L
@@ -1790,7 +1807,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             None
         ] * total_L
 
-        for idx in range(self._stage_start, self._stage_end):
+        for idx in self._mapped_layers():
             ratio = self.compression_ratios[idx]
             if ratio in (0, 1):
                 continue
@@ -1829,7 +1846,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         total_L = len(self.compression_ratios)
         self.layer_mapping: List[Optional[DeepSeekV4LayerItem]] = [None] * total_L
 
-        for idx in range(self._stage_start, self._stage_end):
+        for idx in self._mapped_layers():
             ratio = self.compression_ratios[idx]
             if ratio not in layer_counts:
                 raise ValueError(f"Unsupported compression ratio: {ratio}")

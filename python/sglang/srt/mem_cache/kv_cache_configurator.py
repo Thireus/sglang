@@ -2057,6 +2057,16 @@ class KVCacheConfigurator:
         else:
             compression_ratios = self.model_config.compress_ratios
             kv_source_layers = list(self.model_config.hf_config.kv_source_layer_ids)
+        replayed_layers = ()
+        if not self.is_draft_worker and self.pp_size > 1:
+            from sglang.srt.mem_cache.deepseek_v41_pp_sources import (
+                replayed_sources_of,
+            )
+
+            replayed_layers = replayed_sources_of(
+                self.model_config.hf_config,
+                range(self.layer_info.start_layer, self.layer_info.end_layer),
+            )
 
         # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
         # follows the same fixed ring ownership as GPU. Do not replace the
@@ -2112,6 +2122,7 @@ class KVCacheConfigurator:
             kv_source_layers=kv_source_layers,
             full_size=full_max_total_num_tokens,
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
+            **({"replayed_layers": replayed_layers} if replayed_layers else {}),
             **kv_layout_kwargs,
         )
         if not self.is_draft_worker and token_to_kv_pool._unified_kv:
