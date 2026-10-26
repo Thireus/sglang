@@ -115,6 +115,21 @@ def resolve_pp_proxy_dspark_hidden_size(
 
 
 @runtime_checkable
+class _SupportsPPProxyExtraTensors(Protocol):
+    def get_pp_proxy_extra_tensors(self) -> dict: ...
+
+
+def resolve_pp_proxy_extra_tensors(*, model: Any, pp_size: int, pp_rank: int) -> dict:
+    """{key: (width, dtype or None)} of the tensors a non-first PP stage receives
+    beside the ones every model sends (hidden_states, residual, ...)."""
+    if pp_size <= 1 or pp_rank == 0:
+        return {}
+    if isinstance(model, _SupportsPPProxyExtraTensors):
+        return dict(model.get_pp_proxy_extra_tensors())
+    return {}
+
+
+@runtime_checkable
 class _SupportsPackedAuxHiddenStates(Protocol):
     def get_aux_hidden_states_width(self) -> int: ...
 

@@ -98,7 +98,10 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 )
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import CUDA_GRAPH_CAPTURE_FAILED_MSG
-from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
+from sglang.srt.model_executor.runner_utils.buffers import (
+    DecodeInputBuffers,
+    pp_proxy_extra_of,
+)
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
     capture_lora_variant,
@@ -499,6 +502,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            pp_proxy_extra=pp_proxy_extra_of(self.model_runner),
             aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
         # The early verify metadata writes these slots beside the draft graph, which

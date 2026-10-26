@@ -116,6 +116,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
+    pp_proxy_extra_of,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
@@ -455,6 +456,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            pp_proxy_extra=pp_proxy_extra_of(self.model_runner),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers

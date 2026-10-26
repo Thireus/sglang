@@ -3418,6 +3418,10 @@ class DeepseekV4AttnBackend(
         run_indexer: bool = True,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention."""
+        tap = getattr(layer, "pp_source_tap", None)
+        if tap is not None:
+            # A later pipeline stage replays this producer from these inputs.
+            tap.record(x, q_lora)
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.encoder_swa_replay:

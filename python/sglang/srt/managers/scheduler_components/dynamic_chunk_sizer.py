@@ -133,6 +133,7 @@ class DynamicChunkSizer:
     def _profile_prefill_latency(self) -> Tuple[List[int], List[float]]:
         from sglang.srt.model_executor.runner_utils.buffers import (
             allocate_pp_proxy_tensors,
+            pp_proxy_extra_of,
         )
 
         seq_lens: List[int] = []
@@ -214,6 +215,7 @@ class DynamicChunkSizer:
                     pp_proxy_residual_num_blocks=(
                         model_runner.get_pp_proxy_residual_num_blocks()
                     ),
+                    pp_proxy_extra=pp_proxy_extra_of(model_runner),
                 )
 
             pp_proxy = PPProxyTensors(proxy_tensors)

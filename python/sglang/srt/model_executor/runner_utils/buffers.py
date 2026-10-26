@@ -64,6 +64,13 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
+def pp_proxy_extra_of(model_runner) -> dict:
+    """The extra PP proxy buffers a runner's model receives (ModelRunner.
+    get_pp_proxy_extra_tensors); {} for a runner without the hook."""
+    get = getattr(model_runner, "get_pp_proxy_extra_tensors", None)
+    return get() if get is not None else {}
+
+
 def allocate_pp_proxy_tensors(
     *,
     max_num_tokens: int,
@@ -74,8 +81,11 @@ def allocate_pp_proxy_tensors(
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     pp_proxy_dspark_hidden_size: int = 0,
+    pp_proxy_extra: Optional[Dict[str, Tuple[int, Optional[torch.dtype]]]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Allocate the stable buffers consumed by an incoming PP proxy."""
+    """Allocate the stable buffers consumed by an incoming PP proxy.
+    ``pp_proxy_extra`` maps further keys a model receives to (width, dtype), a
+    None dtype meaning the model dtype (get_pp_proxy_extra_tensors)."""
     is_mhc = hc_hidden_size is not None
     pp_hidden_size = hc_hidden_size if is_mhc else hidden_size
     pp_proxy_tensors = {
@@ -99,6 +109,10 @@ def allocate_pp_proxy_tensors(
     if pp_proxy_dspark_hidden_size:
         pp_proxy_tensors["dspark_hidden_states"] = torch.zeros(
             (max_num_tokens, pp_proxy_dspark_hidden_size), dtype=dtype
+        )
+    for key, (width, key_dtype) in (pp_proxy_extra or {}).items():
+        pp_proxy_tensors[key] = torch.zeros(
+            (max_hidden_tokens, width), dtype=key_dtype or dtype
         )
     return pp_proxy_tensors
 
@@ -152,6 +166,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
+        pp_proxy_extra: Optional[Dict[str, Tuple[int, Optional[torch.dtype]]]] = None,
         aux_hidden_states_width: int = 0,
     ) -> DecodeInputBuffers:
         with torch.device(device):
@@ -196,6 +211,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
                     pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,
+                    pp_proxy_extra=pp_proxy_extra,
                 )
                 if pp_size > 1
                 else None
@@ -301,6 +317,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
+        pp_proxy_extra: Optional[Dict[str, Tuple[int, Optional[torch.dtype]]]] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -344,6 +361,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
                     pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,
+                    pp_proxy_extra=pp_proxy_extra,
                 )
                 if pp_size > 1 and not is_first_pp_rank
                 else None
