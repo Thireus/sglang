@@ -23,22 +23,28 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     model_arch = hf_config.architectures[0]
     overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
 
-    # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks on SM100/SM103;
-    # explicit backend choices, including Triton, take precedence.
+    # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks on SM100/SM103 and
+    # SM12x; explicit backend choices, including Triton, take precedence.
     quant = getattr(hf_config, "quantization_config", None) or {}
-    if (
+    mxfp8_blocks = (
         getattr(hf_config, "model_type", None) == "deepseek_v41"
         and cfg.device == "cuda"
         and not get_platform().is_hip
-        and get_platform().is_sm100
         and cfg.fp8_gemm_runner_backend == "auto"
         and quant.get("quant_method") == "fp8"
         and quant.get("weight_block_size") == [32, 32]
         and quant.get("scale_fmt") == "ue8m0"
         and is_flashinfer_available()
-    ):
+    )
+    if mxfp8_blocks and get_platform().is_sm100:
         overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
         logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
+    elif mxfp8_blocks and get_platform().is_sm120:
+        # SM12x auto resolves to cutlass, which has no 32-wide block kernel and
+        # leaves these linears on the Triton block-fp8 fallback; FlashInfer's
+        # CUTLASS MXFP8 GEMM takes them with 1-D swizzled scales.
+        overrides["fp8_gemm_runner_backend"] = "flashinfer_cutlass"
+        logger.info("Use flashinfer_cutlass for DeepSeek-V4.1 MXFP8 dense GEMMs.")
 
     # Left unset, the pool configurator sizes the SWA pool from the request cap.
     if (
