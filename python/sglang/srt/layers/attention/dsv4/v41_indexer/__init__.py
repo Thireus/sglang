@@ -62,6 +62,16 @@ def _use_deep_gemm_prefill() -> bool:
     return is_sm100_or_newer() and has_dense_fp4_indexer()
 
 
+def _use_deep_gemm_decode() -> bool:
+    # SM12x decodes the full top-k from the Triton paged scores, as the candidate
+    # layers do: the low-ratio decode metadata carries no DeepGEMM schedule there
+    # (SGLANG_FP8_PAGED_MQA_LOGITS_TORCH is on), and DeepGEMM's SM12x FP4 paged
+    # kernel splits the KV at 128 where the JIT planner encodes 256.
+    from sglang.srt.runtime_context import get_platform
+
+    return is_sm100_or_newer() and not get_platform().is_sm120
+
+
 def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
@@ -71,7 +81,7 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=_use_deep_gemm_decode(),
     )
 
 
