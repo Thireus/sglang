@@ -638,6 +638,9 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
+        # The scheduler clears this when the running batch is at its request
+        # cap: the last chunk would merge the chunked request into it.
+        self.chunked_req_can_finish = True
         self.dllm_config = dllm_config
         # Mamba checkpoints only land on page-aligned chunk ends.
         self.exact_chunk_fill = (
@@ -1179,6 +1182,9 @@ class PrefillAdder:
         if _rem_tokens is None:
             return req
         truncated = cand_extend_input_len > _rem_tokens
+        if not truncated and not self.chunked_req_can_finish:
+            # Park the last chunk until a running batch has room for the request.
+            return req
         new_len = self.floor_chunked_tokens(
             min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
         )
