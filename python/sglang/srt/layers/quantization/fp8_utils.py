@@ -930,8 +930,144 @@ def can_serve_block_fp8_as_mxfp8(
     return not resolve_block_fp8_mxfp8_backend().is_unsupported()
 
 
+# FlashInfer's b12x GEMM (0.7.2) refills a pipeline slot by TMA, an async-proxy write, as
+# soon as the MMA warps have released it, but they read the slot with ldmatrix through the
+# generic proxy and no fence.proxy.async orders those reads before the refill. With other
+# work on the GPU the refill can land before the slot's last k-block is read: a whole tile
+# comes out wrong, at random (greedy drift on DeepSeek-V4.1). A copy of the kernel module with
+# that one fence, after the TMA producer's empty-slot wait, sits beside this file; it replaces
+# FlashInfer's module only when that module is the exact file the copy was made from.
+_B12X_KERNEL_MODULE = "flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x"
+_B12X_KERNEL_SHA256 = "6739702e27afad21767b71024678b35c6892e3f9c74aaff375fb3f6734399f86"
+_B12X_FENCED_COPY = "flashinfer_b12x_sm120_fenced.py"
+_B12X_PRODUCER_ACQUIRE = "mainloop_pipeline.producer_acquire(mainloop_producer_state)"
+_B12X_REFILL_FENCE = 'cute.arch.fence_proxy("async.shared", space="cta")'
+
+
+def _b12x_refill_is_fenced(source: str) -> bool:
+    """Whether the statement right after the TMA producer's empty-slot wait is the fence."""
+    lines = [line.strip() for line in source.splitlines()]
+    hits = [i for i, line in enumerate(lines) if line == _B12X_PRODUCER_ACQUIRE]
+    return (
+        len(hits) == 1
+        and hits[0] + 1 < len(lines)
+        and lines[hits[0] + 1] == _B12X_REFILL_FENCE
+    )
+
+
+@lru_cache(maxsize=1)
+def _install_b12x_refill_fence() -> str:
+    """Make FlashInfer build its b12x GEMMs from a kernel module that fences the slot
+    refill. Returns "flashinfer" when FlashInfer's own module does, "copy" when the fenced
+    copy now stands in for it, "" when neither (b12x must not be used)."""
+    import hashlib
+    import importlib
+    import importlib.util
+    import os
+    import sys
+
+    try:
+        stock = importlib.import_module(_B12X_KERNEL_MODULE)
+        with open(stock.__file__, "rb") as f:
+            data = f.read()
+    except Exception:
+        return ""
+    if _b12x_refill_is_fenced(data.decode("utf-8", "replace")):
+        return "flashinfer"
+    if hashlib.sha256(data).hexdigest() != _B12X_KERNEL_SHA256:
+        return ""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _B12X_FENCED_COPY)
+    try:
+        with open(path, encoding="utf-8") as f:
+            if not _b12x_refill_is_fenced(f.read()):
+                return ""
+        spec = importlib.util.spec_from_file_location(_B12X_KERNEL_MODULE, path)
+        fenced = importlib.util.module_from_spec(spec)
+        sys.modules[_B12X_KERNEL_MODULE] = fenced
+        spec.loader.exec_module(fenced)
+    except Exception:
+        sys.modules[_B12X_KERNEL_MODULE] = stock
+        return ""
+    package, _, name = _B12X_KERNEL_MODULE.rpartition(".")
+    if package in sys.modules:
+        setattr(sys.modules[package], name, fenced)
+    try:
+        # Nothing compiled from the unfenced module may be reused.
+        from flashinfer.gemm import gemm_mm_mxfp8_cute_dsl
+
+        gemm_mm_mxfp8_cute_dsl._B12X_MM_MXFP8_KERNEL_CACHE.clear()
+    except (ImportError, AttributeError):
+        pass
+    return "copy"
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_b12x_mxfp8_usable() -> bool:
+    """Whether FlashInfer's b12x MXFP8 GEMM can run on this device. FlashInfer's
+    is_backend_supported checks only the compute capability (SM120/SM121); the
+    kernel also needs CUDA 13+ and nvidia-cutlass-dsl >= 4.6.0 and raises on its
+    first call without them, and it must fence its slot refill (see
+    _install_b12x_refill_fence), so those are checked here once and CUTLASS is kept
+    when one is missing."""
+    sm = get_device_sm()
+    if not _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", sm):
+        return False
+    try:
+        from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
+        from flashinfer.jit.cpp_ext import get_cuda_version
+    except ImportError:
+        # Another FlashInfer layout: rely on its capability check alone.
+        cuda_ok = dsl_ok = True
+    else:
+        try:
+            cuda_ok = get_cuda_version().major >= 13
+        except Exception:
+            cuda_ok = False
+        dsl_ok = bool(_b12x_mxfp8_dsl_supported())
+    if cuda_ok and dsl_ok:
+        fence = _install_b12x_refill_fence()
+        if not fence:
+            logger.warning(
+                "FlashInfer b12x MXFP8 GEMM unavailable on SM%d: its kernel module is "
+                "neither fenced nor the FlashInfer 0.7.2 file the fenced copy was made "
+                "from, and unfenced it can refill a pipeline slot before reading it; "
+                "block-fp8-as-MXFP8 linears stay on CUTLASS.",
+                sm,
+            )
+            return False
+        logger.info(
+            "Use FlashInfer b12x for block-fp8-as-MXFP8 linears with K %% 128 == 0 "
+            "on SM%d; CUTLASS for other K.",
+            sm,
+        )
+        logger.info(
+            "FlashInfer b12x slot refill fenced after the MMA warps' reads (%s).",
+            "FlashInfer's own kernel" if fence == "flashinfer" else "fenced copy, 028b",
+        )
+        return True
+    logger.warning(
+        "FlashInfer b12x MXFP8 GEMM unavailable on SM%d (CUDA 13+: %s, "
+        "nvidia-cutlass-dsl >= 4.6.0: %s); block-fp8-as-MXFP8 linears stay on CUTLASS.",
+        sm,
+        cuda_ok,
+        dsl_ok,
+    )
+    return False
+
+
+def _b12x_or_cutlass_mxfp8_linear(input, weight, *args, pin_tactic=True, **kwargs):
+    # SM12x: b12x has small-M tiles and beats CUTLASS at every M, but needs
+    # K % 128 == 0. pin_tactic stays overridable, as in the partials below.
+    backend = "b12x" if weight.shape[1] % 128 == 0 else "cutlass"
+    return flashinfer_mxfp8_blockscaled_linear(
+        input, weight, *args, backend=backend, pin_tactic=pin_tactic, **kwargs
+    )
+
+
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
+    if backend.is_flashinfer_cutlass() and _flashinfer_b12x_mxfp8_usable():
+        return _b12x_or_cutlass_mxfp8_linear
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
