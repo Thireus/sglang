@@ -279,6 +279,25 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
     )
 
 
+def sort_selection_(selection: torch.Tensor, lens: torch.Tensor) -> None:
+    """Sort in place each row of ``selection`` ``[rows, k]`` that chose among more
+    than ``k`` positions (``lens > k``): ascending, the ``-1`` padding last.
+
+    The top-k kernels leave such a row in no fixed order (top-k v2 in the order
+    its threads claim output slots, which changes from launch to launch), and
+    the sparse attention reads the list in order, a tile at a time, so the order
+    changes its output. Sorting only permutes a row: the selected set stays. A
+    row with at most ``k`` positions holds all of them in the order it was
+    written and is left as it is."""
+    if selection.numel() == 0:
+        return
+    pad = torch.iinfo(selection.dtype).max
+    key = selection.masked_fill(selection < 0, pad).sort(dim=-1).values
+    key.masked_fill_(key == pad, -1)
+    longer = (lens > selection.shape[1])[:, None]
+    selection.copy_(torch.where(longer, key, selection))
+
+
 def topk_ragged(
     logits: torch.Tensor,
     lens: torch.Tensor,
@@ -287,7 +306,8 @@ def topk_ragged(
     offsets: torch.Tensor,
 ) -> None:
     """Top-k of each row's first ``lens`` columns plus ``offsets`` into ``out``,
-    ``-1`` padded, unordered: DeepSelect for bf16 logits, top-k v2 for fp32."""
+    ``-1`` padded, each row ascending: DeepSelect for bf16 logits, top-k v2 for
+    fp32, whose rows are sorted after the kernel."""
     if logits.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.deep_select import topk
 
@@ -295,6 +315,7 @@ def topk_ragged(
             logits,
             out.shape[1],
             end=lens,
+            sorted_index=True,
             output_idx=out,
             output_idx_offset=offsets,
             idx_oob_fill_value=-1,
@@ -303,6 +324,7 @@ def topk_ragged(
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
     topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
+    sort_selection_(out, lens)
 
 
 def dense_prefill_topk(
@@ -311,7 +333,8 @@ def dense_prefill_topk(
     *,
     out: torch.Tensor,
 ) -> None:
-    """Request-local compressed positions into ``out``, ``-1`` padded, unordered."""
+    """Request-local compressed positions into ``out``, ``-1`` padded, each row
+    ascending."""
     # Score columns are request-relative, so a zero offset emits request-local positions.
     zero_offsets = torch.zeros_like(data.request_starts)
     for tile, logits in score_tiles(data, kv):

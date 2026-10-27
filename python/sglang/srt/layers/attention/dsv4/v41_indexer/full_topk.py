@@ -144,7 +144,7 @@ class FullTopKIndexer:
                 page_table=metadata.page_table[: d.bs],
                 page_size=metadata.compressed_page_size,
                 end=d.lens.to(torch.int32),
-                sorted_index=False,
+                sorted_index=True,
                 output_idx=inputs.out_page_indices[: d.bs],
             )
             return
