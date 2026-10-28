@@ -1120,8 +1120,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
         # Layers of this stage that own compressed storage, per ratio. Same rule
         # as the pool, so a ratio budgeted here is one it allocates.
+        # Under PP a stage also keeps the earlier-stage kv_sources it replays.
+        replayed = ()
+        if kvc.pp_size > 1 and not kvc.is_draft_worker:
+            from sglang.srt.mem_cache.deepseek_v41_pp_sources import (
+                replayed_sources_of,
+            )
+
+            replayed = replayed_sources_of(cfg.hf_config, stage)
         self.stage_owner_layers = collect_sources_by_ratio(
-            cfg.compress_ratios, cfg.hf_config.kv_source_layer_ids, stage
+            cfg.compress_ratios, cfg.hf_config.kv_source_layer_ids, stage, replayed
         )
         self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
         self.swa_ratio = (
