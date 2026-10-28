@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -6,8 +8,15 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
-from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
+from sglang.srt.layers.attention.dsv4 import v41_indexer
+from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+    BlockIds,
+    DenseBlocksBackend,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer.types import get_tail_row_indices
+from sglang.srt.layers.deep_gemm_wrapper import configurer
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -114,6 +123,97 @@ class TestBlockIdsTail(CustomTestCase):
             ).tolist(),
             [3, 4, 5, 6, 7],
         )
+
+
+class TestCandidateIndexerGating(CustomTestCase):
+    """SM12x has no DeepGEMM paged sparse MQA logits; backend init must give it
+    the dense-blocks scheme, not fail, while SM100 without them still fails."""
+
+    def _make_without_sparse_logits(self, **platform):
+        with (
+            patch.object(v41_indexer, "is_sm100_or_newer", return_value=True),
+            patch.object(v41_indexer, "_use_deep_gemm_prefill", return_value=True),
+            patch.object(configurer, "DEEPGEMM_PAGED_SPARSE_MQA_LOGITS", False),
+            override_platform(**platform),
+        ):
+            return v41_indexer.make_candidate_indexer(
+                token_to_kv_pool=None,
+                req_to_token=None,
+                page_size=64,
+                candidate_topk_blocks=4,
+                candidate_block_size=8,
+            )
+
+    def test_sm12x_takes_dense_blocks(self):
+        prefill, decode = self._make_without_sparse_logits(is_sm120=True)
+        self.assertIsInstance(decode, DenseBlocksBackend)
+        self.assertIs(prefill, decode)
+
+    def test_sm100_still_requires_sparse_logits(self):
+        with self.assertRaisesRegex(RuntimeError, "paged sparse MQA logits"):
+            self._make_without_sparse_logits(is_sm120=False)
+
+
+class TestDecodeScoresPagedOnSm12x(CustomTestCase):
+    """Decode scores take the Triton paged scorer on SM12x, as on Hopper; any
+    other device keeps the per-position scorer."""
+
+    def _decode_scores(self, **platform):
+        calls = []
+
+        def paged(q, weights, req, req_to_token, lens, table, pages, lmax, *rest):
+            calls.append("paged")
+            return torch.zeros(req.shape[0], lmax)
+
+        def per_position(q, weights, slots, lens, table, pages):
+            calls.append("per_position")
+            return torch.zeros(slots.shape)
+
+        bs = 2
+        indexer = SimpleNamespace(
+            queries=lambda q_lora, freqs: torch.zeros(q_lora.shape[0], 4, 8),
+            head_weights=lambda x: torch.zeros(x.shape[0], 4),
+        )
+        inputs = SimpleNamespace(
+            compress_ratio=1,
+            indexer=indexer,
+            req_rows=torch.tensor([0, 1]),
+            positions=torch.tensor([5, 9]),
+            paged_metadata=SimpleNamespace(max_compressed_seq_len=16),
+            q_lora=torch.zeros(bs, 8),
+            freqs_cis=torch.zeros(32, 4),
+            x=torch.zeros(bs, 8),
+            layer_id=0,
+            reset_outputs=lambda: None,
+        )
+        pool = SimpleNamespace(
+            get_index_k_with_scale_buffer=lambda layer_id: torch.zeros(
+                4, 68 * 64, dtype=torch.uint8
+            )
+        )
+        with (
+            patch.object(scoring, "fp4_index_logits_paged", paged),
+            patch.object(scoring, "fp4_index_logits_decode", per_position),
+            patch.object(scoring, "plan_topk_v2", lambda lens: torch.zeros(1)),
+            override_platform(**platform),
+        ):
+            d = scoring.decode_scores(
+                inputs=inputs,
+                token_to_kv_pool=pool,
+                req_to_token=torch.arange(64).view(2, 32),
+            )
+        return calls, d
+
+    def test_sm12x_scores_paged(self):
+        calls, d = self._decode_scores(is_sm90=False, is_sm120=True)
+        self.assertEqual(calls, ["paged"])
+        self.assertIsInstance(d, scoring.PagedDecodeScores)
+        self.assertIsNotNone(d.plan)
+
+    def test_other_devices_score_per_position(self):
+        calls, d = self._decode_scores(is_sm90=False, is_sm120=False)
+        self.assertEqual(calls, ["per_position"])
+        self.assertIsInstance(d, scoring.DecodeScores)
 
 
 if __name__ == "__main__":
