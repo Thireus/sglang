@@ -24,6 +24,7 @@ from .scoring import (
     prefill_requests,
     score_tiles,
     select_decode,
+    sort_selection_,
     topk_ragged,
     write_decode,
     write_prefill,
@@ -342,6 +343,9 @@ def _consume_tile_blocks(
             out.shape[1],
             block_size=block_size,
         )
+        # Rows over k positions come out ascending; a row with at most k keeps
+        # its candidate-block order.
+        sort_selection_(positions, lens[rows])
         out[rows] = torch.where(positions >= 0, positions + starts[rows, None], -1).to(
             torch.int32
         )
