@@ -325,7 +325,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -333,6 +332,37 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 f"DeepSeek-V4.1 does not support {feature} yet; disable it to "
                 "serve this model."
             )
+
+    if cfg.pp_size > 1:
+        # A later stage replays the ratio-1/2 producers of earlier ones and takes
+        # the mHC pre-mix with the streams (deepseek_v41_pp_sources). The replay
+        # tails narrow rows from the last kv_source on, and the vision tower and
+        # context parallelism are single-stage, so none of them crosses stages.
+        hf_config = model_config_of(server_args).hf_config
+        with_pp = (
+            (
+                "the vision tower (serve it with --language-model-only)",
+                getattr(hf_config, "vision_n_layers", 0) > 0
+                and not cfg.language_model_only,
+            ),
+            (
+                "decoder SWA bounded replay",
+                cfg.enable_decoder_swa_bounded_replay is True,
+            ),
+            ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),
+            (
+                "context parallelism",
+                cfg.enable_prefill_cp
+                or (cfg.attn_cp_size or 1) != 1
+                or (cfg.dcp_size or 1) != 1,
+            ),
+        )
+        for feature, enabled in with_pp:
+            if enabled:
+                raise ValueError(
+                    "DeepSeek-V4.1 under pipeline parallelism does not support "
+                    f"{feature} yet."
+                )
 
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.ragged_verify import (
@@ -399,6 +429,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     enabled = (
         (get_platform().is_cuda or get_platform().is_hip)
+        # The replay tail is not wired across pipeline stages.
+        and cfg.pp_size == 1
         # Both PD roles run it on CUDA; PD on ROCm has not been run with it.
         and (cfg.disaggregation_mode == "null" or get_platform().is_cuda)
         and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
