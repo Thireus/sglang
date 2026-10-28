@@ -4176,7 +4176,16 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
+            # The last chunk merges the request into this running batch. Under PP
+            # another micro-batch may have admitted it, so it finishes only in a
+            # micro-batch under the cap; a full one runs its decode step instead.
+            adder.chunked_req_can_finish = (
+                running_bs < get_parallel().pp_max_micro_batch_size
+            )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if not adder.can_run_list and not adder.chunked_req_can_finish:
+                running_batch.batch_is_full = True
+                return None, running_batch
 
         if self.enable_lora:
             running_loras = {
