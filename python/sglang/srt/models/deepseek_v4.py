@@ -965,6 +965,65 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 )
 
 
+class DeepseekV41ReplayedSource(nn.Module):
+    """A ratio-1/2 producer of an earlier pipeline stage, replayed on this one: the
+    layer's compressor and indexer with the RoPE table they read, and nothing else.
+    The attention backend takes it where it takes the layer itself
+    (forward_low_ratio_sources reads layer_id, compress_ratio, compressor, indexer,
+    freqs_cis and rope_head_dim)."""
+
+    def __init__(
+        self,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
+
+        self.layer_id = layer_id
+        self.compress_ratio = config.compress_ratios[layer_id]
+        assert self.compress_ratio in (1, 2), (
+            f"layer {layer_id} is not a ratio-1/2 layer"
+        )
+        self.head_dim = config.head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        # The same table as MqaAttentionBase builds for a compressed layer.
+        _, rope_scaling = get_rope_config(config)
+        scaling = dict(rope_scaling) if rope_scaling else {}
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(
+                dim=config.qk_rope_head_dim,
+                seqlen=config.max_position_embeddings,
+                original_seq_len=scaling["original_max_position_embeddings"],
+                base=config.compress_rope_theta,
+                factor=scaling.get("factor", 1.0),
+                beta_fast=scaling.get("beta_fast", 32),
+                beta_slow=scaling.get("beta_slow", 1),
+            ),
+            persistent=False,
+        )
+        self.compressor = None
+        self.indexer = None
+        if layer_id in config.kv_source_layer_ids:
+            self.compressor = DeepseekV41Compressor(
+                hidden_size=config.hidden_size,
+                head_dim=self.head_dim,
+                compress_ratio=self.compress_ratio,
+                eps=config.rms_norm_eps,
+            )
+        if layer_id in config.index_source_layer_ids:
+            self.indexer = DeepseekV41Indexer(
+                config,
+                layer_id=layer_id,
+                head_dim=self.head_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("indexer", prefix),
+            )
+
+
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
@@ -3714,6 +3773,9 @@ class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    # Not a module, so a class default does not shadow the instance's; the
+    # replayed modules (pp_sources) exist only where a plan does.
+    pp_source_plan = None
 
     def __init__(
         self,
@@ -3801,6 +3863,51 @@ class DeepseekV4Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        # Under PP, the ratio-1/2 producers of earlier stages this stage replays,
+        # and taps on this stage's producers that a later stage replays.
+        self.pp_sources = None
+        self.pp_source_plan = None
+        if self.pp_group.world_size > 1 and getattr(
+            config, "kv_source_layer_ids", None
+        ):
+            from sglang.srt.mem_cache.deepseek_v41_pp_sources import (
+                SourceTap,
+                pipeline_stages,
+                stage_sources,
+            )
+
+            stages = pipeline_stages(
+                config.num_hidden_layers, self.pp_group.world_size
+            )
+            rank = self.pp_group.rank_in_group
+            assert stages[rank] == range(self.start_layer, self.end_layer), (
+                f"stage {rank} holds layers [{self.start_layer}, {self.end_layer}), "
+                f"the source plan expected {stages[rank]}"
+            )
+            self.pp_source_plan = stage_sources(config, stages, rank)
+            self.pp_sources = nn.ModuleDict(
+                {
+                    str(layer_id): DeepseekV41ReplayedSource(
+                        config,
+                        layer_id,
+                        quant_config,
+                        prefix=add_prefix(f"layers.{layer_id}.self_attn", prefix),
+                    )
+                    for layer_id in self.pp_source_plan.replayed
+                }
+            )
+            for layer_id in self.pp_source_plan.captured:
+                self.layers[layer_id].self_attn.pp_source_tap = SourceTap()
+            logger.info(
+                "DeepSeek-V4.1 PP stage %d, layers [%d, %d): replays %s, "
+                "receives %s, sends %s",
+                rank,
+                self.start_layer,
+                self.end_layer,
+                list(self.pp_source_plan.replayed),
+                list(self.pp_source_plan.received),
+                list(self.pp_source_plan.sent),
+            )
         self.gemm_output_zero_allocator_size = 0
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
@@ -3948,8 +4055,21 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+        prev_pre: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        # A later pipeline stage starts from the previous stage's streams and the
+        # pre-mix its last hyper-connection predicted (prev_pre). The decoder
+        # replay tail narrows rows from the last kv_source on and is not wired
+        # across stages.
+        if self.pp_group.world_size > 1:
+            assert self.late_layer_start is None, (
+                "decoder SWA bounded replay is not wired across PP"
+            )
+            assert (
+                prev_pre is not None
+                or self.start_layer == 0
+                or hidden_states.shape[0] == 0
+            ), "a later pipeline stage needs the previous stage's mHC pre-mix"
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4021,7 +4141,7 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, prev_pre)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4224,6 +4344,64 @@ class DeepseekV4Model(nn.Module):
             return state.residual, state.pre, tail
         return state.residual, state.pre, None
 
+    def _replay_earlier_sources(
+        self, received_sources, positions, forward_batch, attn_backend
+    ) -> None:
+        """Run the earlier stages' producers this stage reads, oldest first: their
+        compressors write this stage's copy of their KV and index keys, and their
+        indexers rebuild the top-k and candidates this stage's layers read."""
+        for layer_id in self.pp_source_plan.replayed:
+            x, q_lora = received_sources.get(layer_id, (None, None))
+            if x is None or q_lora is None:
+                # Only a runner's dummy forward carries the residual alone.
+                continue
+            source = self.pp_sources[str(layer_id)]
+            if _low_ratio_sources_break(attn_backend, forward_batch):
+                bcg_deepseek_v4_low_ratio_sources(source, x, q_lora, positions)
+            else:
+                attn_backend.forward_low_ratio_sources(
+                    layer=source,
+                    x=x,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                )
+
+    def _pack_stage_outputs(self, tensors, last_pre, received_sources) -> None:
+        from sglang.srt.mem_cache.deepseek_v41_pp_sources import pack_stage_outputs
+
+        hidden = tensors["hidden_states"]
+        sources = {}
+        for layer_id in self.pp_source_plan.sent:
+            if layer_id in self.pp_source_plan.captured:
+                sources[layer_id] = self.layers[layer_id].self_attn.pp_source_tap.take()
+            else:
+                sources[layer_id] = received_sources.get(layer_id, (None, None))
+        pack_stage_outputs(
+            tensors,
+            pre=last_pre,
+            sources=sources,
+            num_rows=hidden.shape[0],
+            hidden_size=self.hidden_size,
+            q_lora_rank=self.config.q_lora_rank,
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+
+    def pp_input_specs(self) -> dict:
+        """Extra tensors this stage receives beside hidden_states (runner buffers)."""
+        if self.pp_source_plan is None:
+            return {}
+        from sglang.srt.mem_cache.deepseek_v41_pp_sources import stage_input_specs
+
+        return stage_input_specs(
+            is_first_stage=self.pp_group.is_first_rank,
+            pre_width=self.hc_mult if self.hc_pre_from_prev_sublayer else 0,
+            received=self.pp_source_plan.received,
+            hidden_size=self.hidden_size,
+            q_lora_rank=self.config.q_lora_rank,
+        )
+
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
 
@@ -4393,6 +4571,19 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+        prev_pre, received_sources = None, {}
+        if self.pp_source_plan is not None:
+            # Taps hold this forward's producer inputs only.
+            for layer_id in self.pp_source_plan.captured:
+                self.layers[layer_id].self_attn.pp_source_tap.take()
+            if not self.pp_group.is_first_rank:
+                from sglang.srt.mem_cache.deepseek_v41_pp_sources import (
+                    unpack_stage_inputs,
+                )
+
+                prev_pre, received_sources = unpack_stage_inputs(
+                    pp_proxy_tensors.tensors, self.pp_source_plan.received
+                )
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4447,6 +4638,10 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 positions,
             )
+        if self.pp_source_plan is not None and self.pp_source_plan.replayed:
+            self._replay_earlier_sources(
+                received_sources, positions, forward_batch, attn_backend
+            )
         last_pre = None
         tail = None
         if self.hc_pre_from_prev_sublayer:
@@ -4463,6 +4658,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                prev_pre=prev_pre,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4533,7 +4729,10 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            tensors = {"hidden_states": hidden_states.flatten(1)}
+            if self.pp_source_plan is not None:
+                self._pack_stage_outputs(tensors, last_pre, received_sources)
+            return PPProxyTensors(tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -4564,6 +4763,22 @@ class DeepseekV4Model(nn.Module):
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()
 
         return hidden_states, pre_hc_head
+
+
+def _replayed_source_param_name(
+    name: str, layer_id: Optional[int], pp_sources: Optional[nn.ModuleDict]
+) -> Optional[str]:
+    """``model.pp_sources.N.<part>`` for a compressor or indexer tensor of a layer
+    this pipeline stage replays (model.layers.N.self_attn.<part>), else None."""
+    if layer_id is None or not pp_sources or str(layer_id) not in pp_sources:
+        return None
+    prefix = f"model.layers.{layer_id}.self_attn."
+    if not name.startswith(prefix):
+        return None
+    part = name[len(prefix) :]
+    if not part.startswith(("compressor.", "indexer.")):
+        return None
+    return f"model.pp_sources.{layer_id}.{part}"
 
 
 # Quark keys its per-layer specs by checkpoint module names (layers.N.attn.wq_a,
@@ -4799,6 +5014,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
+
+    def get_pp_proxy_extra_tensors(self) -> dict:
+        return self.model.pp_input_specs()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
         if not self.pp_group.is_last_rank:
@@ -5309,7 +5527,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                         continue
 
                     layer_id = get_layer_id(name)
-                    if (
+                    replayed_name = _replayed_source_param_name(
+                        name, layer_id, getattr(self.model, "pp_sources", None)
+                    )
+                    if replayed_name is not None:
+                        # An earlier stage's producer this stage replays.
+                        name = replayed_name
+                    elif (
                         layer_id is not None
                         and hasattr(self.model, "start_layer")
                         and (

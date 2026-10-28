@@ -69,6 +69,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _pp_proxy_extra_of(mr) -> dict:
+    from sglang.srt.model_executor.runner_utils.buffers import pp_proxy_extra_of
+
+    return pp_proxy_extra_of(mr)
+
+
 def _allocate_decode_buffers(
     *,
     device: torch.device,
@@ -89,6 +95,7 @@ def _allocate_decode_buffers(
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     allocate_logits_buffer: bool = True,
+    pp_proxy_extra: Optional[dict] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     parallel = get_parallel()
@@ -153,6 +160,10 @@ def _allocate_decode_buffers(
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                )
+            for key, (width, key_dtype) in (pp_proxy_extra or {}).items():
+                pp_proxy_tensors[key] = torch.zeros(
+                    (max_num_token, width), dtype=key_dtype or dtype
                 )
         else:
             pp_proxy_tensors = None
@@ -460,6 +471,7 @@ class BaseRunner(ABC):
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
             allocate_logits_buffer=allocate_logits_buffer,
+            pp_proxy_extra=_pp_proxy_extra_of(mr),
         )
 
     def _dummy_run(

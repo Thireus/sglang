@@ -854,6 +854,13 @@ class ModelRunner:
             pp_rank=self.pp_group.rank_in_group,
         )
 
+    def get_pp_proxy_extra_tensors(self) -> dict:
+        return misc_utils.resolve_pp_proxy_extra_tensors(
+            model=self.model,
+            pp_size=self.pp_group.world_size,
+            pp_rank=self.pp_group.rank_in_group,
+        )
+
     def get_aux_hidden_states_width(self) -> int:
         return misc_utils.resolve_aux_hidden_states_width(
             model=self.model,
