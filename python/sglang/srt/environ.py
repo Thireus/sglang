@@ -762,6 +762,13 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Sliding-window tails a request has gone past move to the SWA LRU's eviction
+    # end, ahead of the turn-end tails other conversations resume from
+    # (UnifiedRadixCache._demote_passed_tails): the tail a chunked prefill leaves
+    # at each chunk boundary, and the earlier turn tails of a conversation that a
+    # new turn has resumed past.
+    SGLANG_SWA_DEMOTE_CHUNK_TAILS = EnvBool(True)
+    SGLANG_SWA_DEMOTE_SUPERSEDED_TAILS = EnvBool(True)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.

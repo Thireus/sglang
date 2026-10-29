@@ -207,6 +207,11 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Set from SGLANG_SWA_DEMOTE_* in __init__ (see _demote_passed_tails); an
+    # instance built without __init__ keeps the stock order.
+    _demote_chunk_tails_enabled = False
+    _demote_superseded_tails_enabled = False
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -372,11 +377,32 @@ class UnifiedRadixCache(BasePrefixCache):
             "l1l2_miss_tokens": 0,
         }
 
+        # A tree core without the hooks keeps the stock LRU order.
+        demote_hooks = (
+            self.is_swa_enabled
+            and not self.disable
+            and hasattr(self.tree_core, "demote_window_tails")
+            and hasattr(self.tree_core, "demote_superseded_tails")
+        )
+        self._demote_chunk_tails_enabled = (
+            demote_hooks and envs.SGLANG_SWA_DEMOTE_CHUNK_TAILS.get()
+        )
+        self._demote_superseded_tails_enabled = (
+            demote_hooks and envs.SGLANG_SWA_DEMOTE_SUPERSEDED_TAILS.get()
+        )
+
         self.reset()
         logger.info(
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
             f"Tree Core: {type(self.tree_core).__name__}"
         )
+        if self.is_swa_enabled:
+            logger.info(
+                "SWA tails a request has passed go to the LRU eviction end: chunk "
+                f"tails {'on' if self._demote_chunk_tails_enabled else 'off'}, "
+                "superseded turn tails "
+                f"{'on' if self._demote_superseded_tails_enabled else 'off'}"
+            )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -1206,6 +1232,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
         token_ids = req.full_untruncated_fill_ids[:up_to]
+        insert_start = req.kv.cache_protected_len
 
         if self.disable:
             if is_finished:
@@ -1365,6 +1392,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_params=insert_params,
             )
 
+        if not is_finished and (
+            self._demote_chunk_tails_enabled or self._demote_superseded_tails_enabled
+        ):
+            self._demote_passed_tails(
+                req, new_last_node, insert_start, len(new_indices), up_to
+            )
+
         if self.enable_session_radix_cache and is_finished:
             from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
@@ -1372,6 +1406,60 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(
                     req, leaf=result.last_device_node
                 )
+
+    def _demote_passed_tails(
+        self,
+        req: Req,
+        last_node: NodeId,
+        insert_start: int,
+        end: int,
+        up_to: int,
+    ) -> None:
+        """Move the sliding-window tails this request has gone past to the SWA
+        LRU's eviction end.
+
+        A prefix is reusable only up to a node whose last window still holds live
+        SWA, and a later turn of a conversation resumes from the tail its previous
+        turn left at the prompt end or the output end. Every chunk checkpoint also
+        publishes a tail, at MRU: one long prefill then evicts the turn-end tails of
+        every other conversation, whose next turn matches only up to the deepest
+        tail still live (a shared system prompt) and prefills the rest again, which
+        publishes more chunk tails. Earlier turn tails of a conversation that has
+        moved on likewise crowd out an idle conversation's only tail.
+
+        Chunk tails: a middle chunk moves the previous chunk's tail and its own
+        unlocked tail pages; the last chunk moves the previous chunk's tail, the
+        prompt-end tail keeps its place. A tail at a branch (where this request
+        left a path another request had cached) stays.
+
+        Superseded tails: once the prompt is in, the tails behind the admission
+        match move while the path through them has a single continuation (the
+        turns this request extends), up to the first branch, whose tail other
+        requests resume from.
+
+        Nothing is freed: a moved tail stays matchable until evicted, and a match
+        refreshes it as usual."""
+        own_floor = req.num_matched_prefix_tokens
+        prompt_done = up_to >= len(req.origin_input_ids)
+        window = self.component_of(TREE_WINDOW)
+        if self._demote_chunk_tails_enabled:
+            page = self.page_size
+            # A checkpoint leaves live the pages up to one window before its end.
+            span = page + ceil_align(max(window.sliding_window_size, page), page)
+            lo = max(own_floor, insert_start - span)
+            hi = insert_start if prompt_done else end
+            if hi > lo:
+                self.tree_core.demote_window_tails(
+                    last_node, end, lo, hi, window.component_type
+                )
+        if (
+            self._demote_superseded_tails_enabled
+            and prompt_done
+            and 0 < own_floor < end
+        ):
+            self.tree_core.demote_superseded_tails(
+                last_node, end, own_floor, window.component_type
+            )
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
