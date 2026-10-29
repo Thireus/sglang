@@ -284,6 +284,15 @@ class UnifiedLRUList:
         self._remove_node(node)
         self._add_node(node)
 
+    def reset_node_lru_end(self, node: UnifiedTreeNode):
+        """Move ``node`` next to the tail, where device eviction starts. A
+        session-referenced node keeps its partition and its place."""
+        assert node.id in self.cache
+        if self._is_referenced is not None and self._is_referenced(node):
+            return
+        self._remove_node(node)
+        self._add_node_after(self.tail.lru_prev[self._pt], node)
+
     def cursor_begin(self):
         if self.cursor.lru_prev[self._pt] is not None:
             self._remove_node(self.cursor)
@@ -2971,6 +2980,68 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 actions.append(action)
             target = fragment
         self.set_component_device_value(target.id, component_type, values.clone())
+
+    def _demote_to_lru_end(
+        self, node: UnifiedTreeNode, component_type: ComponentType
+    ) -> bool:
+        cd = node.component_data[component_type]
+        lru = self.lru_lists[component_type]
+        if cd.value is None or cd.lock_ref > 0 or not lru.in_list(node):
+            return False
+        lru.reset_node_lru_end(node)
+        return True
+
+    def demote_window_tails(
+        self,
+        node_id: NodeId,
+        end: int,
+        lo: int,
+        hi: int,
+        component_type: ComponentType,
+    ) -> int:
+        """Move the unlocked ``component_type`` device values on the path that
+        ends at ``node_id`` (key position ``end``) and lie inside ``[lo, hi)`` to
+        that component's LRU eviction end, except at a branch: a node with more
+        than one child is where other cached paths resume. Returns the number of
+        nodes moved."""
+        if component_type not in self.components_by_type:
+            return 0
+        node = self.node_by_id(node_id)
+        moved = 0
+        while node is not self.root_node and end > lo:
+            start = end - len(node.key)
+            if start >= lo and end <= hi and len(node.children) <= 1:
+                moved += self._demote_to_lru_end(node, component_type)
+            end = start
+            node = node.parent
+        return moved
+
+    def demote_superseded_tails(
+        self,
+        node_id: NodeId,
+        end: int,
+        floor: int,
+        component_type: ComponentType,
+    ) -> int:
+        """From the node that ends at key position ``floor`` on the path to
+        ``node_id`` (which ends at ``end``), walk toward the root and move each
+        unlocked ``component_type`` device value to that component's LRU eviction
+        end, while the node has a single child: past it every cached path goes
+        the same way. Stops at the first branch. Returns the number of nodes
+        moved."""
+        if component_type not in self.components_by_type:
+            return 0
+        node = self.node_by_id(node_id)
+        while node is not self.root_node and end > floor:
+            end -= len(node.key)
+            node = node.parent
+        if end != floor:
+            return 0
+        moved = 0
+        while node is not self.root_node and len(node.children) == 1:
+            moved += self._demote_to_lru_end(node, component_type)
+            node = node.parent
+        return moved
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
