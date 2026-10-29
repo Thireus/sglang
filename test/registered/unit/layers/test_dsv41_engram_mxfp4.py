@@ -19,7 +19,12 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.environ import envs
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+)
 from sglang.srt.layers import engram as engram_mod
 from sglang.srt.layers.engram import (
     Engram,
@@ -82,11 +87,28 @@ def parallel(tp_size=1, tp_rank=0):
     )
 
 
+def engram_config(host_layout=None):
+    """The --engram-config a layer resolves (resolve_engram_config): device rows
+    with the all-reduce lookup, or host rows one shard per rank ("per_rank") or one
+    copy per node ("shared"), what the deprecated SGLANG_*_ENGRAM_* switches select."""
+    if host_layout is None:
+        return EngramConfig(lookup=EngramLookup.ALL_REDUCE)
+    return EngramConfig(
+        placement=EngramPlacement.CPU,
+        replication=(
+            EngramReplication.PER_NODE
+            if host_layout == "shared"
+            else EngramReplication.NONE
+        ),
+        lookup=EngramLookup.ALL_REDUCE,
+    )
+
+
 class FakeHostTable:
     """_HostTable's interface over plain CPU memory (no pinning, no CUDA)."""
 
-    def __init__(self, layout, nbytes, name, group):
-        self.layout, self.nbytes, self.dirty = layout, nbytes, False
+    def __init__(self, replication, nbytes, name, group):
+        self.replication, self.nbytes, self.dirty = replication, nbytes, False
         self.bytes = torch.zeros(nbytes, dtype=torch.uint8)
         self.device_ptr = self.bytes.data_ptr()
 
@@ -103,14 +125,14 @@ def make_embed(rows, packed, *, host_layout=None, tp_size=1, tp_rank=0):
                 engram_mod, "get_parallel", return_value=parallel(tp_size, tp_rank)
             )
         )
-        stack.enter_context(envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.override(False))
         stack.enter_context(
-            envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(host_layout is not None)
+            patch.object(
+                engram_mod,
+                "resolve_engram_config",
+                return_value=engram_config(host_layout),
+            )
         )
         if host_layout is not None:
-            stack.enter_context(
-                envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.override(host_layout)
-            )
             stack.enter_context(patch.object(engram_mod, "_HostTable", FakeHostTable))
             stack.enter_context(
                 patch.object(engram_mod, "_sorted_host_reads", return_value=False)
@@ -200,8 +222,9 @@ class TestConfigDetection(CustomTestCase):
                 patch.object(
                     engram_mod, "ReplicatedLinear", return_value=nn.Identity()
                 ),
-                envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
-                envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.override(False),
+                patch.object(
+                    engram_mod, "resolve_engram_config", return_value=engram_config()
+                ),
             ):
                 module = Engram(config, 14, layout)
             self.assertEqual(module.embed.packed, expect)

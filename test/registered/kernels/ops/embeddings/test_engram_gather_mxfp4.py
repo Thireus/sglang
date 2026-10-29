@@ -22,7 +22,12 @@ from sglang.kernels.ops.embeddings.engram_gather import (
     engram_gather,
     engram_gather_peer,
 )
-from sglang.srt.environ import envs
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+)
 from sglang.srt.layers import engram as engram_mod
 from sglang.srt.layers.engram import EngramEmbedding, _PeerShards, unpack_mxfp4_codes
 from sglang.srt.layers.engram_staging import EngramRowStager
@@ -96,19 +101,36 @@ def parallel():
     )
 
 
+def engram_config(host_layout=None):
+    """The --engram-config a layer resolves (resolve_engram_config): device rows
+    with the all-reduce lookup, or host rows one shard per rank ("per_rank") or one
+    copy per node ("shared"), what the deprecated SGLANG_*_ENGRAM_* switches select."""
+    if host_layout is None:
+        return EngramConfig(lookup=EngramLookup.ALL_REDUCE)
+    return EngramConfig(
+        placement=EngramPlacement.CPU,
+        replication=(
+            EngramReplication.PER_NODE
+            if host_layout == "shared"
+            else EngramReplication.NONE
+        ),
+        lookup=EngramLookup.ALL_REDUCE,
+    )
+
+
 def make_embed(rows, packed, host_layout=None):
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(engram_mod, "get_parallel", return_value=parallel())
         )
-        stack.enter_context(envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.override(False))
         stack.enter_context(
-            envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(host_layout is not None)
+            patch.object(
+                engram_mod,
+                "resolve_engram_config",
+                return_value=engram_config(host_layout),
+            )
         )
         if host_layout is not None:
-            stack.enter_context(
-                envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.override(host_layout)
-            )
             return EngramEmbedding(rows, DIM, 1, (0, rows), packed=packed)
         with torch.device("cuda"):
             return EngramEmbedding(rows, DIM, 1, (0, rows), packed=packed)
