@@ -437,14 +437,24 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     if cfg.pp_size > 1:
         # A later stage replays the ratio-1/2 producers of earlier ones and takes
         # the mHC pre-mix with the streams (deepseek_v41_pp_sources). The replay
-        # tails narrow rows from the last kv_source on, and the vision tower and
-        # context parallelism are single-stage, so none of them crosses stages.
+        # tails narrow rows from the last kv_source on, and context parallelism is
+        # single-stage, so neither crosses stages. The vision tower runs on the
+        # first stage and every stage reads the image positions from its own IDs;
+        # each stage also receives the request's pixel features, which only the
+        # host transport hands to a stage without mapping them on its GPU.
         hf_config = model_config_of(server_args).hf_config
+        transport = getattr(cfg, "mm_feature_transport", None)
+        if transport is None and envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set():
+            transport = (
+                "cuda_ipc" if envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get() else "cpu"
+            )
         with_pp = (
             (
-                "the vision tower (serve it with --language-model-only)",
+                "the vision tower with a GPU feature transport (serve it with "
+                "--mm-feature-transport cpu)",
                 getattr(hf_config, "vision_n_layers", 0) > 0
-                and not cfg.language_model_only,
+                and not cfg.language_model_only
+                and transport in ("cuda_ipc", "cuda_vmm"),
             ),
             (
                 "decoder SWA bounded replay",

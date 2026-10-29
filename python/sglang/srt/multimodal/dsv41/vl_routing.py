@@ -19,6 +19,17 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.utils import is_cuda
 
 
+def batch_has_image_inputs(forward_batch) -> bool:
+    """Whether a forward can carry image tokens: only an extend batch with image
+    inputs does. Decode and text-only prefill route every token with the text
+    bias, which the fused top-k applies."""
+    if forward_batch is None:
+        return True
+    return (
+        forward_batch.forward_mode.is_extend() and forward_batch.contains_image_inputs()
+    )
+
+
 def vision_topk(
     moe,
     logits,
