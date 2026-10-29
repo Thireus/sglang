@@ -208,7 +208,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
-from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.multimodal.dsv41.vl_routing import batch_has_image_inputs, vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
@@ -1075,6 +1075,12 @@ class DeepseekV2MoE(nn.Module):
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
+        elif use_vision_topk and not (
+            is_in_breakable_cuda_graph() or is_in_tc_piecewise_cuda_graph()
+        ):
+            # Text keeps the fused top-k. A prefill graph replays batches its
+            # capture did not see, so it keeps the vision top-k.
+            use_vision_topk = batch_has_image_inputs(forward_batch)
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()

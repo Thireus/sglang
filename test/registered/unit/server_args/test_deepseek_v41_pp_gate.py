@@ -1,6 +1,7 @@
 """DeepSeek-V4.1 accepts pipeline parallelism, without the features that do
 not cross stages, and resolves decoder SWA bounded replay off under it."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -36,6 +37,7 @@ def _cfg(**overrides):
         moe_a2a_backend="none",
         ep_join_mode=None,
         language_model_only=True,
+        mm_feature_transport=None,
         enable_unified_memory=False,
         enable_mixed_chunk=False,
         enable_lora=False,
@@ -79,11 +81,29 @@ class TestDeepseekV41PipelineGate(CustomTestCase):
             {"enable_decoder_swa_bounded_replay": True},
         )
 
-    def test_pp_refuses_the_vision_tower(self):
-        with self.assertRaisesRegex(ValueError, "language-model-only"):
-            self._validate(_cfg(language_model_only=False))
-        # A checkpoint without the tower needs no flag.
+    def test_pp_serves_the_vision_tower(self):
+        # The first stage holds the tower; every stage routes image positions.
+        self.assertEqual(
+            self._validate(_cfg(language_model_only=False)),
+            {"enable_decoder_swa_bounded_replay": False},
+        )
+        self._validate(_cfg(language_model_only=False, mm_feature_transport="cpu"))
         self._validate(_cfg(language_model_only=False), vision_n_layers=0)
+
+    def test_pp_vision_refuses_a_gpu_feature_transport(self):
+        for transport in ("cuda_ipc", "cuda_vmm"):
+            with self.subTest(transport=transport):
+                with self.assertRaisesRegex(ValueError, "mm-feature-transport cpu"):
+                    self._validate(
+                        _cfg(language_model_only=False, mm_feature_transport=transport)
+                    )
+                # A text-only launch maps no feature and keeps its choice.
+                self._validate(_cfg(mm_feature_transport=transport))
+        # The legacy switch, when no transport is named (restored even on failure).
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
+            with self.assertRaisesRegex(ValueError, "mm-feature-transport cpu"):
+                self._validate(_cfg(language_model_only=False))
+            self._validate(_cfg(language_model_only=False, mm_feature_transport="cpu"))
 
     def test_pp_refuses_an_explicit_replay_tail(self):
         with self.assertRaisesRegex(ValueError, "decoder SWA bounded replay"):

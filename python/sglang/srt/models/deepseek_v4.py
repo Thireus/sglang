@@ -109,6 +109,7 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
@@ -4835,6 +4836,55 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
+# A later pipeline stage reads no tower tensor: the first stage holds the tower.
+_VISION_ON_FIRST_STAGE = "vision on the first stage"
+
+
+def _routes_images(model) -> bool:
+    """Whether image positions take gate.bias_vl and skip Engram in this model.
+
+    True on every pipeline stage of a launch that serves the vision tower, which
+    only the first stage holds."""
+    routes = getattr(model, "vision_routing", None)
+    if routes is None:
+        return getattr(model, "vision", None) is not None
+    return routes
+
+
+def _v41_checkpoint_skip(
+    name: str, *, holds_tower: bool, routes_images: bool
+) -> Optional[str]:
+    """Why this stage loads no module for a V4.1 checkpoint tensor, else None."""
+    if name.startswith(("vision.", "aligner.", "image_")):
+        if holds_tower:
+            return None
+        return _VISION_ON_FIRST_STAGE if routes_images else "vision"
+    if not routes_images and name.endswith(".gate.e_score_correction_bias_vl"):
+        return "gate.bias_vl"
+    return None
+
+
+def _return_mm_features_to_host(mm_inputs_list, device: torch.device) -> None:
+    """Move the GPU copies of a batch's pixel features back to the host, as
+    prepare_mm_inputs does: only a later chunk that misses the embedding cache
+    reads them again, and on the GPU each stays until its request finishes."""
+    if device.type != "cuda" or not mm_inputs_list:
+        return
+    stream = torch.cuda.current_stream(device)
+    offloaded = False
+    for mm_inputs in mm_inputs_list:
+        for item in mm_inputs.mm_items if mm_inputs is not None else ():
+            feature = item.feature
+            if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                feature.record_stream(stream)
+                item.feature = feature.to("cpu", non_blocking=True)
+                offloaded = True
+    if offloaded:
+        if mm_schedule.host_offload_event is None:
+            mm_schedule.host_offload_event = torch.cuda.Event()
+        mm_schedule.host_offload_event.record(stream)
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4880,24 +4930,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.vision = None
-        if (
+        # Every pipeline stage routes image positions with gate.bias_vl and keeps
+        # them out of Engram; the first stage alone holds the tower that embeds them.
+        self.vision_routing = (
             config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
+        )
+        if self.vision_routing and (
+            get_parallel().attn_cp_size != 1
+            or not (
+                get_moe_a2a_backend().is_none()
+                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
+            )
         ):
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
-            ):
-                raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
-                )
-
+            raise ValueError(
+                "V4.1 vision supports TP/EP/DP/PP without CP; "
+                "MoE A2A requires CUDA MegaMoE"
+            )
+        if self.vision_routing and get_parallel().pp_group.is_first_rank:
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
             self.vision = ViT(args)
             self.aligner = Aligner(args)
@@ -5049,6 +5100,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             input_embedding=self.get_input_embeddings(),
             multimodal_model=self,
         )
+        _return_mm_features_to_host(forward_batch.mm_inputs, input_ids.device)
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
 
@@ -5112,6 +5164,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         Scheduler hash IDs stay intact for multimodal cache keys; the language
         model uses image_token_id for Engram masking and visual MoE routing.
+        Only the stage holding the tower embeds images; every pipeline stage
+        maps its own prompt IDs, so each finds the image positions itself.
         """
         if (
             getattr(self, "vision", None) is not None
@@ -5123,7 +5177,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
+        if _routes_images(self) and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -5550,16 +5604,14 @@ class DeepseekV4ForCausalLM(nn.Module):
 
                     # V4.1 checkpoint tensors with no module in the text model yet.
                     skip_group = None
-                    if not is_dsv41:
-                        pass
-                    elif self.vision is None and name.startswith(
-                        ("vision.", "aligner.", "image_")
-                    ):
-                        skip_group = "vision"
-                    elif self.vision is None and name.endswith(
-                        ".gate.e_score_correction_bias_vl"
-                    ):
-                        skip_group = "gate.bias_vl"
+                    if is_dsv41:
+                        skip_group = _v41_checkpoint_skip(
+                            name,
+                            holds_tower=getattr(self, "vision", None) is not None,
+                            routes_images=_routes_images(self),
+                        )
+                    if skip_group == _VISION_ON_FIRST_STAGE:
+                        continue
                     if skip_group is not None:
                         skipped_by_group[skip_group] = (
                             skipped_by_group.get(skip_group, 0) + 1
