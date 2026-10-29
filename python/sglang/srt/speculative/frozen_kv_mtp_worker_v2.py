@@ -364,6 +364,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=forward_batch.req_pool_indices[:bs],
             seq_lens=forward_batch.seq_lens[:bs],
@@ -376,8 +377,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             encoder_lens=None,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-            kv_loc_plan=forward_batch.kv_loc_plan,
-            kv_loc_cols=forward_batch.kv_loc_cols,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
             spec_info=None,
         )
         with self._frozen_kv_target_view(forward_batch):
@@ -824,5 +825,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            if self._post_verify_graphs is not None:
+                # The mamba state commit may still run on a side stream.
+                self._post_verify_graphs.join()
 
             return batch_output
