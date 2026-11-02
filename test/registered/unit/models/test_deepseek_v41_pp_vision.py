@@ -74,6 +74,9 @@ class _Batch:
     def contains_mm_inputs(self):
         return self.contains_image_inputs()
 
+    def moe_num_token_non_padded(self):
+        return None
+
 
 class _Stage(nn.Module):
     """One pipeline stage of DeepseekV4ForCausalLM, reduced to its multimodal entry."""
