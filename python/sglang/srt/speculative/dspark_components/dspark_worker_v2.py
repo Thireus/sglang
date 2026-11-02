@@ -166,6 +166,8 @@ class DSparkWorkerV2(BaseSpecWorker):
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
     _verify_inputs_ready = None
+    # This stage's half of a relayed round; None on every other launch.
+    pp_last_stage = None
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -523,6 +525,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1:
+            from sglang.srt.speculative.dspark_components.dspark_pp_round import (
+                DSparkPPLastStage,
+            )
+
+            self.pp_last_stage = DSparkPPLastStage.build(
+                self, get_spec().speculative_draft_model_path
+            )
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -725,6 +736,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         commit = self._deferred_commit()
         if commit is not None:
             commit.disarm()
+        if self.pp_last_stage is not None:
+            self.pp_last_stage.clear()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
@@ -751,6 +764,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+        if self.pp_last_stage is not None:
+            self.pp_last_stage.note_request_finished(rid)
 
     def forward_batch_generation(
         self,

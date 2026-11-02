@@ -70,13 +70,16 @@ def _pp_exchange_outputs_before_forward(
     spec_relay: bool,
     is_last_rank: bool,
     async_batch_depth: int,
+    launch_first: bool = False,
 ) -> bool:
     """Extend microbatches launch first: they need nothing from the relay, and
     exchanging first caps every stage at (pp_size - 1) / pp_size. A verify round
-    must exchange first or the ring deadlocks on its tree rebuild."""
+    must exchange first or the ring deadlocks on its tree rebuild. ``launch_first``
+    is a round that rebuilds nothing: a plain or a chain round of DSpark, whose
+    tokens arrived one iteration earlier."""
     if async_batch_depth > 0:
         return True
-    if not spec_relay or is_last_rank or cur_batch is None:
+    if not spec_relay or is_last_rank or cur_batch is None or launch_first:
         return False
     return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
 
@@ -90,6 +93,8 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+    # DSpark under PP: the ids this stage verified, for the commit after the accept.
+    spec_verify_ids: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
 
@@ -99,6 +104,9 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    # The relay's DSpark flow (scheduler_pp_dspark.py), also per instance.
+    _pp_dspark_relay: bool = False
+    _pp_dspark_launch_first: bool = False
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -165,6 +173,7 @@ class SchedulerPPMixin:
                     spec_relay=self._pp_spec_relay,
                     is_last_rank=self.pp_group.is_last_rank,
                     async_batch_depth=get_parallel().pp_async_batch_depth,
+                    launch_first=self._pp_dspark_launches_first(cur_batch),
                 )
                 if exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -582,6 +591,10 @@ class SchedulerPPMixin:
             and get_parallel().pp_size > 1
             and not self.spec_algorithm.is_none()
         )
+        self._pp_dspark_relay = self._pp_spec_relay and self.spec_algorithm.is_dspark()
+        self._pp_dspark_launch_first = (
+            self._pp_dspark_relay and envs.SGLANG_PP_DSPARK_LAUNCH_FIRST.get()
+        )
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -612,6 +625,17 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+
+    def _pp_dspark_launches_first(self: Scheduler, batch: Optional[ScheduleBatch]) -> bool:
+        """Under the DSpark relay a plain round keeps the plain order, and a verify
+        round takes it only with SGLANG_PP_DSPARK_LAUNCH_FIRST."""
+        if not self._pp_dspark_relay:
+            return False
+        if self._pp_dspark_launch_first:
+            return True
+        from sglang.srt.managers.scheduler_pp_dspark import pp_dspark_round_runs_plain
+
+        return pp_dspark_round_runs_plain(batch)
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -817,10 +841,12 @@ class SchedulerPPMixin:
                 # Tail-drafted tree for the next verify round (root = bonus),
                 # with the topology its tokens were arranged by.
                 tensor_dict["spec_next_chain"] = result.next_verify_chain
-                tensor_dict["spec_next_parents"] = result.next_verify_parent_list
-                tensor_dict["spec_next_top_scores"] = (
-                    result.next_verify_top_scores_index
-                )
+                # A DSpark block is a chain: no topology to send.
+                if result.next_verify_parent_list is not None:
+                    tensor_dict["spec_next_parents"] = result.next_verify_parent_list
+                    tensor_dict["spec_next_top_scores"] = (
+                        result.next_verify_top_scores_index
+                    )
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -1019,14 +1045,23 @@ class SchedulerPPMixin:
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
-            self._pp_spec_commit_relayed_accept(
-                batch,
-                fwd_batch,
-                fwd_rids,
-                live_rids,
-                mb_metadata.verify_out_cache_loc,
-                pp_outputs,
-            )
+            if self._pp_dspark_relay:
+                from sglang.srt.managers.scheduler_pp_dspark import (
+                    commit_relayed_engram,
+                )
+
+                commit_relayed_engram(
+                    self, fwd_batch, mb_metadata.spec_verify_ids, pp_outputs
+                )
+            else:
+                self._pp_spec_commit_relayed_accept(
+                    batch,
+                    fwd_batch,
+                    fwd_rids,
+                    live_rids,
+                    mb_metadata.verify_out_cache_loc,
+                    pp_outputs,
+                )
             if live_rids == fwd_rids:
                 batch.seq_lens = new_seq_lens
                 if batch.seq_lens_cpu is not None:
@@ -1048,7 +1083,12 @@ class SchedulerPPMixin:
                         merged, dtype=batch.seq_lens_cpu.dtype
                     )
                     batch.seq_lens_sum = int(sum(merged))
-            self._pp_spec_adopt_relayed_tree(batch, fwd_rids, pp_outputs)
+            if self._pp_dspark_relay:
+                from sglang.srt.managers.scheduler_pp_dspark import adopt_relayed_chain
+
+                adopt_relayed_chain(self, batch, fwd_rids, pp_outputs)
+            else:
+                self._pp_spec_adopt_relayed_tree(batch, fwd_rids, pp_outputs)
             output_result = GenerationBatchResult(
                 logits_output=logits_output,
                 pp_hidden_states_proxy_tensors=None,
@@ -1056,6 +1096,12 @@ class SchedulerPPMixin:
                 accept_lens=pp_outputs["spec_accept_lens"].cpu(),
                 new_seq_lens=new_seq_lens,
                 speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                # A plain round's rows are one token wide under the same keys.
+                speculative_output_stride=(
+                    pp_outputs["next_token_ids"].numel() // len(fwd_rids)
+                    if self._pp_dspark_relay
+                    else None
+                ),
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
@@ -1107,9 +1153,14 @@ class SchedulerPPMixin:
                     if mb_metadata.fwd_batch is not None
                     else batch
                 )
+                relay_cls = PPSpecRelayInput
+                if self._pp_dspark_relay:
+                    from sglang.srt.speculative.dspark_components.dspark_pp_relay import (
+                        DSparkPPRelayInput as relay_cls,
+                    )
                 self._pp_spec_set_relay(
                     batch,
-                    PPSpecRelayInput.degenerate(
+                    relay_cls.degenerate(
                         rids=[req.rid for req in fwd_batch.reqs],
                         bonus_tokens=next_token_ids,
                         num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -1681,6 +1732,7 @@ class SchedulerPPMixin:
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                    spec_verify_ids=result.spec_verify_ids,
                     fpm_timing=result.fpm_timing,
                 )
                 event = self.device_module.Event()

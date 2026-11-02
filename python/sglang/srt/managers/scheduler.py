@@ -5018,6 +5018,14 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
+            elif self._pp_dspark_relay and not (
+                batch.forward_mode.is_extend() or batch.is_extend_in_batch
+            ):
+                from sglang.srt.managers.scheduler_pp_dspark import (
+                    run_pp_dspark_decode_round,
+                )
+
+                batch_result = run_pp_dspark_decode_round(self, batch, pp_proxy_tensors)
             elif not batch.spec_algorithm.is_none():
                 is_verify_round = get_parallel().pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch
