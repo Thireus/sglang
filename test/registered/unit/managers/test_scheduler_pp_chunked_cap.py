@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -197,6 +198,7 @@ class TestScheduler(CustomTestCase):
         s.spec_algorithm = None
         s.req_to_token_pool = SimpleNamespace(available_size=lambda: 4)
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        s.running_reqs = RunningReqs()
         return s
 
     def _pass(self, s, running_batch):
