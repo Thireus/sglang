@@ -783,6 +783,15 @@ class Envs:
     # new turn has resumed past.
     SGLANG_SWA_DEMOTE_CHUNK_TAILS = EnvBool(True)
     SGLANG_SWA_DEMOTE_SUPERSEDED_TAILS = EnvBool(True)
+    # The Python tree core's insert walks the key by offset instead of cutting it
+    # down at each node, which copies the rest of the token array: one chunk
+    # checkpoint of a long prefill copies depth^2 / page bytes per rank. Same tree,
+    # same side effects. Read when the tree core is built.
+    SGLANG_RADIX_INSERT_WALK_BY_OFFSET = EnvBool(False)
+    # On top of that, a request's later inserts start at the node its previous
+    # insert ended on: the path above it is replayed (touch, priority) without
+    # comparing keys. Implies the walk by offset.
+    SGLANG_RADIX_INSERT_RESUME_AT_LAST_NODE = EnvBool(False)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.

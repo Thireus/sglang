@@ -1348,6 +1348,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            resume_node=req.last_node,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1451,6 +1452,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     value=values[: len(prompt_key)],
                     prev_prefix_len=len(prompt_key),
                     inserted_len=len(prompt_key),
+                    resume_node=None,
                     priority=min(
                         insert_params.priority + 1, torch.iinfo(torch.int64).max
                     ),
