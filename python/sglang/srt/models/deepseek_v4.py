@@ -5334,6 +5334,16 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        if envs.SGLANG_DSV41_DRAFT_DUMP_DIR.get() and self.pp_group.is_last_rank:
+            from sglang.srt.speculative.dspark_components.dspark_pp_dump import (
+                install_draft_dump,
+            )
+
+            install_draft_dump(
+                self,
+                envs.SGLANG_DSV41_DRAFT_DUMP_DIR.get(),
+                getattr(self.config, "text_config", self.config).dspark_target_layer_ids,
+            )
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
