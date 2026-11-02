@@ -470,6 +470,9 @@ class _InsertWalkState(msgspec.Struct):
     priority: int
     result: InsertResult
     total_prefix_length: int = 0
+    # How far the walk has gone into ``key`` when it walks by offset; otherwise 0
+    # and ``key`` itself is cut down at each node.
+    key_offset: int = 0
     is_new_leaf: bool = False
     target_node: Optional[UnifiedTreeNode] = None
     overlap_node: Optional[UnifiedTreeNode] = None
@@ -523,6 +526,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # them to drive their tree-level hooks, attaching itself as tree_core.
         assert components
         self.component_types = tuple(components.keys())
+        resume_at_last_node = envs.SGLANG_RADIX_INSERT_RESUME_AT_LAST_NODE.get()
+        self._insert_walk_by_offset = (
+            resume_at_last_node or envs.SGLANG_RADIX_INSERT_WALK_BY_OFFSET.get()
+        )
+        # Full and SWA only: a state component's hooks have not been shown to do
+        # nothing on the path above that node.
+        self._insert_resume_at_last_node = resume_at_last_node and set(
+            self.component_types
+        ) <= {ComponentType.FULL, ComponentType.SWA}
+        if self._insert_walk_by_offset:
+            logger.info(
+                "Radix insert walks the key by offset%s",
+                ", later inserts of a request from its last node"
+                if self._insert_resume_at_last_node
+                else "",
+            )
         self.components_by_type: dict[ComponentType, TreeComponent] = components
         for component in components.values():
             component.tree_core = self
@@ -1295,11 +1314,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     ),
                 )
 
+        start_node, start = self._insert_start(params, key, priority)
         self._ongoing_insert_walk_state = _InsertWalkState(
             phase=_InsertPhase.WALK,
-            node=self.root_node,
+            node=start_node,
             key=key,
-            value=value,
+            key_offset=start,
+            total_prefix_length=start,
+            value=value[start:] if start else value,
             params=params,
             priority=priority,
             result=InsertResult(
@@ -1308,6 +1330,50 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             ),
         )
         return self._advance_insert()
+
+    def _insert_start(
+        self, params: InsertParams, key: RadixKey, priority: int
+    ) -> tuple[UnifiedTreeNode, int]:
+        """Where the insert walk starts: the root, or the node the request's
+        previous insert ended on.
+
+        Every node above that node ends within what the request already inserted
+        and holds under its lock, so the walk would only touch it and raise its
+        priority: it matches whole (no split), holds a Full value (locked), gets
+        no hit (past ``inserted_len`` only) and no overlap work (past
+        ``prev_prefix_len`` only). Those two are replayed here in walk order.
+        Anything else, the request's first insert included, walks from the root.
+        """
+        start = params.prev_prefix_len
+        if (
+            not self._insert_resume_at_last_node
+            or params.resume_node is None
+            or not 0 < start <= min(len(key), params.inserted_len)
+        ):
+            return self.root_node, 0
+        anchor = self._node_arena.get(params.resume_node)
+        if anchor is None:
+            return self.root_node, 0
+        path = []
+        depth = 0
+        node = anchor
+        while node is not self.root_node:
+            if node.evicted:
+                return self.root_node, 0
+            path.append(node)
+            depth += len(node.key)
+            node = node.parent
+        anchor_len = len(anchor.key)
+        if (
+            depth != start
+            or anchor.key.match_at(key, start - anchor_len, page_size=self.page_size)
+            != anchor_len
+        ):
+            return self.root_node, 0
+        for node in reversed(path):
+            self._touch_node(node)
+            node.priority = max(node.priority, priority)
+        return anchor, start
 
     def _rotation_conflict(
         self, key: RadixKey, rotation_base: int
@@ -1339,15 +1405,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         node = self.root_node
         total_prefix_length = 0
-        while len(key) > 0:
-            child_key = key.child_key(self.page_size)
+        while total_prefix_length < len(key):
+            child_key = key.child_key_at(total_prefix_length, self.page_size)
             if child_key not in node.children:
                 break
             child = node.children[child_key]
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(
+                key, total_prefix_length, page_size=self.page_size
+            )
             node = child
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
             if prefix_len < len(child.key):
                 # The walk would split here; the fragment inherits this base.
                 break
@@ -1408,7 +1475,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
         key = state.key
-        child_key = key.child_key(self.page_size) if len(key) else None
+        offset = state.key_offset
+        child_key = (
+            key.child_key_at(offset, self.page_size) if offset < len(key) else None
+        )
         if child_key not in state.node.children:
             state.phase = _InsertPhase.COMMIT
             return
@@ -1417,7 +1487,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Under joint_lru an access to only the prefix keeps the suffix's recency.
         suffix_time = node.last_access_time if self.joint_lru is not None else None
         self._touch_node(node)
-        prefix_len = node.key.match(key, page_size=self.page_size)
+        prefix_len = node.key.match_at(key, offset, page_size=self.page_size)
         if prefix_len < len(node.key):
             suffix = node
             node, action = self._split_node(node.key, node, prefix_len)
@@ -1509,7 +1579,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             state.pending_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
-        state.key = state.key[prefix_len:]
+        if self._insert_walk_by_offset:
+            state.key_offset += prefix_len
+        else:
+            state.key = state.key[prefix_len:]
         state.value = state.value[prefix_len:]
         state.overlap_node = None
         state.overlap_prefix_len = 0
@@ -1521,15 +1594,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # value alone; auxiliary components (SWA, Mamba) may legitimately hold
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
-        if len(state.key):
+        tail_key = state.key[state.key_offset :] if state.key_offset else state.key
+        if len(tail_key):
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
                 state.total_prefix_length,
-                state.total_prefix_length + len(state.key),
+                state.total_prefix_length + len(tail_key),
             )
             state.target_node = self._add_new_node(
                 state.node,
-                state.key,
+                tail_key,
                 state.value,
                 priority=state.priority,
                 session_id=state.params.session_id,

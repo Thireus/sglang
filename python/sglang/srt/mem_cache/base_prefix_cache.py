@@ -119,6 +119,10 @@ class InsertParams:
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
 
+    # The node the request holds at prev_prefix_len. The Python tree core may
+    # start the walk there (SGLANG_RADIX_INSERT_RESUME_AT_LAST_NODE).
+    resume_node: Optional[int] = None
+
     def get_evicted_seqlen(self, component_type: ComponentType) -> int:
         return self.component_evicted_seqlens.get(component_type, 0)
 
