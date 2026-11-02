@@ -126,12 +126,17 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         "Pipeline parallelism is not compatible with overlap schedule"
     )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
-        )
-        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
-            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
-        )
+        # The relayed launch is checked where the model config is known:
+        # dspark_pp_launch.validate_pp_dspark_launch, from _handle_dspark.
+        if not (
+            envs.SGLANG_ENABLE_PP_SPEC.get() and cfg.disaggregation_mode == "null"
+        ):
+            assert cfg.disaggregation_mode == "prefill", (
+                "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+            )
+            assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+                "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+            )
     elif cfg.speculative_algorithm is not None:
         assert (
             cfg.speculative_algorithm.upper() == "EAGLE"

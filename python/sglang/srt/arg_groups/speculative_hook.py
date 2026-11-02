@@ -712,7 +712,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        if cfg.disaggregation_mode != "prefill":
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and cfg.disaggregation_mode == "null":
+            from sglang.srt.speculative.dspark_components.dspark_pp_launch import (
+                validate_pp_dspark_launch,
+            )
+
+            validate_pp_dspark_launch(server_args)
+        elif cfg.disaggregation_mode != "prefill":
             raise ValueError(
                 "DSpark pipeline parallelism requires PD prefill; "
                 "decode and non-disaggregated serving require pp_size == 1."
