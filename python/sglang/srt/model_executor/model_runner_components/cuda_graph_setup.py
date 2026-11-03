@@ -700,6 +700,39 @@ def capture_prefill_graph(
     return result(prefill_runner, mem_usage, capture_time)
 
 
+def _maybe_add_pp_dspark_plain_family(model_runner: ModelRunner, runner):
+    """DSpark under pipeline parallelism: every stage also captures the plain decode
+    graphs, for the rounds that verify nothing. Any other launch keeps its one runner
+    and imports nothing of this flow."""
+    if (
+        not envs.SGLANG_ENABLE_PP_SPEC.get()
+        or model_runner.is_draft_worker
+        or runner is None
+    ):
+        return runner
+    from sglang.srt.speculative.dspark_components.dspark_pp_launch import (
+        pp_dspark_relay_enabled,
+    )
+
+    if not pp_dspark_relay_enabled(
+        pp_size=get_parallel().pp_size,
+        spec_algorithm=get_spec().speculative_algorithm,
+    ):
+        return runner
+    from sglang.srt.model_executor.runner.decode_family_dispatch import (
+        DecodeFamilyDispatch,
+    )
+
+    plain = model_runner._decode_cuda_graph_runner_cls()(
+        model_runner, plain_decode_family=True
+    )
+    logger.info(
+        "Captured the plain decode graphs beside the verify graphs: bs=%s.",
+        plain.capture_bs,
+    )
+    return DecodeFamilyDispatch(verify=runner, plain=plain)
+
+
 def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     """Capture device graphs."""
     if model_runner.is_draft_worker:
@@ -777,6 +810,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         )
         GraphRunnerCls = graph_runners[model_runner.device]
     runner = GraphRunnerCls(model_runner)
+    runner = _maybe_add_pp_dspark_plain_family(model_runner, runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem

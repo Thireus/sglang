@@ -263,6 +263,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _staged_inputs = None
     # Unlimited-OCR v2 decode input/output relay; None for every other model.
     uocr_graph_io: Optional[UOCRDecodeGraphIO] = None
+    # DSpark under pipeline parallelism: the plain DECODE graphs beside the verify's.
+    plain_decode_family = False
 
     _draft_glue_logged = 0
 
@@ -292,8 +294,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         record_nolora_graph: bool = False,
+        plain_decode_family: bool = False,
     ):
         super().__init__(model_runner)
+        self.plain_decode_family = plain_decode_family
         # The env only opts in to the automatic LoRA variant pair; explicit
         # requests (the UNO runner) are honoured regardless.
         self.record_nolora_graph = _should_record_nolora_graph(
@@ -380,6 +384,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+        if plain_decode_family:
+            # A speculative launch whose plain rounds still run the plain graph. The
+            # last stage's commit of the round's row reads the captured target hidden.
+            self.capture_forward_mode = ForwardMode.DECODE
+            self.captured_req_width = 1
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         self.dllm_attention = self.attn_backend.dllm_attention
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
@@ -406,6 +416,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.captured_req_width,
             gathered_buffer_required=self.require_gathered_buffer,
         )
+        verify_max_bs = envs.SGLANG_PP_DSPARK_VERIFY_MAX_BS.get()
+        if plain_decode_family:
+            # The plain launch's list, not the speculative one's dense small sizes.
+            largest = max(self.capture_bs)
+            self.capture_bs = [
+                bs for bs in self.capture_bs if bs in (1, 2, 4, 8) or bs == largest
+            ]
+            self.compile_bs = [bs for bs in self.compile_bs if bs in self.capture_bs]
+        elif verify_max_bs > 0 and envs.SGLANG_ENABLE_PP_SPEC.get():
+            # The verify and draft graphs serve what the switch can draft for.
+            self.capture_bs = [bs for bs in self.capture_bs if bs <= verify_max_bs]
+            self.compile_bs = [bs for bs in self.compile_bs if bs <= verify_max_bs]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -455,7 +477,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_num_tokens is not None
             else self.max_bs * self.captured_req_width
         )
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        if not plain_decode_family:
+            # A second family shares the backend's per-bucket metadata the first
+            # captured; re-initializing here would orphan those graphs' tensors.
+            self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         self.seq_len_fill_value = (
             self.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -2053,6 +2078,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
         spec_info = None
+        if self.plain_decode_family:
+            return spec_info
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
