@@ -134,6 +134,9 @@ class GenerationBatchResult:
     # batch.out_cache_loc, so the slots have to travel on the result to survive
     # until the accepted path comes back over the relay.
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
+    # DSpark under PP: the ids a non-last stage verified, for its commit after the
+    # accept comes round the ring.
+    spec_verify_ids: Optional[torch.Tensor] = None
 
     # The plan the forward wrote its KV through, when the caller asked for it
     # (`return_iteration_ids`): a speculative worker's own writes into the same
