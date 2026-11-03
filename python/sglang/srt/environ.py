@@ -1646,6 +1646,22 @@ class Envs:
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
     # (non-overlap schedule, no DP attention).
     SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+    # DSpark under SGLANG_ENABLE_PP_SPEC (DeepSeek-V4.1 only). Where the last stage
+    # keeps the draft's input embedding: "host" (the mapped checkpoint shard, the
+    # anchor rows copied in per step) or "gpu" (the table on that stage).
+    SGLANG_PP_DSPARK_EMBED = EnvStr("host")
+    # Per micro-batch: "auto" (the break-even rule), "on" or "off".
+    SGLANG_PP_DSPARK_SWITCH = EnvStr("auto")
+    # JSON {"<decoding requests>": <break-even tokens per verify>} for "auto".
+    SGLANG_PP_DSPARK_BREAKEVEN = EnvStr(None)
+    # Plain rounds capture the target hidden and commit it to the draft's window.
+    SGLANG_PP_DSPARK_WARM_WHEN_OFF = EnvBool(True)
+    # A verify round launches before its output exchange (the chain it needs
+    # arrived one iteration earlier).
+    SGLANG_PP_DSPARK_LAUNCH_FIRST = EnvBool(False)
+    # Largest micro-batch the verify graphs serve; 0 keeps the decode list. A
+    # micro-batch above it runs plain.
+    SGLANG_PP_DSPARK_VERIFY_MAX_BS = EnvInt(0)
     SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
