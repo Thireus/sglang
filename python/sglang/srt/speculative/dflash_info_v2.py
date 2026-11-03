@@ -32,6 +32,27 @@ def _get_overlap_plan_stream(
     return stream, torch.get_device_module(device_str).stream(stream)
 
 
+def _device_index(device: torch.device) -> int:
+    """The index ``device`` names: its own, or for a name without one the current
+    device of its type. cpu tensors report no index, and a type without a current
+    device has one device: 0 for both."""
+    if device.index is not None:
+        return device.index
+    current = getattr(getattr(torch, device.type, None), "current_device", None)
+    index = current() if callable(current) else 0
+    return index if isinstance(index, int) else 0
+
+
+def _same_device(a: torch.device | str, b: torch.device | str) -> bool:
+    """Whether ``a`` and ``b`` name one device. ScheduleBatch.device is the runner's
+    name without an index ("cuda"), and a buffer allocated there reports the current
+    device's index ("cuda:0"): as strings they differ for one device."""
+    a, b = torch.device(a), torch.device(b)
+    return a.type == b.type and (
+        a.index == b.index or _device_index(a) == _device_index(b)
+    )
+
+
 @dataclass
 class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
@@ -72,11 +93,17 @@ class DFlashDraftInputV2(SpecInput):
             return buf is None or buf.numel() < bs
 
         def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
+            return (
+                buf is None or buf.numel() < bs or not _same_device(buf.device, device)
+            )
 
         def grown_capacity(buf: Optional[torch.Tensor]) -> int:
             current = 0 if buf is None else int(buf.numel())
-            return max(bs, 32, current * 2 if current > 0 else 0)
+            if current >= bs:
+                # Big enough, on another device: what the batch needs, never more.
+                return max(bs, 32)
+            # Doubling for a growing batch, so under twice what it needs.
+            return max(bs, 32, current * 2)
 
         # The three CPU scratch buffers grow together; capacity is the only
         # invariant (batch is int64 non-pinned, cur/nxt are int32 pinned).
