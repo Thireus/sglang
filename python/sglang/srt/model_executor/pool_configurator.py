@@ -1282,8 +1282,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             draft_layers = 1
             target_layers = self.num_layers_total
             self._spec_infl = (target_layers + draft_layers) / target_layers
-            self.bytes_per_full_token *= self._spec_infl
-            self.bytes_per_swa_token *= self._spec_infl
+            from sglang.srt.speculative.dspark_components.dspark_pp_launch import (
+                pp_dspark_relay_enabled,
+            )
+
+            if pp_dspark_relay_enabled(
+                pp_size=kvc.pp_size,
+                spec_algorithm=get_spec().speculative_algorithm,
+            ):
+                # The draft lives on the last stage alone, which pays for its SWA
+                # layers directly; no other stage reserves anything for it.
+                self._spec_infl = 1.0
+                if kvc.pp_group.rank_in_group == kvc.pp_size - 1:
+                    self.bytes_per_swa_token += (
+                        self._get_paged_kv_bytes_per_token()
+                        * self._pp_dspark_draft_layers(kvc)
+                    )
+                    self.bytes_per_full_token = self._get_bytes_per_full_token()
+            else:
+                self.bytes_per_full_token *= self._spec_infl
+                self.bytes_per_swa_token *= self._spec_infl
 
         # Online c128 keeps one in-progress (max, sum, kv) state per index and
         # assumes forward-only; MTP would need rollback across draft and verify.
@@ -1353,6 +1371,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # default's bytes on proportionally more tails.
             tails *= max(1, self.num_layers_total // self.paged_draft_layers)
         return tails
+
+    @staticmethod
+    def _pp_dspark_draft_layers(kvc) -> int:
+        aux = kvc.spec_aux_config
+        return int(aux.dspark_num_stages or aux.dflash_draft_num_layers or 0)
 
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
         """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode
