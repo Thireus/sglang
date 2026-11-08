@@ -6,6 +6,7 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <sgl_kernel/quantization/gguf/moe_vec.cuh>
+#include <sgl_kernel/quantization/gguf/moe_vec_iqk.cuh>
 #include <sgl_kernel/quantization/gguf/quantize_q8_1.cuh>
 #include <sgl_kernel/quantization/gguf/vecdotq.cuh>
 
@@ -18,10 +19,11 @@ namespace gguf {
 template <int kQuantType>
 struct MoeVecFormat;
 
-#define GGUF_MOE_VEC_FORMAT(type, qk, block, launcher)                 \
+#define GGUF_MOE_VEC_FORMAT_META(type, qk, block, meta, launcher)      \
   template <>                                                          \
   struct MoeVecFormat<type> {                                          \
     static constexpr int kBlockSize = qk;                              \
+    static constexpr int kRowMeta = meta;                              \
     static constexpr int kBlockBytes = sizeof(block);                  \
     static constexpr int kAlignment = alignof(block);                  \
     template <typename scalar_t>                                       \
@@ -39,6 +41,10 @@ struct MoeVecFormat;
       launcher<scalar_t>(w, q, y, ids, topk, m, k, n, stride, stream); \
     }                                                                  \
   }
+
+// Row bytes = kRowMeta + K / kBlockSize * kBlockBytes (ggml_row_size): ik's IQ4_KS / IQ2_KS
+// rows start with a 4- / 2-byte scale.
+#define GGUF_MOE_VEC_FORMAT(type, qk, block, launcher) GGUF_MOE_VEC_FORMAT_META(type, qk, block, 0, launcher)
 
 GGUF_MOE_VEC_FORMAT(2, QK4_0, block_q4_0, moe_vec_q4_0_q8_1_cuda);
 GGUF_MOE_VEC_FORMAT(3, QK4_0, block_q4_1, moe_vec_q4_1_q8_1_cuda);
@@ -59,8 +65,11 @@ GGUF_MOE_VEC_FORMAT(21, QK_K, block_iq3_s, moe_vec_iq3_s_q8_1_cuda);
 GGUF_MOE_VEC_FORMAT(22, QK_K, block_iq2_s, moe_vec_iq2_s_q8_1_cuda);
 GGUF_MOE_VEC_FORMAT(23, QK_K, block_iq4_xs, moe_vec_iq4_xs_q8_1_cuda);
 GGUF_MOE_VEC_FORMAT(29, QK_K, block_iq1_m, moe_vec_iq1_m_q8_1_cuda);
+GGUF_MOE_VEC_FORMAT_META(144, QK_K, block_iq4_ks, IQ4_KS_ROW_META, moe_vec_iq4_ks_q8_1_cuda);
+GGUF_MOE_VEC_FORMAT_META(145, QK_K, block_iq2_ks, IQ2_KS_ROW_META, moe_vec_iq2_ks_q8_1_cuda);
 
 #undef GGUF_MOE_VEC_FORMAT
+#undef GGUF_MOE_VEC_FORMAT_META
 
 }  // namespace gguf
 
@@ -91,12 +100,14 @@ void gguf_moe_a8_vec(
   TensorMatcher({tokens, columns}).with_dtype<scalar_t>().template with_device<kDLGPU>(device).verify(input);
   const int64_t k = columns.unwrap();
   CHECK_HOST(k > 0 && k <= kMaxIndex - 511 && k % Format::kBlockSize == 0);
-  const int64_t packed_columns = k / Format::kBlockSize * Format::kBlockBytes;
+  const int64_t packed_columns = Format::kRowMeta + k / Format::kBlockSize * Format::kBlockBytes;
+  constexpr int kWeightAlignment = std::max({2, Format::kAlignment, Format::kRowMeta});
   TensorMatcher({experts, row, packed_columns})
       .with_dtype<uint8_t>()
       .with_device(device)
-      .ensure_alignment(std::max(2, Format::kAlignment))
+      .ensure_alignment(kWeightAlignment)
       .verify(weight);
+  CHECK_HOST(packed_columns % kWeightAlignment == 0);
   CHECK_HOST(experts.unwrap() > 0 && experts.unwrap() <= kMaxIndex / row / (k / Format::kBlockSize));
   TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(expert_ids);
   CHECK_HOST(expert_ids.numel() == tokens * top_k);
