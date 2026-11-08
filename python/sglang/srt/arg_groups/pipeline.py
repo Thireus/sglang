@@ -313,6 +313,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_expert_distribution_metrics, server_args)
     run_hook(handle_elastic_ep, server_args)
     run_hook(validate_experimental_sgl_marlin, server_args)
+    # A hot/cold checkpoint needs trivial expert placement and the FlashInfer
+    # MXFP4 hot tier; checked after the model override picked the runner.
+    from sglang.srt.arg_groups.hotcold_hook import handle_hotcold
+
+    run_hook(handle_hotcold, server_args)
 
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)
 
