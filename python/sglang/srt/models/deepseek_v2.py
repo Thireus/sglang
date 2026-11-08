@@ -756,22 +756,61 @@ class DeepseekV2MoE(nn.Module):
         num_redundant_experts = (
             get_exec().moe.ep_num_redundant_experts if uses_expert_location else 0
         )
-        self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe + num_redundant_experts,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            top_k=top_k_for_moe,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            layer_id=self.layer_id,
-            quant_config=quant_config,
-            routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=getattr(
-                config, "routing_method_type", RoutingMethodType.DeepSeekV3
-            ),
-            swiglu_limit=getattr(config, "swiglu_limit", None),
-            prefix=add_prefix("experts", prefix),
-            uses_expert_location=uses_expert_location,
+        from sglang.srt.layers.moe.hotcold import hotcold_layer_enabled
+
+        hotcold_manifest = hotcold_layer_enabled(
+            config, layer_id, is_nextn=is_nextn, is_deepseek_v4=is_deepseek_v4
         )
+        if hotcold_manifest is not None:
+            # A hot/cold checkpoint: the hot tier is production's MXFP4 FusedMoE
+            # over H slots, the cold tier packed ggml rows (layers/moe/hotcold.py).
+            from sglang.srt.layers.moe.hotcold import HotColdFusedMoE
+
+            if self.num_fused_shared_experts or num_redundant_experts:
+                raise ValueError(
+                    "a hot/cold checkpoint supports neither fused shared experts "
+                    "nor redundant experts"
+                )
+            self.experts = HotColdFusedMoE(
+                manifest=hotcold_manifest,
+                layer_id=self.layer_id,
+                hot=get_moe_impl_class(quant_config)(
+                    num_experts=hotcold_manifest.num_hot,
+                    num_fused_shared_experts=0,
+                    top_k=top_k_for_moe,
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                    layer_id=self.layer_id,
+                    quant_config=quant_config,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    routing_method_type=getattr(
+                        config, "routing_method_type", RoutingMethodType.DeepSeekV3
+                    ),
+                    swiglu_limit=getattr(config, "swiglu_limit", None),
+                    prefix=add_prefix("experts", prefix),
+                    uses_expert_location=False,
+                ),
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+            )
+        else:
+            self.experts = get_moe_impl_class(quant_config)(
+                num_experts=num_experts_for_moe + num_redundant_experts,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                top_k=top_k_for_moe,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                layer_id=self.layer_id,
+                quant_config=quant_config,
+                routed_scaling_factor=self.routed_scaling_factor,
+                routing_method_type=getattr(
+                    config, "routing_method_type", RoutingMethodType.DeepSeekV3
+                ),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                prefix=add_prefix("experts", prefix),
+                uses_expert_location=uses_expert_location,
+            )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(

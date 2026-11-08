@@ -1968,6 +1968,13 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Hot/cold checkpoints (layers/moe/hotcold.py): the cold tier's kernel, "auto"
+    # (MMQ above the token threshold when built for the cold types, else the vector
+    # kernel), "vec" or "mmq"; the threshold; and the imatrix collector's directory
+    # (eager only, empty = off).
+    SGLANG_HOTCOLD_COLD_KERNEL = EnvStr("auto")
+    SGLANG_HOTCOLD_MMQ_MIN_TOKENS = EnvInt(64)
+    SGLANG_DSV41_HOTCOLD_IMATRIX_DIR = EnvStr("")
     # DeepSeek-V4 default when a request carries no reasoning_effort: a
     # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
