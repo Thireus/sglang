@@ -23,7 +23,11 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -165,11 +169,18 @@ class TestScheduler(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = list(waiting)
+        s.waiting_queue = IndexedReqList(ListKind.WAITING, abort=lambda *a, **k: None)
+        s.waiting_queue.join(waiting)
+        # The chunked slot is a request list since upstream #43910.
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=lambda *a, **k: None)
         s.chunked_req = chunked_req
         s.min_free_slots_delayer = None
+        s.request_retirer = Mock()
+        s.invariant_checker = Mock()
         s.policy = Mock()
         s.policy.shortest_prefill_chunk_limit.return_value = None
+        # The waiting list takes calc_priority's order since upstream #43910.
+        s.policy.calc_priority.side_effect = lambda queue, *a, **k: list(queue)
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = CHUNK
         s.dynamic_chunk_sizer = None
@@ -190,6 +201,7 @@ class TestScheduler(CustomTestCase):
         s.enable_lora = False
         s.disaggregation_mode = DisaggregationMode.NULL
         s.disagg_prefill_bootstrap_queue = None
+        s.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         s.enable_hicache_storage = False
         s.enable_lmcache = False
         s.truncation_align_size = None
@@ -198,7 +210,7 @@ class TestScheduler(CustomTestCase):
         s.spec_algorithm = None
         s.req_to_token_pool = SimpleNamespace(available_size=lambda: 4)
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
-        s.running_reqs = RunningReqs()
+        s.running_reqs = KeyedReqList(ListKind.DECODING)
         return s
 
     def _pass(self, s, running_batch):
@@ -235,7 +247,7 @@ class TestScheduler(CustomTestCase):
         self.assertEqual(req.extend_end, req.prefix_len)
         self.assertEqual(req.inflight_middle_chunks, 0)
         self.assertTrue(running.batch_is_full)
-        self.assertEqual(s.waiting_queue, [waiting])
+        self.assertEqual(list(s.waiting_queue), [waiting])
         self.assertEqual(waiting.next_round_inputs, 0)
         self.assertEqual(len(running.reqs), CAP)
 
@@ -258,7 +270,7 @@ class TestScheduler(CustomTestCase):
         self.assertEqual(built, [req])
         self.assertIs(s.chunked_req, req)
         self.assertEqual(req.extend_len, CHUNK)
-        self.assertEqual(req.inflight_middle_chunks, 1)
+        # (upstream #43906 dropped the per-request middle-chunk counter this line read)
 
     def test_pipeline_puts_the_request_in_the_first_micro_batch_with_room(self):
         # Micro-batches 0 and 1 are at the cap and 2 has room, as when 25 streams
@@ -293,8 +305,8 @@ class TestScheduler(CustomTestCase):
         )
         s = self._scheduler(req, waiting=[waiting])
         s.enable_priority_preemption = True
-        s._add_request_to_queue = lambda r, is_retracted=False: s.waiting_queue.append(
-            r
+        s._add_request_to_queue = lambda r, is_retracted=False: s.waiting_queue.join(
+            [r]
         )
         s.req_to_token_pool = SimpleNamespace(
             available_size=lambda: CAP * NUM_MICRO_BATCHES - CAP - 1
@@ -313,7 +325,7 @@ class TestScheduler(CustomTestCase):
         self.assertIsNone(built, "the last chunk joined a micro-batch at the cap")
         self.assertIs(s.chunked_req, req)
         self.assertEqual(running.reqs, members, "a running request was preempted")
-        self.assertEqual(s.waiting_queue, [waiting])
+        self.assertEqual(list(s.waiting_queue), [waiting])
         self.assertTrue(running.batch_is_full)
 
 

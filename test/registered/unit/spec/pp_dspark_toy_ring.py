@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     _get_speculative_output_stride,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -262,7 +263,15 @@ class ToyInjector:
         return plan.write_ids(None)
 
     def inject_target_hidden(
-        self, *, target_hidden, cache_loc, cache_loc_2d, positions, commit_lens, state_slot
+        self,
+        *,
+        target_hidden,
+        cache_loc,
+        cache_loc_2d,
+        positions,
+        commit_lens,
+        state_slot,
+        iteration_ids=None,  # passed by upstream's verify since #48001
     ):
         bs, width = cache_loc_2d.shape
         assert target_hidden.shape[0] == bs * width
@@ -362,6 +371,10 @@ class ToyStage(SchedulerPPMixin):
         self.ring = ring
         self.rank = rank
         self.device = "cpu"
+        # The loop asks the pause state whether it may launch (upstream #49144).
+        self.pause_state = PauseState()
+        # The loops run the state checks through it (upstream #48997); a toy checks nothing.
+        self.invariant_checker = SimpleNamespace(run=lambda *a, **k: None)
         self.spec_algorithm = SpeculativeAlgorithm.DSPARK
         self.pp_group = SimpleNamespace(
             is_first_rank=rank == 0,
@@ -414,7 +427,7 @@ class ToyStage(SchedulerPPMixin):
         if self.ring.stop.is_set():
             raise _Stop()
 
-    def ingest_requests(self):
+    def ingest_requests(self, stop_at_pause=False):
         for req in self.ring.requests_for(self.rank, self.iterations):
             self.waiting.append(req)
         return []

@@ -131,7 +131,7 @@ class TestCandidateIndexerGating(CustomTestCase):
 
     def _make_without_sparse_logits(self, **platform):
         with (
-            patch.object(v41_indexer, "is_sm100_or_newer", return_value=True),
+            patch.object(v41_indexer, "is_sm100", return_value=True),
             patch.object(v41_indexer, "_use_deep_gemm_prefill", return_value=True),
             patch.object(configurer, "DEEPGEMM_PAGED_SPARSE_MQA_LOGITS", False),
             override_platform(**platform),

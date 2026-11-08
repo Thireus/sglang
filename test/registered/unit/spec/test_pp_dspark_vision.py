@@ -79,6 +79,7 @@ class TestVerifyOnImageRequests(CustomTestCase):
         counts TARGET_VERIFY), whose text rows take the text bias all the same."""
         moe = SimpleNamespace(
             gate=SimpleNamespace(e_score_correction_bias_vl=torch.zeros(4)),
+            is_hash=False,  # a routed layer (upstream #48041 reads it)
             _enable_a2a_moe=False,
             _can_dual_stream_graph=lambda hidden: False,
             alt_stream=None,
