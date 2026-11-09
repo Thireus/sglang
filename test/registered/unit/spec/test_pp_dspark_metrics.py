@@ -48,7 +48,7 @@ def _settle(reqs, tokens, accept, stride):
         speculative_output_stride=stride,
     )
     out = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-        processor, result, SimpleNamespace(reqs=reqs)
+        processor, result, SimpleNamespace(reqs=reqs), [True] * len(reqs)
     )
     return out, commits, result
 

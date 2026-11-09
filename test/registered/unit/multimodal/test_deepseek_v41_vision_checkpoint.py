@@ -43,7 +43,7 @@ from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.multimodal.processors.deepseek_v41 import DeepseekV41ImageProcessor
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase

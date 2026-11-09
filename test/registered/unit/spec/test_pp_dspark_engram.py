@@ -53,6 +53,7 @@ def _decode(hasher, slot, token, pos):
 def _verify(hasher, slot, chain, pos):
     batch = SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
+        ragged_verify_layout=None,  # one equal block per request (upstream #42718)
         req_pool_indices=torch.tensor([slot]),
         positions=torch.arange(pos, pos + len(chain)),
         spec_info=DFlashVerifyInput(

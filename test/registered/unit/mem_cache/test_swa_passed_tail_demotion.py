@@ -201,7 +201,7 @@ class _Engine:
             self.full_total,
         )
         test.assertEqual(
-            self.alloc.swa_available_size() + self.cache.swa_evictable_size(),
+            self.alloc.swa_available_size() + self.cache.window_evictable_size(self.cache.window_sub_pools()[0][0]),
             self.swa_total,
         )
         self.cache.sanity_check()

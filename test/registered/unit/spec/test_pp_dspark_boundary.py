@@ -122,6 +122,10 @@ class TestProxyBuffers(CustomTestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.bs = 2
+        runner.raw_bs = 2  # read by the replay key since upstream #47676
+        runner.require_mlp_tp_gather = False
+        runner._with_logits_variant = lambda key, variant: key
+        runner._resolve_logits_variant = lambda fb, padded: None
         runner.captured_req_width = WIDTH
         runner.raw_num_token = 2 * WIDTH
         runner.model_runner = SimpleNamespace(
