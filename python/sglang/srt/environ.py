@@ -1345,6 +1345,9 @@ class Envs:
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
     SGLANG_OPT_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
+    # Let moe_fused_gate hand the configs it covers to the one-warp-per-token
+    # CUDA router (moe_route_warp); off keeps them on the Triton router.
+    SGLANG_MOE_ROUTE_WARP = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

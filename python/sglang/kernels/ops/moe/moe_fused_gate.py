@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import logging
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -11,6 +13,8 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix, moe_route_warp
+
+logger = logging.getLogger(__name__)
 
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
@@ -326,6 +330,23 @@ def _router_triton_kernel(
         tl.store(out_p_ptr, packed, mask=store_mask)
 
 
+@functools.cache
+def _route_warp_enabled() -> bool:
+    """SGLANG_MOE_ROUTE_WARP, read once. On, the one-warp-per-token CUDA router
+    takes the configs it covers; off, they stay on the Triton router below."""
+    from sglang.srt.environ import envs
+
+    enabled = envs.SGLANG_MOE_ROUTE_WARP.get()
+    if enabled:
+        logger.info(
+            "MoE router: one-warp-per-token CUDA where it covers the config, "
+            "Triton otherwise (SGLANG_MOE_ROUTE_WARP=1)"
+        )
+    else:
+        logger.info("MoE router: Triton (SGLANG_MOE_ROUTE_WARP off)")
+    return enabled
+
+
 _DUMMY_I32: Dict[torch.device, torch.Tensor] = {}
 
 
@@ -476,9 +497,11 @@ def moe_fused_gate(
             return moe_route_radix.route_radix(*radix_args, sorted=False)
 
     # One-warp-per-token CUDA router: same selection, order and padding contract
-    # as the Triton kernel below.
+    # as the Triton kernel below. Opt-in: on SM120 it made DeepSeek-V4.1 decode
+    # slower at one stream.
     if (
-        moe_softcapping == 0.0
+        _route_warp_enabled()
+        and moe_softcapping == 0.0
         and moe_route_warp.covered(
             scores.dtype,
             scores.shape[1],
