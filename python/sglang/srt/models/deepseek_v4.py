@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -6115,6 +6116,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         if hotcold_map is not None:
             hotcold_map.check_complete()
+            if envs.SGLANG_DSV41_HOTCOLD_VERIFY_LOAD.get():
+                # Diagnostics: the loaded bytes against the shards, then a reference
+                # checksum each layer compares again at its first eager forward.
+                hotcold_map.verify_against_shards(
+                    params_dict, os.path.dirname(hotcold_map.manifest.path)
+                )
+                for layer_id in range(self.model.start_layer, self.model.end_layer):
+                    experts = getattr(self.model.layers[layer_id].mlp, "experts", None)
+                    if type(experts).__name__ == "HotColdFusedMoE":
+                        experts.arm_recheck()
         if skipped_by_group:
             log_info_on_rank0(
                 logger,

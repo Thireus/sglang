@@ -1975,6 +1975,14 @@ class Envs:
     SGLANG_HOTCOLD_COLD_KERNEL = EnvStr("auto")
     SGLANG_HOTCOLD_MMQ_MIN_TOKENS = EnvInt(64)
     SGLANG_DSV41_HOTCOLD_IMATRIX_DIR = EnvStr("")
+    # Hot/cold diagnostics: ZERO_COLD drops the cold tier's output at serve time
+    # (the layer behaves like a drop of its cold experts, router weights kept);
+    # VERIFY_LOAD compares every hot and cold tensor with the shard bytes after the
+    # load (one log line per layer) and checks the parameters again at a layer's
+    # first eager forward, and every RECHECK_EVERY eager forwards when > 0.
+    SGLANG_DSV41_HOTCOLD_ZERO_COLD = EnvBool(False)
+    SGLANG_DSV41_HOTCOLD_VERIFY_LOAD = EnvBool(False)
+    SGLANG_DSV41_HOTCOLD_RECHECK_EVERY = EnvInt(0)
     # DeepSeek-V4 default when a request carries no reasoning_effort: a
     # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

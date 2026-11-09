@@ -396,6 +396,73 @@ class TestImatrixCollector(_Base):
         self.assertEqual(data["l0.count"].tolist(), count.tolist())
 
 
+class TestDiagnostics(_Base):
+    """SGLANG_DSV41_HOTCOLD_ZERO_COLD and the post-load recheck."""
+
+    def test_zero_cold_returns_the_hot_tier_only(self):
+        with patch.dict(os.environ, {"SGLANG_DSV41_HOTCOLD_ZERO_COLD": "1"}):
+            from sglang.srt.models import deepseek_v2
+
+            mlp = deepseek_v2.DeepseekV2MoE(
+                config=fx.toy_hf_config(self.ckpt.path),
+                layer_id=0,
+                quant_config=fx.fp4_quant_config(),
+                prefix="model.layers.0.mlp",
+                is_deepseek_v4=True,
+            )
+        self.assertTrue(mlp.experts.zero_cold)
+        self.assertFalse(self.experts.zero_cold)
+        x = torch.randn(7, HID, generator=self.gen)
+        ids, weights = self.routes(HOT0 + COLD0)
+        full = self.run_layer(x, ids, weights)
+        self.experts.zero_cold = True
+        self.experts.cold.forward = MagicMock(
+            side_effect=AssertionError("the cold tier ran")
+        )
+        dropped = self.run_layer(x, ids, weights)
+        hot_ids, _ = self.experts.split_routes(ids)
+        with torch.no_grad():
+            hot_only = self.experts.hot(
+                x, StandardTopKOutput(weights, hot_ids, torch.zeros(7, 8))
+            )
+        self.assertTrue(torch.equal(dropped, hot_only))
+        self.assertFalse(torch.allclose(dropped, full))
+
+    def test_digest_sees_one_byte_and_a_swap(self):
+        from sglang.srt.layers.moe.hotcold import _digest
+
+        t = torch.arange(4096, dtype=torch.int32).view(torch.uint8)[:16381].clone()
+        ref = _digest([t])
+        one = t.clone()
+        one[16380] ^= 1
+        swap = t.clone()
+        swap[0:4], swap[4:8] = t[4:8].clone(), t[0:4].clone()
+        self.assertFalse(torch.equal(_digest([one]), ref))
+        self.assertFalse(torch.equal(_digest([swap]), ref))
+        self.assertTrue(torch.equal(_digest([t.clone()]), ref))
+
+    def test_recheck_logs_unchanged_then_changed(self):
+        x = torch.randn(5, HID, generator=self.gen)
+        ids, weights = self.routes(HOT0 + COLD0, tokens=5)
+        self.experts.arm_recheck()
+        with self.assertLogs("sglang.srt.layers.moe.hotcold", level="INFO") as logs:
+            self.run_layer(x, ids, weights)
+            self.run_layer(x, ids, weights)  # RECHECK_EVERY 0: the first forward only
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(
+            "recheck layer 0, eager forward 1 (5 tokens): cold rows unchanged, hot weights unchanged",
+            logs.output[0],
+        )
+        self.experts._recheck_every = 3
+        self.experts.cold.w13_qweight.data[2, 7, 11] ^= 0x40
+        with self.assertLogs("sglang.srt.layers.moe.hotcold", level="ERROR") as logs:
+            self.run_layer(x, ids, weights)
+        self.assertIn(
+            "eager forward 3 (5 tokens): cold rows CHANGED, hot weights unchanged",
+            logs.output[0],
+        )
+
+
 def build_model(ckpt_path, layer_range=(0, 2)):
     """DeepseekV4ForCausalLM's loader over production's DeepseekV2MoE layers."""
     from sglang.srt.models import deepseek_v2
@@ -515,6 +582,80 @@ class TestHybridLoad(CustomTestCase):
         self._assert_loaded(model, 1)
         self.assertTrue(
             torch.equal(model.model.layers[0].mlp.experts.cold.w13_qweight.data, before)
+        )
+
+    def test_verify_load_logs_every_layer_and_arms_the_recheck(self):
+        with (
+            torch.no_grad(),
+            patch.dict(os.environ, {"SGLANG_DSV41_HOTCOLD_VERIFY_LOAD": "1"}),
+        ):
+            model = build_model(self.ckpt.path)
+            with self.assertLogs(
+                "sglang.srt.model_loader.hotcold_manifest", level="INFO"
+            ) as logs:
+                model.load_weights(checkpoint_stream(self.ckpt.path))
+        lines = [
+            r.getMessage() for r in logs.records if "verify layer" in r.getMessage()
+        ]
+        self.assertEqual(
+            lines,
+            [
+                f"hot/cold verify layer {l}: hot 24/24 and cold 3/3 tensors byte-equal to the shards"
+                for l in (0, 1)
+            ],
+        )
+        for layer in model.model.layers:
+            self.assertIsNotNone(layer.mlp.experts._recheck_ref)
+
+    def test_verify_load_is_off_by_default(self):
+        with torch.no_grad():
+            model = build_model(self.ckpt.path)
+            model.load_weights(checkpoint_stream(self.ckpt.path))
+        for layer in model.model.layers:
+            self.assertIsNone(layer.mlp.experts._recheck_ref)
+
+    def test_verify_names_the_tensors_that_differ(self):
+        from sglang.srt.model_loader.hotcold_manifest import (
+            HotColdWeightMap,
+            manifest_of_config,
+        )
+
+        with torch.no_grad():
+            model = build_model(self.ckpt.path)
+            model.load_weights(checkpoint_stream(self.ckpt.path))
+            experts = model.model.layers[0].mlp.experts
+            experts.hot.w2_weight.data[1, 3, 5] ^= 0x11  # slot 1 = expert 2
+            experts.hot.w13_weight_scale_inv.data.view(torch.uint8)[3, 0, 0] ^= (
+                1  # slot 3 = expert 7, up rows
+            )
+            experts.cold.w13_qweight.data[0, INTER + 2, 9] ^= 0x80  # cold up rows (w3)
+            # gate and up swapped in hot slot 0 (expert 0): both halves differ
+            w13 = experts.hot.w13_weight.data[0]
+            w13.copy_(torch.cat([w13[INTER:].clone(), w13[:INTER].clone()]))
+            wm = HotColdWeightMap(manifest_of_config(model.config), (0, 2))
+            params = dict(model.named_parameters())
+            with self.assertLogs(
+                "sglang.srt.model_loader.hotcold_manifest", level="ERROR"
+            ) as logs:
+                report = wm.verify_against_shards(params, self.ckpt.path)
+        self.assertEqual(
+            sorted(report[0]["mismatch"]),
+            sorted(
+                [
+                    "layers.0.ffn.experts.2.w2.weight",
+                    "layers.0.ffn.experts.7.w3.scale",
+                    "layers.0.ffn.experts_cold.w3.qweight",
+                    "layers.0.ffn.experts.0.w1.weight",
+                    "layers.0.ffn.experts.0.w3.weight",
+                ]
+            ),
+        )
+        self.assertEqual(report[0]["hot"], (20, 24))
+        self.assertEqual(report[0]["cold"], (2, 3))
+        self.assertEqual(report[1]["mismatch"], [])
+        self.assertIn(
+            "hot/cold verify layer 0: hot 20/24 and cold 2/3 tensors byte-equal to the shards; MISMATCH 5",
+            logs.output[0],
         )
 
     def test_refusals(self):
