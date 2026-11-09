@@ -276,6 +276,7 @@ def cold_moe(
     reference_weights: Optional[tuple] = None,
     collector: Optional[HotColdImatrixCollector] = None,
     use_kernels: Optional[bool] = None,
+    kernel: Optional[str] = None,
 ) -> torch.Tensor:
     """Sum over the cold routes of ``topk_weights * expert(x)``; [tokens, hidden]."""
     tokens, hidden = x.shape
@@ -306,7 +307,8 @@ def cold_moe(
     )
     ids = ids.contiguous()
     rows2 = w2_qweight.shape[1]
-    kernel = select_cold_kernel(tokens, w13_type, w2_type)
+    if kernel is None:
+        kernel = select_cold_kernel(tokens, w13_type, w2_type)
     if kernel == "mmq":
         block = _mmq_block(w13_type)
         if _mmq_block(w2_type) != block:
@@ -495,7 +497,11 @@ class ColdGGUFExperts(nn.Module):
         return self._reference
 
     def forward(
-        self, x: torch.Tensor, topk_weights: torch.Tensor, cold_ids: torch.Tensor
+        self,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cold_ids: torch.Tensor,
+        kernel: Optional[str] = None,
     ) -> torch.Tensor:
         collector = HotColdImatrixCollector.get()
         if collector is not None:
@@ -518,4 +524,5 @@ class ColdGGUFExperts(nn.Module):
             layer_id=self.layer_id,
             reference_weights=None if x.is_cuda else self.reference_weights(),
             collector=collector,
+            kernel=kernel,
         )

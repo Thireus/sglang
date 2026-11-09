@@ -463,6 +463,32 @@ class TestDiagnostics(_Base):
         )
 
 
+class TestStats(_Base):
+    def test_stats_log_the_first_forwards_only(self):
+        x = torch.randn(6, HID, generator=self.gen)
+        # token 0 has no hot route (HOT0 = 0, 2, 5, 7); 8 of the 18 routes are hot
+        ids = torch.tensor(
+            [[1, 3, 4], [0, 1, 3], [2, 4, 6], [5, 7, 1], [0, 2, 5], [7, 3, 6]],
+            dtype=torch.int32,
+        )
+        weights = torch.rand(6, 3, generator=self.gen) + 0.1
+        plain = self.run_layer(x, ids, weights)
+        self.experts._stats_left = 2
+        with self.assertLogs("sglang.srt.layers.moe.hotcold", level="INFO") as logs:
+            for _ in range(3):
+                out = self.run_layer(x, ids, weights)
+        self.assertTrue(torch.equal(out, plain))
+        self.assertEqual(len(logs.records), 2)
+        line = logs.output[0]
+        self.assertIn("hot/cold stats layer 0: 6 tokens, x float32 contiguous", line)
+        self.assertIn("hot routes 44.4 %", line)
+        self.assertIn("all-cold tokens 16.7 %", line)
+        self.assertIn(
+            "nonfinite hot/cold 0/0; recompute on a copy: hot max|diff| 0.00e+00, cold kernel",
+            line,
+        )
+
+
 def build_model(ckpt_path, layer_range=(0, 2)):
     """DeepseekV4ForCausalLM's loader over production's DeepseekV2MoE layers."""
     from sglang.srt.models import deepseek_v2
