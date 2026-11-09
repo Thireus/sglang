@@ -4187,8 +4187,11 @@ class _Dsv41Diag:
         os.replace(path + ".tmp", path)
 
     def _save(self, name, record):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # The copies were queued on the current stream (after the engine's own
+        # joins of its side streams); waiting for the whole device could also wait
+        # on a pipeline transfer posted on another stream.
+        if any(isinstance(v, torch.Tensor) and v.is_cuda for v in record.values()):
+            torch.cuda.current_stream().synchronize()
         cpu = {
             k: (v.cpu() if isinstance(v, torch.Tensor) else v)
             for k, v in record.items()
