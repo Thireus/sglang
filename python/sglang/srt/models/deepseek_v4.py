@@ -150,7 +150,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -3948,6 +3948,400 @@ DeepseekV4DecoderLayer = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics: which forwards are real, and a per-layer dump of the first ones
+# ---------------------------------------------------------------------------
+
+
+def dsv41_forward_skip_reason(forward_batch, num_tokens: int, min_tokens: int):
+    """None for a real extend forward a diagnostic may record, else why not.
+
+    Skipped: a CUDA-graph capture (the stream's or the runner's capture mode,
+    breakable graphs included), the FlashInfer autotune warm-ups (DECODE dummies
+    at max_running_requests and at the largest graph batch, and its optional
+    EXTEND pass), every mode but EXTEND/MIXED (decode, idle, target verify, draft
+    extend), fewer than min_tokens tokens, and a batch whose longest request
+    extends by fewer than min_tokens (the 1-token-per-request EXTEND dummies)."""
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return "stream capture"
+    if get_is_capture_mode():
+        return "capture mode"
+    from sglang.srt.layers import logits_processor
+
+    if getattr(logits_processor, "_autotune_run_lm_head", None) is not None:
+        return "autotune warm-up"
+    mode = getattr(forward_batch, "forward_mode", None)
+    if mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+        return f"mode {getattr(mode, 'name', mode)}"
+    if num_tokens < min_tokens:
+        return f"{num_tokens} tokens"
+    lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if lens is not None and len(lens) > 0 and max(int(n) for n in lens) < min_tokens:
+        return f"longest request extends by {max(int(n) for n in lens)}"
+    return None
+
+
+def _parse_layer_set(spec: str):
+    """ "0-12,20" -> {0..12, 20}; "" -> None (every layer)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def _snap(t):
+    return t.detach().clone() if isinstance(t, torch.Tensor) else None
+
+
+def _list_of(v):
+    if v is None:
+        return None
+    if isinstance(v, torch.Tensor):
+        return v.detach().cpu().reshape(-1).tolist()
+    return [int(x) for x in v]
+
+
+class _Dsv41Diag:
+    """SGLANG_DSV41_DUMP_DIR / SGLANG_DSV41_HOTCOLD_STATS for one model stage.
+
+    Each forward of the stage asks ``dsv41_forward_skip_reason``; a real one sets
+    the hot/cold stats flag and, among the first DUMP_FORWARDS real ones, is
+    dumped: module hooks registered for that forward only (removed after it)
+    copy, per layer, the residual streams the attention reads and the attention
+    input, the residual streams the FFN reads and the MoE input, what the routed
+    experts receive (input, top-k ids and weights, router logits) and return, the
+    MoE pieces (routed, shared), and in a hot/cold layer the route split and both
+    tiers' outputs (hotcold._DUMP_SINK). At the layer's end the copies are
+    synchronised, moved to the CPU and saved as
+    DIR/pp{rank}/fwd{n}_layer{L}.pt; DIR/pp{rank}/fwd{n}_meta.json holds the
+    token ids, positions and lengths. Copies only: the forward computes the same
+    numbers. Nothing is created when both variables are unset."""
+
+    def __init__(self, dump_dir, forwards, min_tokens, layers):
+        self.dump_dir = dump_dir
+        self.forwards = forwards
+        self.min_tokens = min_tokens
+        self.layers = layers
+        self.real_forwards = 0
+        self._handles = []
+        self._records = {}
+        self._fwd = None
+        self._meta = None
+        self._dir = None
+        self._warned = set()
+
+    @classmethod
+    def from_env(cls):
+        dump_dir = envs.SGLANG_DSV41_DUMP_DIR.get()
+        if not dump_dir and envs.SGLANG_DSV41_HOTCOLD_STATS.get() <= 0:
+            return None
+        return cls(
+            dump_dir,
+            envs.SGLANG_DSV41_DUMP_FORWARDS.get(),
+            envs.SGLANG_DSV41_DUMP_MIN_TOKENS.get(),
+            _parse_layer_set(envs.SGLANG_DSV41_DUMP_LAYERS.get()),
+        )
+
+    @staticmethod
+    def _hotcold_module():
+        import sys
+
+        return sys.modules.get("sglang.srt.layers.moe.hotcold")
+
+    def _warn(self, what, exc):
+        if what not in self._warned:
+            self._warned.add(what)
+            logger.warning(
+                "dsv41 dump: %s failed (%r); the forward is unaffected", what, exc
+            )
+
+    # -- per forward ---------------------------------------------------------
+
+    def begin(self, model, input_ids, positions, forward_batch):
+        num_tokens = positions.shape[0] if positions is not None else input_ids.shape[0]
+        skip = dsv41_forward_skip_reason(forward_batch, num_tokens, self.min_tokens)
+        hc = self._hotcold_module()
+        if hc is not None:
+            hc.set_real_forward(skip is None)
+        if skip is not None:
+            return
+        n = self.real_forwards
+        self.real_forwards += 1
+        if not self.dump_dir or n >= self.forwards:
+            return
+        try:
+            self._start(model, n, input_ids, positions, forward_batch, num_tokens)
+        except Exception as e:  # never break serving for a diagnostic
+            self._warn("start", e)
+            self._stop()
+
+    def end(self, output):
+        hc = self._hotcold_module()
+        if hc is not None:
+            hc.set_real_forward(False)
+        if self._fwd is None:
+            return
+        try:
+            out = {}
+            tensors = getattr(output, "tensors", None)
+            if isinstance(tensors, dict):
+                out = {
+                    f"out_{k}": _snap(v)
+                    for k, v in tensors.items()
+                    if isinstance(v, torch.Tensor)
+                }
+            elif isinstance(output, (tuple, list)):
+                flat = []
+                for v in output:
+                    flat.extend(v if isinstance(v, (tuple, list)) else [v])
+                out = {
+                    f"out{i}": _snap(v)
+                    for i, v in enumerate(flat)
+                    if isinstance(v, torch.Tensor)
+                }
+            elif isinstance(output, torch.Tensor):
+                out = {"out0": _snap(output)}
+            if out:
+                self._save(f"fwd{self._fwd}_out.pt", out)
+            self._meta["stage_output"] = {k: list(v.shape) for k, v in out.items()}
+            self._meta["complete"] = True
+            self._write_meta()
+        except Exception as e:
+            self._warn("end", e)
+        finally:
+            self._stop()
+
+    def _start(self, model, n, input_ids, positions, forward_batch, num_tokens):
+        pp_rank = model.pp_group.rank_in_group
+        tag = f"pp{pp_rank}"
+        try:
+            parallel = get_parallel()
+            if parallel.tp_size > 1:
+                tag += f"_tp{parallel.tp_rank}"
+        except Exception:
+            pass
+        self._dir = os.path.join(self.dump_dir, tag)
+        os.makedirs(self._dir, exist_ok=True)
+        self._fwd = n
+        self._records = {}
+        local = [
+            i
+            for i in range(model.start_layer, model.end_layer)
+            if self.layers is None or i in self.layers
+        ]
+        mode = forward_batch.forward_mode
+        self._meta = dict(
+            forward=n,
+            pp_rank=pp_rank,
+            stage_layers=[model.start_layer, model.end_layer],
+            dumped_layers=local,
+            num_tokens=int(num_tokens),
+            forward_mode=getattr(mode, "name", str(mode)),
+            batch_size=getattr(forward_batch, "batch_size", None),
+            input_ids=_list_of(input_ids),
+            positions=_list_of(positions),
+            seq_lens=_list_of(getattr(forward_batch, "seq_lens_cpu", None)),
+            extend_seq_lens=_list_of(
+                getattr(forward_batch, "extend_seq_lens_cpu", None)
+            ),
+            extend_prefix_lens=_list_of(
+                getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            ),
+            time=time.time(),
+            files={},
+            complete=False,
+        )
+        self._write_meta()
+        for i in local:
+            self._hook_layer(i, model.layers[i])
+        hc = self._hotcold_module()
+        if hc is not None:
+            hc.set_dump_sink(self._sink)
+
+    def _stop(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+        self._records = {}
+        self._fwd = None
+        hc = self._hotcold_module()
+        if hc is not None:
+            hc.set_dump_sink(None)
+
+    def _write_meta(self):
+        import json
+
+        path = os.path.join(self._dir, f"fwd{self._fwd}_meta.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(self._meta, f)
+        os.replace(path + ".tmp", path)
+
+    def _save(self, name, record):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        cpu = {
+            k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+            for k, v in record.items()
+        }
+        path = os.path.join(self._dir, name)
+        torch.save(cpu, path + ".tmp")
+        os.replace(path + ".tmp", path)
+        self._meta["files"][name] = os.path.getsize(path)
+
+    # -- per layer -----------------------------------------------------------
+
+    def _put(self, layer_id, name, t, same_as=()):
+        """Copy t into the layer's record; a tensor equal to an earlier piece
+        named in same_as is stored as {name}_same_as instead."""
+        rec = self._records.get(layer_id)
+        if rec is None or not isinstance(t, torch.Tensor):
+            return
+        for other in same_as:
+            prev = rec.get(other)
+            if (
+                isinstance(prev, torch.Tensor)
+                and prev.shape == t.shape
+                and prev.dtype == t.dtype
+                and prev.device == t.device
+                and torch.equal(prev, t)
+            ):
+                rec[f"{name}_same_as"] = other
+                return
+        rec[name] = _snap(t)
+
+    def _sink(self, layer_id, **tensors):
+        for name, t in tensors.items():
+            self._put(layer_id, name, t)
+
+    def _hook_layer(self, layer_id, layer):
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        n = self._fwd
+
+        def guarded(what, fn):
+            def hook(*args):
+                try:
+                    fn(*args)
+                except Exception as e:
+                    self._warn(f"layer {layer_id} {what}", e)
+
+            return hook
+
+        def residual_of(forward_batch):
+            r = residual_batch.written_residual(forward_batch)
+            return r if isinstance(r, torch.Tensor) else getattr(r, "streams", None)
+
+        def layer_pre(module, args, kwargs):
+            self._records[layer_id] = dict(
+                layer=layer_id,
+                forward=n,
+                pp_rank=self._meta["pp_rank"],
+                hotcold=type(getattr(module.mlp, "experts", None)).__name__
+                == "HotColdFusedMoE",
+            )
+            self._put(layer_id, "positions", kwargs.get("positions"))
+            self._put(layer_id, "input_ids", kwargs.get("input_ids"))
+
+        def attn_pre(module, args, kwargs):
+            x = kwargs.get("x", args[0] if args else None)
+            fb = kwargs.get("forward_batch")
+            self._put(layer_id, "attn_in", x)
+            if fb is not None:
+                self._put(layer_id, "residual", residual_of(fb))
+
+        def mlp_pre(module, args, kwargs):
+            x = args[0] if args else kwargs.get("hidden_states")
+            fb = args[1] if len(args) > 1 else kwargs.get("forward_batch")
+            self._put(layer_id, "moe_in", x)
+            if fb is not None:
+                self._put(layer_id, "ffn_residual", residual_of(fb))
+
+        def experts_pre(module, args, kwargs):
+            x = args[0] if args else kwargs.get("hidden_states")
+            topk = args[1] if len(args) > 1 else kwargs.get("topk_output")
+            self._put(layer_id, "experts_in", x, same_as=("moe_in",))
+            rec = self._records.get(layer_id)
+            if topk is not None and rec is not None:
+                rec["topk_format"] = str(getattr(topk, "format", type(topk).__name__))
+                if TopKOutputChecker.format_is_standard(topk):
+                    self._put(layer_id, "topk_ids", topk.topk_ids)
+                    self._put(layer_id, "topk_weights", topk.topk_weights)
+                self._put(
+                    layer_id, "router_logits", getattr(topk, "router_logits", None)
+                )
+
+        def experts_post(module, args, kwargs, output):
+            if isinstance(output, torch.Tensor):
+                self._put(layer_id, "routed_out", output)
+
+        def mlp_post(module, args, kwargs, output):
+            if isinstance(output, torch.Tensor):
+                self._put(layer_id, "mlp_out", output)
+                return
+            rec = self._records.get(layer_id)
+            if rec is not None:
+                rec["mlp_out_type"] = type(output).__name__
+            for field in ("routed", "shared"):
+                self._put(
+                    layer_id,
+                    f"moe_{field}",
+                    getattr(output, field, None),
+                    same_as=("routed_out",) if field == "routed" else (),
+                )
+
+        def layer_post(module, args, kwargs, output):
+            rec = self._records.pop(layer_id, None)
+            if rec is not None:
+                self._save(f"fwd{n}_layer{layer_id}.pt", rec)
+                self._write_meta()
+
+        reg = self._handles.append
+        reg(
+            layer.register_forward_pre_hook(guarded("pre", layer_pre), with_kwargs=True)
+        )
+        reg(layer.register_forward_hook(guarded("save", layer_post), with_kwargs=True))
+        if getattr(layer, "self_attn", None) is not None:
+            reg(
+                layer.self_attn.register_forward_pre_hook(
+                    guarded("attn", attn_pre), with_kwargs=True
+                )
+            )
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            reg(
+                mlp.register_forward_pre_hook(
+                    guarded("mlp in", mlp_pre), with_kwargs=True
+                )
+            )
+            reg(
+                mlp.register_forward_hook(
+                    guarded("mlp out", mlp_post), with_kwargs=True
+                )
+            )
+            experts = getattr(mlp, "experts", None)
+            if isinstance(experts, nn.Module):
+                reg(
+                    experts.register_forward_pre_hook(
+                        guarded("experts in", experts_pre), with_kwargs=True
+                    )
+                )
+                reg(
+                    experts.register_forward_hook(
+                        guarded("experts out", experts_post), with_kwargs=True
+                    )
+                )
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
@@ -3955,6 +4349,8 @@ class DeepseekV4Model(nn.Module):
     # Not a module, so a class default does not shadow the instance's; the
     # replayed modules (pp_sources) exist only where a plan does.
     pp_source_plan = None
+    # SGLANG_DSV41_DUMP_DIR / SGLANG_DSV41_HOTCOLD_STATS; None when both are unset.
+    dsv41_diag: Optional[_Dsv41Diag] = None
 
     def __init__(
         self,
@@ -3965,6 +4361,7 @@ class DeepseekV4Model(nn.Module):
         super().__init__()
         self.config = config
         self.pp_group = get_parallel().pp_group
+        self.dsv41_diag = _Dsv41Diag.from_env()
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -4718,6 +5115,29 @@ class DeepseekV4Model(nn.Module):
 
     @torch.no_grad()
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        diag = self.dsv41_diag
+        if diag is None:
+            return self._forward_entry(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        diag.begin(self, input_ids, positions, forward_batch)
+        output = None
+        try:
+            output = self._forward_entry(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+            return output
+        finally:
+            diag.end(output)
+
+    def _forward_entry(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,

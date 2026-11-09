@@ -1983,10 +1983,20 @@ class Envs:
     SGLANG_DSV41_HOTCOLD_ZERO_COLD = EnvBool(False)
     SGLANG_DSV41_HOTCOLD_VERIFY_LOAD = EnvBool(False)
     SGLANG_DSV41_HOTCOLD_RECHECK_EVERY = EnvInt(0)
-    # The first N eager forwards of each hot/cold layer log their routing and the
+    # The first N real extend forwards (the dump's filter below: no warm-up, no
+    # capture, no decode) of each hot/cold layer log their routing and the
     # two tiers' output sizes, and recompute both tiers (the cold one with its
     # other kernel) on a copy of the input to compare.
     SGLANG_DSV41_HOTCOLD_STATS = EnvInt(0)
+    # DeepSeek-V4 per-layer dump of the first DUMP_FORWARDS real extend forwards
+    # (DUMP_MIN_TOKENS or more tokens, a request of at least that many, never a
+    # capture or a warm-up; the hot/cold stats use the same filter) into
+    # DUMP_DIR/pp{rank}/fwd{n}_layer{L}.pt and fwd{n}_meta.json. DUMP_LAYERS
+    # narrows the layers ("0-12,20"); empty dumps every layer of the stage.
+    SGLANG_DSV41_DUMP_DIR = EnvStr("")
+    SGLANG_DSV41_DUMP_FORWARDS = EnvInt(4)
+    SGLANG_DSV41_DUMP_MIN_TOKENS = EnvInt(64)
+    SGLANG_DSV41_DUMP_LAYERS = EnvStr("")
     # DeepSeek-V4 default when a request carries no reasoning_effort: a
     # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
