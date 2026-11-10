@@ -12,7 +12,9 @@ padded ones included, gives exactly 0): gate/up projection, the clamped SwiGLU
 projection, route weights, sum over top-k. On CUDA the projections are the
 GGUF vector kernel or, above ``SGLANG_HOTCOLD_MMQ_MIN_TOKENS`` tokens, the MoE
 MMQ kernel when it is built for the cold types (``SGLANG_HOTCOLD_COLD_KERNEL``
-switches). Off CUDA the projections are a float reference that dequantises the
+switches). An eager MMQ call (a prefill) keeps the rows of the cold routes only
+(``SGLANG_HOTCOLD_PREFILL_COMPACT``): same bits, a fraction of the memory
+traffic. Off CUDA the projections are a float reference that dequantises the
 rows (IQ2_S through gguf-py); it is what the CPU tests run and it does not
 reproduce the kernels' q8_1 activation rounding.
 """
@@ -54,6 +56,8 @@ _COLD_KERNEL_MODES = ("auto", "vec", "vecm", "mmq", "legacy")
 _IQ2_S = 22
 # Routes of one expert per CTA the wide-block MMQ kernel is built for (gguf_moe_mmq_wide.py).
 _MMQ_WIDE_BLOCKS = (16, 32, 64, 128)
+# The same for the staged MMQ kernel (gguf_moe_mmq_staged.py).
+_MMQ_STAGED_BLOCKS = (32, 64)
 
 
 def _cold_kernel_mode() -> str:
@@ -118,6 +122,51 @@ def select_mmq_wide(tokens: int, w13_type: int, w2_type: int) -> int:
             f"SGLANG_HOTCOLD_MMQ_WIDE must be 0 or one of {_MMQ_WIDE_BLOCKS}, got {wide}"
         )
     return wide
+
+
+def select_mmq_staged(tokens: int, w13_type: int, w2_type: int) -> int:
+    """Routes of one expert per CTA of the staged MMQ kernel for this batch
+    (SGLANG_HOTCOLD_MMQ_STAGED; IQ2_S only), or 0 for the wide-block or 16-route
+    kernel. Same bits either way; one answer per (tokens, types)."""
+    if _cold_kernel_mode() == "legacy" or {int(w13_type), int(w2_type)} != {_IQ2_S}:
+        return 0
+    staged = envs.SGLANG_HOTCOLD_MMQ_STAGED.get()
+    if staged <= 0:
+        return 0
+    if staged not in _MMQ_STAGED_BLOCKS:
+        raise ValueError(
+            f"SGLANG_HOTCOLD_MMQ_STAGED must be 0 or one of {_MMQ_STAGED_BLOCKS}, got {staged}"
+        )
+    return staged
+
+
+def select_prefill_float(tokens: int, w13_type: int, w2_type: int) -> bool:
+    """Whether the staged kernel's products run in half-float arithmetic on the
+    unquantised activations (SGLANG_HOTCOLD_PREFILL_FLOAT; IQ2_S on the staged
+    kernel only). It changes the output bits of the calls above the MMQ threshold
+    (closer to the fp32 product of the dequantised weights: no 8-bit rounding of
+    the activations); one answer per (tokens, types)."""
+    return (
+        bool(envs.SGLANG_HOTCOLD_PREFILL_FLOAT.get())
+        and select_mmq_staged(tokens, w13_type, w2_type) > 0
+    )
+
+
+def select_prefill_compact(x: torch.Tensor, top_k: int, collector) -> bool:
+    """Whether an MMQ call keeps the rows of the cold routes only (h, a and y of
+    [cold routes, .] instead of [tokens * top_k, .], and one weighted sum over
+    them). Eager calls only: the row count is read on the host, which a captured
+    graph cannot do, and no captured batch reaches the MMQ threshold. The imatrix
+    collector reads the dense layout, and moe_sum has kernels of its own for a
+    top-k of 2 to 4 that the compact sum does not reproduce. The host read sits
+    behind the gate/up kernel (cold_moe), so the device does not idle for it."""
+    if not envs.SGLANG_HOTCOLD_PREFILL_COMPACT.get() or collector is not None:
+        return False
+    if _cold_kernel_mode() == "legacy":
+        return False
+    if x.is_cuda and torch.cuda.is_current_stream_capturing():
+        return False
+    return _compact_sum_serves(x.dtype, top_k)
 
 
 def select_mmq_block(tokens: int, qtype: int) -> int:
@@ -292,7 +341,18 @@ def _mmq_project(
 
 
 def _mmq_wide_project(
-    x, weight, sorted_ids, expert_ids, post_padded, qtype, rows, top_k, tokens, wide
+    x,
+    weight,
+    sorted_ids,
+    expert_ids,
+    post_padded,
+    qtype,
+    rows,
+    top_k,
+    tokens,
+    wide,
+    sorted_rows=None,
+    out_rows=None,
 ):
     from sglang.kernels.ops.moe.gguf_moe_mmq_wide import gguf_moe_mmq_wide
 
@@ -309,7 +369,106 @@ def _mmq_wide_project(
         tokens,
         wide,
         zero_init=False,
+        sorted_rows=sorted_rows,
+        out_rows=out_rows,
     )
+
+
+def _mmq_staged_project(
+    x,
+    weight,
+    sorted_ids,
+    expert_ids,
+    post_padded,
+    qtype,
+    rows,
+    top_k,
+    tokens,
+    wide,
+    sorted_rows=None,
+    out_rows=None,
+):
+    from sglang.kernels.ops.moe.gguf_moe_mmq_staged import gguf_moe_mmq_staged
+
+    return gguf_moe_mmq_staged(
+        x,
+        weight,
+        sorted_ids,
+        expert_ids,
+        post_padded,
+        qtype,
+        rows,
+        top_k,
+        tokens,
+        wide,
+        zero_init=False,
+        sorted_rows=sorted_rows,
+        out_rows=out_rows,
+    )
+
+
+def _f16_staged_project(
+    x,
+    weight,
+    sorted_ids,
+    expert_ids,
+    post_padded,
+    qtype,
+    rows,
+    top_k,
+    tokens,
+    wide,
+    sorted_rows=None,
+    out_rows=None,
+):
+    from sglang.kernels.ops.moe.gguf_moe_f16_staged import gguf_moe_f16_staged
+
+    return gguf_moe_f16_staged(
+        x,
+        weight,
+        sorted_ids,
+        expert_ids,
+        post_padded,
+        qtype,
+        rows,
+        top_k,
+        tokens,
+        wide,
+        zero_init=False,
+        sorted_rows=sorted_rows,
+        out_rows=out_rows,
+    )
+
+
+def _compact_sum_serves(dtype, top_k):
+    from sglang.kernels.ops.moe.gguf_moe_cold_sum import gguf_moe_cold_sum_serves
+
+    return gguf_moe_cold_sum_serves(dtype, top_k)
+
+
+def _compact_rows(ids):
+    """(rows, count): the row of every cold route in a compact [count, .] layout
+    (int32 [tokens, top_k], route order, -1 for the other routes) and the number
+    of cold routes as a 0-d int32 tensor on the device (no host read here)."""
+    active = ids.reshape(-1) >= 0
+    rows = torch.cumsum(active, dim=0, dtype=torch.int32) - 1
+    count = rows[-1] + 1
+    return rows.masked_fill(~active, -1).view(ids.shape), count
+
+
+def _compact_sorted_rows(sorted_ids, rows, count):
+    """The compact row of every sorted column of the alignment: padding (ids past
+    the routes) maps to ``count`` (a 0-d tensor), an inactive route to -1; both
+    are skipped by the kernels, as outputs and as the down projection's sorted ids."""
+    numel = rows.numel()
+    picked = rows.reshape(-1).index_select(0, sorted_ids.clamp(0, numel - 1))
+    return torch.where((sorted_ids >= 0) & (sorted_ids < numel), picked, count)
+
+
+def _compact_weight_and_sum(y, topk_weights, rows):
+    from sglang.kernels.ops.moe.gguf_moe_cold_sum import gguf_moe_cold_sum
+
+    return gguf_moe_cold_sum(y, rows, topk_weights)
 
 
 def _vecm_project(
@@ -428,16 +587,76 @@ def cold_moe(
             # the vector kernel's arithmetic, `block` routes of one expert per CTA
             block, project = envs.SGLANG_HOTCOLD_VECM_ROUTES.get(), _vecm_project
         else:
+            compact = False
             block, project = (
-                select_mmq_wide(tokens, w13_type, w2_type),
-                _mmq_wide_project,
+                select_mmq_staged(tokens, w13_type, w2_type),
+                _mmq_staged_project,
             )
+            if block and select_prefill_float(tokens, w13_type, w2_type):
+                project = (
+                    _f16_staged_project  # not the int8 kernels' bits: behind its switch
+                )
+            if block == 0:
+                block, project = (
+                    select_mmq_wide(tokens, w13_type, w2_type),
+                    _mmq_wide_project,
+                )
             if block == 0:
                 block, project = select_mmq_block(tokens, w13_type), _mmq_project
                 if select_mmq_block(tokens, w2_type) != block:
                     raise RuntimeError(
                         "the cold w13 and w2 types need one MMQ block size"
                     )
+            else:
+                compact = select_prefill_compact(x, top_k, collector)
+            if compact:
+                # The same arithmetic per route on [cold routes, .] tensors: the kernels
+                # write each route's row at its compact position, the SwiGLU and the down
+                # projection's activation quantisation run over those rows only, and one
+                # kernel applies the route weights and sums in the dense path's rounding
+                # and order (gguf_moe_cold_sum.py). Same output bits.
+                rows, count = _compact_rows(ids)
+                sorted_ids, expert_ids, post_padded = _mmq_align(
+                    ids, block, w13_qweight.shape[0]
+                )
+                sorted_rows = _compact_sorted_rows(sorted_ids, rows, count)
+                # The gate/up kernel is launched into a buffer of the static bound (only its first
+                # rows are written) BEFORE the cold route count is read on the host: the read then
+                # waits behind that kernel instead of leaving the device idle while the next
+                # launches are prepared.
+                h = project(
+                    x,
+                    w13_qweight,
+                    sorted_ids,
+                    expert_ids,
+                    post_padded,
+                    w13_type,
+                    inter2,
+                    top_k,
+                    tokens,
+                    block,
+                    sorted_rows=sorted_rows,
+                    out_rows=tokens * top_k,
+                )
+                count = int(count)
+                if count == 0:
+                    return x.new_zeros((tokens, rows2))
+                h = h[:count]
+                a = _clamped_swiglu(h, swiglu_limit)
+                # the down projection's input is one row per cold route: its sorted ids are the compact rows
+                y = project(
+                    a,
+                    w2_qweight,
+                    sorted_rows,
+                    expert_ids,
+                    post_padded,
+                    w2_type,
+                    rows2,
+                    1,
+                    count,
+                    block,
+                )
+                return _compact_weight_and_sum(y, topk_weights, rows)
         sorted_ids, expert_ids, post_padded = _mmq_align(
             ids, block, w13_qweight.shape[0]
         )
@@ -605,8 +824,34 @@ class ColdGGUFExperts(nn.Module):
             )
         mmq = mode not in ("vec", "vecm") and set(types) <= _mmq_types()
         # one answer per types: the token count does not enter
-        wide = select_mmq_wide(0, self.w13_type, self.w2_type) if mmq else 0
-        if wide:
+        staged = select_mmq_staged(0, self.w13_type, self.w2_type) if mmq else 0
+        wide = (
+            select_mmq_wide(0, self.w13_type, self.w2_type) if mmq and not staged else 0
+        )
+        compact = bool(staged or wide) and envs.SGLANG_HOTCOLD_PREFILL_COMPACT.get()
+        if compact:
+            from sglang.kernels.ops.moe.gguf_moe_cold_sum import (
+                _jit_gguf_moe_cold_sum_module,
+            )
+
+            # the routed top-k is not known here: built for DeepSeek-V4's six; another top-k builds at its first call
+            _jit_gguf_moe_cold_sum_module(torch.bfloat16, 6)
+        half_float = bool(staged) and select_prefill_float(
+            0, self.w13_type, self.w2_type
+        )
+        if half_float:
+            from sglang.kernels.ops.moe.gguf_moe_f16_staged import (
+                _jit_gguf_moe_f16_staged_module,
+            )
+
+            _jit_gguf_moe_f16_staged_module(torch.bfloat16, _IQ2_S, staged)
+        elif staged:
+            from sglang.kernels.ops.moe.gguf_moe_mmq_staged import (
+                _jit_gguf_moe_mmq_staged_module,
+            )
+
+            _jit_gguf_moe_mmq_staged_module(torch.bfloat16, _IQ2_S, staged)
+        elif wide:
             from sglang.kernels.ops.moe.gguf_moe_mmq_wide import (
                 _jit_gguf_moe_mmq_wide_module,
             )
@@ -640,6 +885,17 @@ class ColdGGUFExperts(nn.Module):
                     if mode == "legacy"
                     else "vector kernel"
                 )
+            if staged:
+                build = f"staged block {staged}"
+            elif wide:
+                build = f"wide block {wide}"
+            else:
+                build = f"block {_mmq_block(types[0])}" if mmq else ""
+            if compact:
+                build += ", compact rows"
+            if half_float:
+                # SGLANG_HOTCOLD_PREFILL_FLOAT: other output bits than the int8 kernels above the threshold
+                build += ", half-float products"
             # The line keeps its first three fields (the boot proof reads them); the rest names the builds.
             logger.info(
                 "hot/cold cold tier: kernel mode %s, vector kernel built for ggml type %s, "
@@ -647,8 +903,7 @@ class ColdGGUFExperts(nn.Module):
                 mode,
                 "/".join(str(t) for t in types),
                 (
-                    f"built ({f'wide block {wide}' if wide else f'block {_mmq_block(types[0])}'}) above "
-                    f"{envs.SGLANG_HOTCOLD_MMQ_MIN_TOKENS.get()} tokens"
+                    f"built ({build}) above {envs.SGLANG_HOTCOLD_MMQ_MIN_TOKENS.get()} tokens"
                     if mmq
                     else "off"
                 ),

@@ -1,7 +1,8 @@
 """The cold tier's kernel choice and the grouped routing of the hot/cold MoE, on CPU.
 
-* ``select_cold_kernel`` / ``select_mmq_wide``: the rule by token count and ggml
-  type, every switch, and the "legacy" mode that restores the earlier kernels.
+* ``select_cold_kernel`` / ``select_mmq_wide`` / ``select_mmq_staged`` /
+  ``select_prefill_compact``: the rule by token count and ggml type, every switch,
+  and the "legacy" mode that restores the earlier kernels.
 * The routing the grouped kernels read (``moe_align_block_size`` blocks, the lanes of
   the multi-route vector kernel, the column groups and passes of the wide-block MMQ
   kernel), through the CPU model in sglang/test/kernels/gguf_moe_grouped_reference.py:
@@ -11,6 +12,9 @@
 * ``cold_moe``'s CUDA branch on the toy checkpoint with the grouped kernels replaced
   by float stand-ins that walk that routing: the block sizes it asks the alignment
   for, one alignment for both projections, and the float reference's numbers.
+* The compact layout of an eager MMQ call (one row per cold route): the row map, the
+  sorted rows handed to the kernels, and the same numbers as the dense layout, on
+  routes with a top-k of 6 (the toy checkpoint's own top-k of 3 keeps the dense one).
 
 The kernels' own numerics and their bit equality with the kernels they replace are
 GPU tests (test/registered/kernels/ops/moe/test_gguf_moe_grouped_iq2s.py).
@@ -38,6 +42,9 @@ SWITCHES = (
     "SGLANG_HOTCOLD_MMQ_MIN_TOKENS",
     "SGLANG_HOTCOLD_MMQ_WIDE",
     "SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS",
+    "SGLANG_HOTCOLD_MMQ_STAGED",
+    "SGLANG_HOTCOLD_PREFILL_COMPACT",
+    "SGLANG_HOTCOLD_PREFILL_FLOAT",
     "SGLANG_HOTCOLD_VEC_MULTI",
     "SGLANG_HOTCOLD_VEC_MULTI_MIN_TOKENS",
     "SGLANG_HOTCOLD_VECM_ROUTES",
@@ -130,6 +137,81 @@ class TestColdKernelChoice(CustomTestCase):
         with _env(SGLANG_HOTCOLD_MMQ_WIDE=48):
             with self.assertRaises(ValueError):
                 hc.select_mmq_wide(2048, 22, 22)
+
+    def test_staged_choice(self):
+        with _env():
+            self.assertEqual(hc.select_mmq_staged(2048, 22, 22), 64)
+            self.assertEqual(
+                hc.select_mmq_staged(65, 22, 22), 64
+            )  # one answer whatever the size
+            self.assertEqual(hc.select_mmq_staged(2048, 144, 144), 0)
+            self.assertEqual(hc.select_mmq_staged(2048, 22, 145), 0)
+        with _env(SGLANG_HOTCOLD_MMQ_STAGED=0):
+            self.assertEqual(hc.select_mmq_staged(2048, 22, 22), 0)
+        with _env(SGLANG_HOTCOLD_MMQ_STAGED=32):
+            self.assertEqual(hc.select_mmq_staged(2048, 22, 22), 32)
+        with _env(SGLANG_HOTCOLD_MMQ_STAGED=16):
+            with self.assertRaises(ValueError):
+                hc.select_mmq_staged(2048, 22, 22)
+        with _env(SGLANG_HOTCOLD_COLD_KERNEL="legacy"):
+            self.assertEqual(hc.select_mmq_staged(2048, 22, 22), 0)
+
+    def test_float_choice(self):
+        with _env():
+            self.assertFalse(
+                hc.select_prefill_float(2048, 22, 22)
+            )  # off by default: other output bits
+        with _env(SGLANG_HOTCOLD_PREFILL_FLOAT=1):
+            self.assertTrue(hc.select_prefill_float(2048, 22, 22))
+            self.assertTrue(hc.select_prefill_float(65, 22, 22))
+            self.assertFalse(hc.select_prefill_float(2048, 144, 144))  # IQ2_S only
+            # a decode batch never reaches it: the kernel choice stays a vector kernel up to the threshold
+            with patch.object(hc, "_mmq_types", lambda: BUILT):
+                self.assertEqual(hc.select_cold_kernel(54, 22, 22), "vecm")
+                self.assertEqual(hc.select_cold_kernel(64, 22, 22), "vecm")
+                self.assertEqual(hc.select_cold_kernel(65, 22, 22), "mmq")
+        with _env(SGLANG_HOTCOLD_PREFILL_FLOAT=1, SGLANG_HOTCOLD_MMQ_STAGED=0):
+            self.assertFalse(
+                hc.select_prefill_float(2048, 22, 22)
+            )  # it is the staged kernel's arithmetic
+        with _env(SGLANG_HOTCOLD_PREFILL_FLOAT=1, SGLANG_HOTCOLD_COLD_KERNEL="legacy"):
+            self.assertFalse(hc.select_prefill_float(2048, 22, 22))
+
+    def test_compact_choice(self):
+        x = torch.zeros(4, 8, dtype=torch.bfloat16)
+        with patch.object(hc, "_compact_sum_serves", lambda dtype, top_k: top_k > 4):
+            with _env():
+                self.assertTrue(hc.select_prefill_compact(x, 6, None))
+                self.assertFalse(
+                    hc.select_prefill_compact(x, 3, None)
+                )  # moe_sum's own kernels for 2..4
+                self.assertFalse(
+                    hc.select_prefill_compact(x, 6, object())
+                )  # the imatrix collector reads the dense layout
+            with _env(SGLANG_HOTCOLD_PREFILL_COMPACT=0):
+                self.assertFalse(hc.select_prefill_compact(x, 6, None))
+            with _env(SGLANG_HOTCOLD_COLD_KERNEL="legacy"):
+                self.assertFalse(hc.select_prefill_compact(x, 6, None))
+
+    def test_compact_rows(self):
+        ids = torch.tensor([[1, -1, 3], [-1, -1, -1], [0, 2, -1]], dtype=torch.int32)
+        rows, count = hc._compact_rows(ids)
+        self.assertEqual(
+            (rows.tolist(), int(count)), ([[0, -1, 1], [-1, -1, -1], [2, 3, -1]], 4)
+        )
+        self.assertEqual(
+            (rows.dtype, count.dtype, count.dim()), (torch.int32, torch.int32, 0)
+        )  # the count stays a tensor
+        # sorted columns: an active route takes its compact row, padding (9 = numel) the count, an inactive route -1
+        sorted_ids = torch.tensor(
+            [1, 4, 5, 8, 6, 0, 9, 9, 2, 7, 9, 9], dtype=torch.int32
+        )
+        self.assertEqual(
+            hc._compact_sorted_rows(sorted_ids, rows, count).tolist(),
+            [-1, -1, -1, -1, 2, 0, 4, 4, 1, 3, 4, 4],
+        )
+        none, zero = hc._compact_rows(torch.full((5, 6), -1, dtype=torch.int32))
+        self.assertEqual((int(zero), int(none.max())), (0, -1))
 
 
 def _edge_routes(tokens, top_k, experts, gen):
@@ -305,11 +387,27 @@ class TestColdMoeGroupedPaths(CustomTestCase):
                 top_k,
                 tokens,
                 block,
+                sorted_rows=None,
+                out_rows=None,
             ):
-                calls.append((kind, tokens, top_k, rows, block))
                 dense = w13_f if weight is cold.w13_qweight else w2_f
                 numel = tokens * top_k
-                out = torch.zeros(numel, rows, dtype=torch.float32)
+                if sorted_rows is None:
+                    calls.append((kind, tokens, top_k, rows, block))
+                    out = torch.zeros(numel, rows, dtype=torch.float32)
+                    place = lambda route: route
+                else:
+                    # a compact output: NaN where the kernel would write nothing, so a missed row shows
+                    calls.append((kind, tokens, top_k, rows, block, "rows", out_rows))
+                    out = torch.full(
+                        (out_rows, rows), float("nan"), dtype=torch.float32
+                    )
+                    row_of = {
+                        s: r
+                        for s, r in zip(sorted_ids.tolist(), sorted_rows.tolist())
+                        if 0 <= s < numel
+                    }
+                    place = lambda route: row_of[route]
                 seen = []
                 for _, _, expert, valid in gr.lane_walk(
                     sorted_ids.tolist(),
@@ -322,12 +420,23 @@ class TestColdMoeGroupedPaths(CustomTestCase):
                     len(expert_ids),
                 ):
                     for route in valid:
-                        out[route] = dense[expert] @ x[route // top_k].float()
+                        out[place(route)] = dense[expert] @ x[route // top_k].float()
                         seen.append(route)
                 assert len(seen) == len(set(seen)), "a route was written twice"
                 return out.to(x.dtype)
 
             return project
+
+        def compact_weight_and_sum(y, topk_weights, rows):
+            calls.append(("compact sum", y.shape[0]))
+            assert not bool(y.isnan().any()), "a compact row was not written"
+            active = rows >= 0
+            terms = (
+                y.float()[rows.clamp_min(0).long()] * topk_weights.float().unsqueeze(-1)
+            ).to(y.dtype)
+            return (
+                terms.float().masked_fill(~active.unsqueeze(-1), 0).sum(1).to(y.dtype)
+            )
 
         def vec(x, weight, ids, top_k, qtype, rows, tokens):
             calls.append(("vec", tokens, top_k, rows, hc._vec_rows_per_block()))
@@ -349,6 +458,10 @@ class TestColdMoeGroupedPaths(CustomTestCase):
             patch.object(hc, "_vecm_project", grouped("vecm")),
             patch.object(hc, "_mmq_project", grouped("mmq")),
             patch.object(hc, "_mmq_wide_project", grouped("wide")),
+            patch.object(hc, "_mmq_staged_project", grouped("staged")),
+            patch.object(hc, "_f16_staged_project", grouped("half-float")),
+            patch.object(hc, "_compact_sum_serves", lambda dtype, top_k: top_k > 4),
+            patch.object(hc, "_compact_weight_and_sum", compact_weight_and_sum),
             patch.object(hc, "_clamped_swiglu", hc._clamped_swiglu_reference),
             patch.object(hc, "_weight_and_sum", weight_and_sum),
         ]
@@ -411,13 +524,24 @@ class TestColdMoeGroupedPaths(CustomTestCase):
             [("vec", 7, 3, 512, 1), ("vec", 21, 1, 256, 1)],
         )
 
-    def test_prefill_takes_the_wide_block_kernel(self):
+    def test_prefill_takes_the_staged_kernel(self):
+        # the toy checkpoint's top-k is 3: the dense layout (moe_sum has a kernel of its own for it)
         calls = self._run(70)
+        self.assertEqual(
+            calls,
+            [("align", 64, 4), ("staged", 70, 3, 512, 64), ("staged", 210, 1, 256, 64)],
+        )
+        calls = self._run(70, SGLANG_HOTCOLD_MMQ_STAGED=32)
+        self.assertEqual(
+            calls,
+            [("align", 32, 4), ("staged", 70, 3, 512, 32), ("staged", 210, 1, 256, 32)],
+        )
+        calls = self._run(70, SGLANG_HOTCOLD_MMQ_STAGED=0)
         self.assertEqual(
             calls,
             [("align", 64, 4), ("wide", 70, 3, 512, 64), ("wide", 210, 1, 256, 64)],
         )
-        calls = self._run(70, SGLANG_HOTCOLD_MMQ_WIDE=0)
+        calls = self._run(70, SGLANG_HOTCOLD_MMQ_STAGED=0, SGLANG_HOTCOLD_MMQ_WIDE=0)
         self.assertEqual(
             calls, [("align", 16, 4), ("mmq", 70, 3, 512, 16), ("mmq", 210, 1, 256, 16)]
         )
@@ -425,6 +549,159 @@ class TestColdMoeGroupedPaths(CustomTestCase):
         self.assertEqual(
             calls, [("align", 16, 4), ("mmq", 70, 3, 512, 16), ("mmq", 210, 1, 256, 16)]
         )
+
+    def _run_top6(self, tokens, cold_ids=None, **kv):
+        """cold_moe on routes with a top-k of 6 over the toy layer's four cold experts."""
+        top_k = 6
+        x = torch.randn(tokens, 256, generator=self.gen)
+        if cold_ids is None:
+            cold_ids = torch.randint(
+                0, 4, (tokens, top_k), generator=self.gen, dtype=torch.int32
+            )
+            cold_ids[torch.rand(tokens, top_k, generator=self.gen) < 0.6] = -1
+        w = torch.rand(tokens, top_k, generator=self.gen) + 0.1
+        args = (
+            x,
+            self.cold.w13_qweight,
+            self.cold.w2_qweight,
+            w,
+            cold_ids,
+            22,
+            22,
+            LIMIT,
+        )
+        expect = hc.cold_moe(
+            *args, reference_weights=self.cold.reference_weights(), use_kernels=False
+        )
+        calls = []
+        with _env(**kv):
+            ctx = self._seams(calls)
+            for c in ctx:
+                c.start()
+            try:
+                got = hc.cold_moe(*args, use_kernels=True)
+            finally:
+                for c in ctx:
+                    c.stop()
+        torch.testing.assert_close(
+            got, expect, rtol=0, atol=1e-5 * max(expect.abs().max().item(), 1e-6)
+        )
+        return calls, int((cold_ids >= 0).sum())
+
+    def test_prefill_keeps_the_cold_rows_only(self):
+        calls, count = self._run_top6(70)
+        self.assertGreater(count, 0)
+        # one alignment; the gate/up kernel writes the first count rows of a [70 * 6, 512] buffer through the
+        # row map (launched before the count is read), the down projection runs over those count rows with
+        # the compact rows as its sorted ids
+        self.assertEqual(
+            calls,
+            [
+                ("align", 64, 4),
+                ("staged", 70, 6, 512, 64, "rows", 420),
+                ("staged", count, 1, 256, 64),
+                ("compact sum", count),
+            ],
+        )
+        calls, count = self._run_top6(70, SGLANG_HOTCOLD_MMQ_STAGED=0)
+        self.assertEqual(
+            calls,
+            [
+                ("align", 64, 4),
+                ("wide", 70, 6, 512, 64, "rows", 420),
+                ("wide", count, 1, 256, 64),
+                ("compact sum", count),
+            ],
+        )
+        calls, _ = self._run_top6(70, SGLANG_HOTCOLD_PREFILL_COMPACT=0)
+        self.assertEqual(
+            calls,
+            [("align", 64, 4), ("staged", 70, 6, 512, 64), ("staged", 420, 1, 256, 64)],
+        )
+        calls, _ = self._run_top6(
+            70, SGLANG_HOTCOLD_MMQ_STAGED=0, SGLANG_HOTCOLD_MMQ_WIDE=0
+        )
+        self.assertEqual(
+            calls, [("align", 16, 4), ("mmq", 70, 6, 512, 16), ("mmq", 420, 1, 256, 16)]
+        )  # the 16-route kernel: dense
+        calls, _ = self._run_top6(
+            7
+        )  # a decode batch: the multi-route vector kernel, dense
+        self.assertEqual([c[0] for c in calls], ["align", "vecm", "vecm"])
+
+    def test_the_float_switch_takes_the_half_float_kernel_above_the_threshold_only(
+        self,
+    ):
+        calls, count = self._run_top6(70, SGLANG_HOTCOLD_PREFILL_FLOAT=1)
+        self.assertEqual(
+            calls,
+            [
+                ("align", 64, 4),
+                ("half-float", 70, 6, 512, 64, "rows", 420),
+                ("half-float", count, 1, 256, 64),
+                ("compact sum", count),
+            ],
+        )
+        calls = self._run(
+            70, SGLANG_HOTCOLD_PREFILL_FLOAT=1
+        )  # top-k 3: the dense layout
+        self.assertEqual(
+            calls,
+            [
+                ("align", 64, 4),
+                ("half-float", 70, 3, 512, 64),
+                ("half-float", 210, 1, 256, 64),
+            ],
+        )
+        calls, _ = self._run_top6(7, SGLANG_HOTCOLD_PREFILL_FLOAT=1)
+        self.assertEqual([c[0] for c in calls], ["align", "vecm", "vecm"])
+        calls, _ = self._run_top6(64, SGLANG_HOTCOLD_PREFILL_FLOAT=1)
+        self.assertEqual([c[0] for c in calls], ["align", "vecm", "vecm"])
+        calls = self._run(
+            70, SGLANG_HOTCOLD_PREFILL_FLOAT=1, SGLANG_HOTCOLD_MMQ_STAGED=0
+        )
+        self.assertEqual([c[0] for c in calls], ["align", "wide", "wide"])
+
+    def test_compact_edge_routes(self):
+        for tokens in (65, 130):
+            every = torch.randint(
+                0, 4, (tokens, 6), generator=self.gen, dtype=torch.int32
+            )
+            rows = every.clone()
+            rows[::2] = -1
+            one = torch.full((tokens, 6), -1, dtype=torch.int32)
+            one[tokens // 2, 3] = 2
+            cases = {
+                "every route cold": every,
+                "one cold expert on every route": torch.full(
+                    (tokens, 6), 3, dtype=torch.int32
+                ),
+                "padded rows": rows,
+                "a single cold route": one,
+            }
+            for label, ids in cases.items():
+                with self.subTest(label=label, tokens=tokens):
+                    calls, count = self._run_top6(tokens, cold_ids=ids)
+                    self.assertEqual(
+                        [c[0] for c in calls],
+                        ["align", "staged", "staged", "compact sum"],
+                    )
+                    self.assertEqual(calls[-1], ("compact sum", count))
+            with self.subTest(label="no cold route", tokens=tokens):
+                calls, count = self._run_top6(
+                    tokens, cold_ids=torch.full((tokens, 6), -1, dtype=torch.int32)
+                )
+                # the gate/up kernel is launched before the count is known (every block is skipped); then zeros
+                self.assertEqual(
+                    (calls, count),
+                    (
+                        [
+                            ("align", 64, 4),
+                            ("staged", tokens, 6, 512, 64, "rows", tokens * 6),
+                        ],
+                        0,
+                    ),
+                )
 
     def test_edge_routes_through_the_grouped_paths(self):
         hot = sorted(
@@ -460,7 +737,7 @@ class TestColdMoeGroupedPaths(CustomTestCase):
                 with self.subTest(label=label, tokens=tokens):
                     kinds = {c[0] for c in self._run(tokens, ids=ids)}
                     self.assertEqual(
-                        kinds, {"align", "wide" if tokens > 64 else "vecm"}
+                        kinds, {"align", "staged" if tokens > 64 else "vecm"}
                     )
 
 

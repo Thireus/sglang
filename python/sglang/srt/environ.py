@@ -1999,6 +1999,38 @@ class Envs:
     # 30 to 51 % (layers 0, 20 and 39, real and synthetic routes); 5 to 31 % less
     # at 512 tokens, 30 to 36 % less at 8,192.
     SGLANG_HOTCOLD_MMQ_WIDE = EnvInt(64)
+    # The staged MMQ kernel (IQ2_S), the default above MMQ_MIN_TOKENS: the wide-block
+    # kernel's result (same output bits) with up to this many routes of one expert
+    # per CTA (32 or 64); 0 = the wide-block kernel (MMQ_WIDE). The wide-block kernel
+    # waits for memory: cut in stages, its unpack alone is 62 to 77 % of its time and
+    # its products cost nothing on top (two CTAs of 48 KiB of shared memory per
+    # multiprocessor leave the first-level cache no room for fifteen scattered loads
+    # per thread and iteration). The staged kernel runs one CTA of 16 warps per
+    # multiprocessor, copies the packed rows of a tile (and, for a block that is at
+    # most half full, its activations) into shared memory with asynchronous copies
+    # one tile ahead, and unpacks the rows there against a grid table in shared
+    # memory. Layer 20, 2,048 tokens, RTX 5090, both projections: 0.86 against 1.34
+    # ms when 8 % of the routes are cold, 1.96 against 3.06 ms at 16 %, 3.19 against
+    # 5.17 ms at 43 %.
+    SGLANG_HOTCOLD_MMQ_STAGED = EnvInt(64)
+    # An eager MMQ call (a prefill) keeps the rows of the cold routes only: the
+    # SwiGLU, the down projection's activation quantisation, the route weights and
+    # the sum over top-k run over [cold routes, .] instead of [tokens * top_k, .]
+    # (0.05 to 0.12 ms against 0.25 to 0.30 ms for those steps at 2,048 tokens). Same
+    # output bits: the compact sum keeps the dense path's rounding and the order of
+    # torch's fp32 accumulators. The cold route count is read on the host behind the
+    # gate/up kernel; a captured call keeps the dense layout. 0 = the dense layout.
+    SGLANG_HOTCOLD_PREFILL_COMPACT = EnvBool(True)
+    # OFF by default: it changes the output bits of the calls above MMQ_MIN_TOKENS
+    # (prefill; no decode batch). The staged kernel's products then run in the hot
+    # tier's arithmetic: IQ2_S tiles unpacked to fp16 with their scales folded in
+    # (exact), the activations taken as they are instead of rounded to int8 per 32
+    # values, m16n8k16 half-float products accumulated in fp32. The cold tier's
+    # output is then 0.3 to 0.4 % from the fp32 product of the dequantised weights
+    # (relative L2 on the engine's dumped inputs, four layers) against 0.6 to 1.2 %
+    # for the int8 kernels; the cold tier takes 18 to 24 % more time than with the
+    # int8 staged kernel. Its boot line says "half-float products" when it is on.
+    SGLANG_HOTCOLD_PREFILL_FLOAT = EnvBool(False)
     # With SGLANG_HOTCOLD_MMQ_WIDE=0: the 16-route kernel's BLOCK is 32 from this
     # many tokens, 16 below; 0 keeps 16 everywhere. Same output bits.
     SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS = EnvInt(0)

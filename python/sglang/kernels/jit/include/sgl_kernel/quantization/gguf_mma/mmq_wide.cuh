@@ -203,11 +203,15 @@ static __device__ __forceinline__ void mmq_wide_block(
 // The y tile holds one pass of 32 columns: with the x tile the CTA stays under 50 KiB of shared
 // memory whatever kWide (two CTAs a multiprocessor on a card with 100 KiB each, as the 16-route
 // kernel). kSkip = false multiplies every group of every block (a reference for measurements).
+// sorted_rows (may be null): the output row of each sorted column when the caller keeps the rows
+// of the active routes only (a compact output); null writes route s to row s. The arithmetic of a
+// (route, row) does not depend on it.
 template <typename scalar_t, int kWide, bool need_check, bool kSkip>
 __global__ void __launch_bounds__(kWarpSize* kNWarps, 1) gguf_moe_mmq_wide_iq2_s_kernel(
     const char* __restrict__ x,
     const int* __restrict__ y,
     const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ sorted_rows,
     const int32_t* __restrict__ expert_ids,
     const int32_t* __restrict__ num_tokens_post_padded,
     scalar_t* __restrict__ dst,
@@ -245,7 +249,7 @@ __global__ void __launch_bounds__(kWarpSize* kNWarps, 1) gguf_moe_mmq_wide_iq2_s
   for (int j = tid; j < kWide; j += kNWarps * kWarpSize) {
     const int sid = sorted_ids[col0 + j];
     const bool valid = sid >= 0 && sid < numel;
-    ids_dst[j] = valid ? sid : -1;
+    ids_dst[j] = valid ? (sorted_rows != nullptr ? sorted_rows[col0 + j] : sid) : -1;
     ids_src[j] = valid ? sid / top_k : 0;
   }
   __syncthreads();
