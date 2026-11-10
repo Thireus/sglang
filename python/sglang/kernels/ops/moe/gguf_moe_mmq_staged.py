@@ -49,6 +49,7 @@ def _jit_gguf_moe_mmq_staged_module(
         cuda_wrappers=[
             ("project", f"gguf_moe_mmq_staged<{args}>"),
             ("project_rows", f"gguf_moe_mmq_staged_rows<{args}>"),
+            ("project_counted", f"gguf_moe_mmq_staged_counted<{args}>"),
         ],
     )
 
@@ -68,6 +69,7 @@ def gguf_moe_mmq_staged(
     zero_init: bool = True,
     sorted_rows: Optional[torch.Tensor] = None,
     out_rows: Optional[int] = None,
+    row_count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Project aligned routes through packed IQ2_S experts; inactive routes stay zero.
 
@@ -82,10 +84,38 @@ def gguf_moe_mmq_staged(
     ``sorted_rows`` (int32, aligned with ``sorted_token_ids``) with ``out_rows``
     writes sorted column ``c`` to row ``sorted_rows[c]`` of an ``[out_rows, row]``
     output: a caller that keeps the rows of its active routes only.
+
+    ``row_count`` (int32 [1] on the device; not with ``sorted_rows``): only the
+    first ``row_count[0]`` rows of ``input`` hold activations, in a buffer of
+    ``tokens`` rows. The activation quantisation covers those rows and reads the
+    count on the device; no id may point past them.
     """
     k = input.shape[1]
     alloc = torch.zeros if zero_init else torch.empty
     module = _jit_gguf_moe_mmq_staged_module(input.dtype, int(type), int(wide))
+    if row_count is not None:
+        if sorted_rows is not None:
+            raise ValueError(
+                "row_count is for a compact input: its sorted ids are the rows already"
+            )
+        output = alloc((tokens * top_k, row), dtype=input.dtype, device=input.device)
+        quantized_input = torch.empty(
+            (k // 128, tokens, 36), dtype=torch.int32, device=input.device
+        )
+        module.project_counted(
+            input,
+            weight,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            output,
+            quantized_input,
+            row_count,
+            top_k,
+            row,
+            tokens,
+        )
+        return output
     if sorted_rows is None:
         output = alloc((tokens * top_k, row), dtype=input.dtype, device=input.device)
         quantized_input = torch.empty(

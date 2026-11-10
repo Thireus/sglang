@@ -11,8 +11,16 @@
 * The grouped kernels with ``zero_init=False`` on allocator blocks prefilled with NaN
   against their zero-filled result: every row of an active route is written whole and no
   other row is touched.
-* ``cold_moe`` end to end: the compact path and the staged kernel against the dense path
-  on the wide-block and the 16-route kernels, on NaN-prefilled blocks.
+* The compact call without a host read: ``gguf_moe_cold_rows`` (the row map and the cold
+  route count, one launch) against its torch reference; ``gguf_moe_cold_swiglu`` (the
+  clamped SwiGLU over the first rows, the count read on the device) against
+  ``silu_and_mul_clamp``; ``gguf_moe_mmq_staged`` with ``row_count`` (the activation
+  quantisation over the first rows) against the dense rows; in buffers of the dense
+  sizes whose other rows must stay untouched.
+* ``cold_moe`` end to end: the compact path (the default) against the dense path on the
+  staged, the wide-block and the 16-route kernels, on NaN-prefilled blocks, eager and in
+  a captured graph replayed on new routes, and with torch's synchronisation check armed
+  (the call must not read anything on the host).
 * ``gguf_moe_f16_staged`` (SGLANG_HOTCOLD_PREFILL_FLOAT: half-float products on the
   unquantised activations) against the float64 product of the dequantised rows: it is
   not bit-equal to the int8 kernels and must be closer to that product than they are.
@@ -28,7 +36,16 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+from sglang.kernels.ops.moe.gguf_moe_cold_rows import (
+    _jit_gguf_moe_cold_rows_module,
+    gguf_moe_cold_rows,
+)
 from sglang.kernels.ops.moe.gguf_moe_cold_sum import gguf_moe_cold_sum
+from sglang.kernels.ops.moe.gguf_moe_cold_swiglu import (
+    _jit_gguf_moe_cold_swiglu_module,
+    gguf_moe_cold_swiglu,
+)
 from sglang.kernels.ops.moe.gguf_moe_f16_staged import gguf_moe_f16_staged
 from sglang.kernels.ops.moe.gguf_moe_mmq import gguf_moe_mmq
 from sglang.kernels.ops.moe.gguf_moe_mmq_staged import (
@@ -147,6 +164,14 @@ def _poison(shape):
     return seen
 
 
+def _row_map(ids, sorted_ids=None, ntp=None):
+    """(rows, sorted_rows, count as an int) by the torch reference of the row map."""
+    if sorted_ids is None:
+        sorted_ids = torch.arange(ids.numel(), dtype=torch.int32, device=ids.device)
+    rows, sorted_rows, count = hc._compact_row_map_reference(ids, sorted_ids, ntp)
+    return rows, sorted_rows, int(count)
+
+
 def _mmq16(x, w, ids, n, top_k, rows):
     sorted_ids, expert_ids, ntp = moe_align_block_size(
         ids, 16, w.shape[0], pad_expert_ids=True
@@ -240,15 +265,13 @@ class TestCompactOutputs(CustomTestCase):
                     x, pids, rows = _inputs(top_k, ids, k, gen)
                     ref = _mmq16(x, w, pids, n, top_k, rows)
                     active = pids.reshape(-1) >= 0
-                    crow, count = hc._compact_rows(pids)
-                    count = int(count)
-                    self.assertEqual(count, int(active.sum()))
-                    if count == 0:
-                        continue
                     sorted_ids, expert_ids, ntp = moe_align_block_size(
                         pids, 64, w.shape[0], pad_expert_ids=True
                     )
-                    sorted_rows = hc._compact_sorted_rows(sorted_ids, crow, count)
+                    crow, sorted_rows, count = _row_map(pids, sorted_ids, ntp)
+                    self.assertEqual(count, int(active.sum()))
+                    if count == 0:
+                        continue
                     for name, op in ops.items():
                         self.assertTrue(_poison((count, n)))
                         got = op(
@@ -354,7 +377,7 @@ class TestColdSum(CustomTestCase):
         return out
 
     def _compact(self, y_dense, weights, ids):
-        rows, _ = hc._compact_rows(ids)
+        rows, _, _ = _row_map(ids)
         return gguf_moe_cold_sum(
             y_dense[ids.reshape(-1) >= 0].contiguous(), rows, weights
         )
@@ -425,8 +448,8 @@ class TestColdSum(CustomTestCase):
         ids = torch.full((tokens, TOP_K), -1, dtype=torch.int32, device="cuda")
         ids[4, 2] = 5
         y = torch.randn(1, HIDDEN, generator=gen, device="cuda").bfloat16()
-        rows, count = hc._compact_rows(ids)
-        self.assertEqual(int(count), 1)
+        rows, _, count = _row_map(ids)
+        self.assertEqual(count, 1)
         self.assertTrue(_poison((tokens, HIDDEN)))
         out = gguf_moe_cold_sum(
             y, rows, torch.full((tokens, TOP_K), 0.5, device="cuda")
@@ -437,27 +460,220 @@ class TestColdSum(CustomTestCase):
         self.assertTrue(_bits(out[4], (y[0].float() * 0.5).bfloat16()))
 
 
+class TestCompactWithoutAHostRead(CustomTestCase):
+    """The kernels of the compact call that take the cold route count from the device."""
+
+    @torch.inference_mode()
+    def test_row_map_equals_its_reference(self):
+        gen = torch.Generator(device="cuda").manual_seed(2320)
+        checked = 0
+        for tokens in (1, 7, 65, 300, 2048, 8192):
+            for label, ids in _route_cases(tokens, gen).items():
+                for block in (32, 64):
+                    sorted_ids, expert_ids, ntp = moe_align_block_size(
+                        ids, block, EXPERTS, pad_expert_ids=True
+                    )
+                    want_rows, want_sorted, want_count = hc._compact_row_map_reference(
+                        ids, sorted_ids, ntp
+                    )
+                    # the columns past num_tokens_post_padded are not written: they must keep what they held
+                    rows, sorted_rows, count = gguf_moe_cold_rows(ids, sorted_ids, ntp)
+                    used = int(ntp[0])
+                    what = f"T={tokens} {label} block={block}"
+                    self.assertTrue(bool(torch.equal(rows, want_rows)), what)
+                    self.assertEqual(count.tolist(), want_count.tolist(), what)
+                    self.assertEqual(
+                        (count.dtype, tuple(count.shape)), (torch.int32, (1,))
+                    )
+                    self.assertTrue(
+                        bool(torch.equal(sorted_rows[:used], want_sorted[:used])), what
+                    )
+                    self.assertEqual(int(count), int((ids >= 0).sum()), what)
+                    checked += 1
+        self.assertGreater(checked, 90)
+
+    @torch.inference_mode()
+    def test_row_map_leaves_the_unused_columns(self):
+        # the kernel on buffers of the test's own, marked beforehand: what it does not write keeps the mark
+        gen = torch.Generator(device="cuda").manual_seed(2321)
+        mark = 0x5A5A5A5A
+        for label in ("87 % inactive", "none active", "all active"):
+            ids = _route_cases(300, gen)[label]
+            sorted_ids, expert_ids, ntp = moe_align_block_size(
+                ids, 64, EXPERTS, pad_expert_ids=True
+            )
+            used = int(ntp[0])
+            self.assertLess(used, sorted_ids.numel())
+            rows = torch.full_like(ids, mark)
+            sorted_rows = torch.full_like(sorted_ids, mark)
+            count = torch.full((1,), mark, dtype=torch.int32, device="cuda")
+            _jit_gguf_moe_cold_rows_module().run(
+                ids, sorted_ids, ntp, rows, sorted_rows, count
+            )
+            want_rows, want_sorted, want_count = hc._compact_row_map_reference(
+                ids, sorted_ids, ntp
+            )
+            self.assertTrue(
+                bool(torch.equal(rows, want_rows)), label
+            )  # every row of the map is written
+            self.assertEqual(count.tolist(), want_count.tolist(), label)
+            self.assertTrue(
+                bool(torch.equal(sorted_rows[:used], want_sorted[:used])), label
+            )
+            self.assertTrue(
+                bool((sorted_rows[used:] == mark).all()),
+                f"{label}: a column past num_tokens_post_padded was written",
+            )
+
+    @torch.inference_mode()
+    def test_counted_swiglu_equals_the_clamped_swiglu(self):
+        gen = torch.Generator(device="cuda").manual_seed(2322)
+        limit = 10.0
+        compared = 0
+        run = _jit_gguf_moe_cold_swiglu_module(torch.bfloat16).run
+        for rows in (
+            1,
+            7,
+            300,
+            4096,
+            9000,
+        ):  # more rows than the largest grid (4,096): a CTA takes several
+            h = torch.randn(rows, 2 * INTER, generator=gen, device="cuda") * 4
+            # magnitudes on both sides of the limit and far beyond it, exact zeros of both signs
+            h = h * torch.pow(
+                2.0,
+                torch.randint(-12, 6, h.shape, generator=gen, device="cuda").float(),
+            )
+            h[torch.rand(h.shape, generator=gen, device="cuda") < 0.01] = 0.0
+            h[torch.rand(h.shape, generator=gen, device="cuda") < 0.01] = -0.0
+            h = h.bfloat16()
+            ref = torch.empty((rows, INTER), dtype=torch.bfloat16, device="cuda")
+            silu_and_mul_clamp(h, ref, limit)
+            self.assertGreater(int((ref.float().abs() > 0).sum()), rows * INTER // 2)
+            for count in sorted(
+                {
+                    0,
+                    1,
+                    rows // 3,
+                    rows - 1,
+                    rows,
+                    min(rows, 4095),
+                    min(rows, 4097),
+                    rows + 5,
+                }
+            ):
+                # the kernel on an output of the test's own, NaN beforehand: the rows past the count keep it
+                got = torch.full(
+                    (rows, INTER), float("nan"), dtype=torch.bfloat16, device="cuda"
+                )
+                run(
+                    h,
+                    got,
+                    torch.tensor([count], dtype=torch.int32, device="cuda"),
+                    limit,
+                )
+                n = min(count, rows)  # a count past the buffer is clamped to it
+                self.assertTrue(_bits(got[:n], ref[:n]), f"rows={rows} count={count}")
+                self.assertTrue(
+                    bool(got[n:].isnan().all()),
+                    f"rows={rows} count={count}: a row past the count was written",
+                )
+                compared += int(n > 0)
+            # the op: the same rows in a buffer it allocates
+            got = gguf_moe_cold_swiglu(
+                h, torch.tensor([rows], dtype=torch.int32, device="cuda"), limit
+            )
+            self.assertTrue(_bits(got, ref), f"rows={rows}: the op")
+        self.assertGreater(compared, 15)
+
+    @torch.inference_mode()
+    def test_counted_projection_equals_the_dense_rows(self):
+        gen = torch.Generator(device="cuda").manual_seed(2323)
+        w = random_rows(IQ2_S, (EXPERTS, HIDDEN), INTER, gen)
+        compared = 0
+        for tokens in (1, 65, 300, 2048):
+            for label, ids in _route_cases(tokens, gen).items():
+                x, pids, rows = _inputs(
+                    1, ids, INTER, gen
+                )  # the down projection: one input row per route
+                active = pids.reshape(-1) >= 0
+                ref = _mmq16(x, w, pids, HIDDEN, 1, rows)
+                for wide in GGUF_MOE_MMQ_STAGED_BLOCKS:
+                    sorted_ids, expert_ids, ntp = moe_align_block_size(
+                        pids, wide, EXPERTS, pad_expert_ids=True
+                    )
+                    crow, sorted_rows, count = gguf_moe_cold_rows(pids, sorted_ids, ntp)
+                    n = int(count)
+                    # the compact input in a buffer of the dense size, NaN past the cold rows
+                    a = torch.full(
+                        (rows, INTER), float("nan"), dtype=torch.bfloat16, device="cuda"
+                    )
+                    a[:n] = x[active]
+                    self.assertTrue(_poison((rows, HIDDEN)))
+                    got = gguf_moe_mmq_staged(
+                        a,
+                        w,
+                        sorted_rows,
+                        expert_ids,
+                        ntp,
+                        IQ2_S,
+                        HIDDEN,
+                        1,
+                        rows,
+                        wide,
+                        zero_init=False,
+                        row_count=count,
+                    )
+                    what = f"T={tokens} {label} staged={wide}"
+                    self.assertEqual(tuple(got.shape), (rows, HIDDEN))
+                    self.assertTrue(_bits(got[:n], ref[active]), what)
+                    self.assertTrue(
+                        bool(got[n:].isnan().all()),
+                        f"{what}: a row past the count was written",
+                    )
+                    compared += int(n > 0)
+        self.assertGreater(compared, 40)
+        with self.assertRaises(ValueError):
+            gguf_moe_mmq_staged(
+                a,
+                w,
+                sorted_rows,
+                expert_ids,
+                ntp,
+                IQ2_S,
+                HIDDEN,
+                1,
+                rows,
+                64,
+                sorted_rows=sorted_rows,
+                out_rows=rows,
+                row_count=count,
+            )
+
+
 class TestColdMoePrefillPaths(CustomTestCase):
-    """cold_moe above the MMQ threshold: the default (staged kernel, compact rows) against the dense layouts."""
+    """cold_moe above the MMQ threshold: the default (staged kernel, compact rows by a device count) against the dense layouts."""
+
+    PATHS = {
+        "16-route, dense": {
+            "SGLANG_HOTCOLD_MMQ_STAGED": 0,
+            "SGLANG_HOTCOLD_MMQ_WIDE": 0,
+        },
+        "wide, dense": {"SGLANG_HOTCOLD_MMQ_STAGED": 0},
+        "staged, dense": {"SGLANG_HOTCOLD_PREFILL_COMPACT": 0},
+        "staged 32, compact": {"SGLANG_HOTCOLD_MMQ_STAGED": 32},
+        "staged, compact (default)": {},
+    }
+
+    def _weights(self, gen):
+        return random_rows(IQ2_S, (EXPERTS, 2 * INTER), HIDDEN, gen), random_rows(
+            IQ2_S, (EXPERTS, HIDDEN), INTER, gen
+        )
 
     @torch.inference_mode()
     def test_paths_are_bit_equal(self):
         gen = torch.Generator(device="cuda").manual_seed(2308)
-        w13 = random_rows(IQ2_S, (EXPERTS, 2 * INTER), HIDDEN, gen)
-        w2 = random_rows(IQ2_S, (EXPERTS, HIDDEN), INTER, gen)
-        paths = {
-            "16-route, dense": {
-                "SGLANG_HOTCOLD_MMQ_STAGED": 0,
-                "SGLANG_HOTCOLD_MMQ_WIDE": 0,
-            },
-            "wide, dense": {
-                "SGLANG_HOTCOLD_MMQ_STAGED": 0,
-                "SGLANG_HOTCOLD_PREFILL_COMPACT": 0,
-            },
-            "wide, compact": {"SGLANG_HOTCOLD_MMQ_STAGED": 0},
-            "staged, dense": {"SGLANG_HOTCOLD_PREFILL_COMPACT": 0},
-            "staged, compact (default)": {},
-        }
+        w13, w2 = self._weights(gen)
         compared = 0
         for tokens in (65, 300, 2048):
             for label, ids in _route_cases(tokens, gen).items():
@@ -466,12 +682,13 @@ class TestColdMoePrefillPaths(CustomTestCase):
                 ).bfloat16()
                 weights = torch.rand(tokens, TOP_K, generator=gen, device="cuda") + 0.05
                 ref = None
-                for name, kv in paths.items():
+                for name, kv in self.PATHS.items():
                     with _env(**kv):
                         for shape in (
                             (tokens * TOP_K, 2 * INTER),
                             (tokens * TOP_K, INTER),
                             (tokens * TOP_K, HIDDEN),
+                            (tokens, HIDDEN),
                         ):
                             _poison(shape)
                         out = hc.cold_moe(
@@ -485,33 +702,186 @@ class TestColdMoePrefillPaths(CustomTestCase):
                         f"T={tokens} {label}: {name}: max|d|={float((out.float() - ref.float()).abs().max()):.3e}",
                     )
                     compared += int(ref.count_nonzero() > 0)
-        self.assertGreater(compared, 60)
+        self.assertGreater(compared, 80)
 
     @torch.inference_mode()
-    def test_a_captured_call_keeps_the_dense_layout(self):
-        gen = torch.Generator(device="cuda").manual_seed(2309)
-        w13 = random_rows(IQ2_S, (EXPERTS, 2 * INTER), HIDDEN, gen)
-        w2 = random_rows(IQ2_S, (EXPERTS, HIDDEN), INTER, gen)
-        tokens = 96
-        cases = list(_route_cases(tokens, gen).values())
+    def test_paths_are_bit_equal_with_the_limit_inside_the_activations(self):
+        # With these inputs the gate/up values stay far below test_paths_are_bit_equal's limit of 10.0, so the clamp never
+        # acts there and a path that handed the SwiGLU a wrong limit would still pass. Here the limit is the median |gate/up|
+        # of the active routes (the dense 16-route rows): about half of the values are clamped, the result is shown to
+        # differ from the one under 10.0, and every path must still give the dense staged path's bits.
+        gen = torch.Generator(device="cuda").manual_seed(2315)
+        w13, w2 = self._weights(gen)
+        clamped = 0
+        for tokens in (65, 300, 2048):
+            cases = _route_cases(tokens, gen)
+            for label in (
+                "87 % inactive",
+                "a third inactive",
+                "none active",
+                "all active",
+                "one expert on every route",
+            ):
+                ids = cases[label]
+                x = (
+                    torch.randn(tokens, HIDDEN, generator=gen, device="cuda") * 0.02
+                ).bfloat16()
+                weights = torch.rand(tokens, TOP_K, generator=gen, device="cuda") + 0.05
+                active = ids.reshape(-1) >= 0
+                limit = 0.05
+                if bool(active.any()):
+                    h = _mmq16(x, w13, ids.contiguous(), 2 * INTER, TOP_K, tokens)
+                    limit = float(h[active].float().abs().median())
+                with _env(SGLANG_HOTCOLD_PREFILL_COMPACT=0):
+                    loose = hc.cold_moe(
+                        x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq"
+                    )
+                    ref = hc.cold_moe(
+                        x, w13, w2, weights, ids, IQ2_S, IQ2_S, limit, kernel="mmq"
+                    )
+                if bool(active.any()):
+                    self.assertFalse(
+                        _bits(ref, loose),
+                        f"T={tokens} {label}: the limit {limit:.4g} does not act",
+                    )
+                    clamped += 1
+                for name, kv in self.PATHS.items():
+                    with _env(**kv):
+                        for shape in (
+                            (tokens * TOP_K, 2 * INTER),
+                            (tokens * TOP_K, INTER),
+                            (tokens * TOP_K, HIDDEN),
+                            (tokens, HIDDEN),
+                        ):
+                            _poison(shape)
+                        out = hc.cold_moe(
+                            x, w13, w2, weights, ids, IQ2_S, IQ2_S, limit, kernel="mmq"
+                        )
+                    self.assertTrue(
+                        _bits(out, ref),
+                        f"T={tokens} {label} limit {limit:.4g}: {name}: max|d|={float((out.float() - ref.float()).abs().max()):.3e}",
+                    )
+        self.assertEqual(clamped, 12)
+
+    @torch.inference_mode()
+    def test_the_default_is_the_compact_call(self):
+        gen = torch.Generator(device="cuda").manual_seed(2313)
+        w13, w2 = self._weights(gen)
+        tokens = 70
+        ids = _route_cases(tokens, gen)["87 % inactive"]
         x = (
             torch.randn(tokens, HIDDEN, generator=gen, device="cuda") * 0.02
         ).bfloat16()
         weights = torch.rand(tokens, TOP_K, generator=gen, device="cuda") + 0.05
-        ids = cases[0].clone()
-        with _env():
-            call = lambda: hc.cold_moe(
-                x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq"
-            )
-            call()
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                out = call()  # no host read inside a capture: the dense layout
-            for new_ids in cases:
-                ids.copy_(new_ids)
-                graph.replay()
-                self.assertTrue(_bits(out, call()))
+        seen = []
+        spy = lambda *a, _f=hc._compact_row_map: (seen.append(1), _f(*a))[1]
+        with patch.object(hc, "_compact_row_map", spy):
+            with _env():
+                hc.cold_moe(x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq")
+                self.assertEqual(len(seen), 1)
+            for kv in (
+                {"SGLANG_HOTCOLD_PREFILL_COMPACT": 0},
+                {"SGLANG_HOTCOLD_MMQ_STAGED": 0},
+                {"SGLANG_HOTCOLD_PREFILL_FLOAT": 1},
+                {"SGLANG_HOTCOLD_COLD_KERNEL": "legacy"},
+            ):
+                with _env(**kv):
+                    hc.cold_moe(
+                        x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq"
+                    )
+                    self.assertEqual(len(seen), 1, kv)  # the dense layout
+            with _env():
+                hc.cold_moe(
+                    x, w13, w2, weights, ids, IQ2_S, IQ2_S, None, kernel="mmq"
+                )  # no SwiGLU limit: dense
+                self.assertEqual(len(seen), 1)
+                hc.cold_moe(
+                    x[:54], w13, w2, weights[:54], ids[:54], IQ2_S, IQ2_S, 10.0
+                )  # a decode batch: untouched
+                self.assertEqual(len(seen), 1)
+
+    @torch.inference_mode()
+    def test_the_compact_call_reads_nothing_on_the_host(self):
+        # torch raises on a synchronising call (.item(), a host copy of a device tensor) while the check is armed
+        gen = torch.Generator(device="cuda").manual_seed(2314)
+        w13, w2 = self._weights(gen)
+        for tokens in (65, 2048):
+            for label in ("87 % inactive", "none active", "all active"):
+                ids = _route_cases(tokens, gen)[label]
+                x = (
+                    torch.randn(tokens, HIDDEN, generator=gen, device="cuda") * 0.02
+                ).bfloat16()
+                weights = torch.rand(tokens, TOP_K, generator=gen, device="cuda") + 0.05
+                with _env(SGLANG_HOTCOLD_PREFILL_COMPACT=0):
+                    ref = hc.cold_moe(
+                        x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq"
+                    )
+                with _env():
+                    hc.cold_moe(
+                        x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq"
+                    )  # imports and builds first
+                    before = torch.cuda.get_sync_debug_mode()
+                    torch.cuda.set_sync_debug_mode("error")
+                    try:
+                        out = hc.cold_moe(
+                            x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq"
+                        )
+                    finally:
+                        torch.cuda.set_sync_debug_mode(before)
+                self.assertTrue(_bits(out, ref), f"T={tokens} {label}")
+        # the check itself: a host read of a device value does raise while it is armed
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            with self.assertRaises(RuntimeError):
+                int(torch.ones(1, device="cuda").sum())
+        finally:
+            torch.cuda.set_sync_debug_mode(before)
+
+    @torch.inference_mode()
+    def test_a_captured_call_replays_on_new_routes(self):
+        # the compact call has no host read and no shape that depends on the routes: it is captured as it is
+        gen = torch.Generator(device="cuda").manual_seed(2309)
+        w13, w2 = self._weights(gen)
+        for tokens in (96, 700):
+            cases = _route_cases(tokens, gen)
+            x = (
+                torch.randn(tokens, HIDDEN, generator=gen, device="cuda") * 0.02
+            ).bfloat16()
+            weights = torch.rand(tokens, TOP_K, generator=gen, device="cuda") + 0.05
+            ids = cases["all active"].clone()
+            seen = []
+            spy = lambda *a, _f=hc._compact_row_map: (seen.append(1), _f(*a))[1]
+            with _env():
+                call = lambda: hc.cold_moe(
+                    x, w13, w2, weights, ids, IQ2_S, IQ2_S, 10.0, kernel="mmq"
+                )
+                call()
+                torch.cuda.synchronize()
+                for shape in (
+                    (tokens * TOP_K, 2 * INTER),
+                    (tokens * TOP_K, INTER),
+                    (tokens * TOP_K, HIDDEN),
+                ):
+                    _poison(shape)
+                graph = torch.cuda.CUDAGraph()
+                with patch.object(hc, "_compact_row_map", spy):
+                    with torch.cuda.graph(graph):
+                        out = call()
+                self.assertEqual(len(seen), 1)  # the captured call is the compact one
+                for label, new_ids in list(cases.items()) + [
+                    ("all active", cases["all active"])
+                ]:
+                    ids.copy_(new_ids)
+                    x.copy_(
+                        (
+                            torch.randn(tokens, HIDDEN, generator=gen, device="cuda")
+                            * 0.02
+                        ).bfloat16()
+                    )
+                    graph.replay()
+                    with _env(SGLANG_HOTCOLD_PREFILL_COMPACT=0):
+                        ref = call()
+                    self.assertTrue(_bits(out, ref), f"T={tokens} replay on '{label}'")
 
 
 class TestGgufMoeF16Staged(CustomTestCase):
@@ -631,9 +1001,7 @@ class TestGgufMoeF16Staged(CustomTestCase):
                 (got[active].double() - ref[active]).norm() / ref[active].norm()
             )
             self.assertLess(rel, 3e-3, proj)  # the bf16 rounding of the output
-            crow, count = hc._compact_rows(pids)
-            sorted_rows = hc._compact_sorted_rows(sorted_ids, crow, count)
-            count = int(count)
+            crow, sorted_rows, count = _row_map(pids, sorted_ids, ntp)
             self.assertTrue(_poison((count, n)))
             compact = gguf_moe_f16_staged(
                 x,

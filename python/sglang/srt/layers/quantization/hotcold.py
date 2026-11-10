@@ -12,9 +12,10 @@ padded ones included, gives exactly 0): gate/up projection, the clamped SwiGLU
 projection, route weights, sum over top-k. On CUDA the projections are the
 GGUF vector kernel or, above ``SGLANG_HOTCOLD_MMQ_MIN_TOKENS`` tokens, the MoE
 MMQ kernel when it is built for the cold types (``SGLANG_HOTCOLD_COLD_KERNEL``
-switches). An eager MMQ call (a prefill) keeps the rows of the cold routes only
-(``SGLANG_HOTCOLD_PREFILL_COMPACT``): same bits, a fraction of the memory
-traffic. Off CUDA the projections are a float reference that dequantises the
+switches). An MMQ call on the staged kernel (a prefill) keeps the rows of the
+cold routes only (``SGLANG_HOTCOLD_PREFILL_COMPACT``): same bits, a fraction of
+the memory traffic, and no host read (the number of cold routes stays on the
+device). Off CUDA the projections are a float reference that dequantises the
 rows (IQ2_S through gguf-py); it is what the CPU tests run and it does not
 reproduce the kernels' q8_1 activation rounding.
 """
@@ -152,19 +153,21 @@ def select_prefill_float(tokens: int, w13_type: int, w2_type: int) -> bool:
     )
 
 
-def select_prefill_compact(x: torch.Tensor, top_k: int, collector) -> bool:
-    """Whether an MMQ call keeps the rows of the cold routes only (h, a and y of
-    [cold routes, .] instead of [tokens * top_k, .], and one weighted sum over
-    them). Eager calls only: the row count is read on the host, which a captured
-    graph cannot do, and no captured batch reaches the MMQ threshold. The imatrix
-    collector reads the dense layout, and moe_sum has kernels of its own for a
-    top-k of 2 to 4 that the compact sum does not reproduce. The host read sits
-    behind the gate/up kernel (cold_moe), so the device does not idle for it."""
+def select_prefill_compact(
+    x: torch.Tensor, top_k: int, collector, swiglu_limit: Optional[float] = 1.0
+) -> bool:
+    """Whether a staged MMQ call keeps the rows of the cold routes only: the
+    SwiGLU, the down projection's activation quantisation and the weighted sum
+    touch one row per cold route instead of one per route. The buffers keep the
+    dense sizes ([tokens * top_k, .]) and the number of cold routes stays on the
+    device (the kernels read it there), so the call has no host read, no shape
+    that depends on the routes, and can sit in a captured graph. The imatrix
+    collector reads the dense layout; moe_sum has kernels of its own for a top-k
+    of 2 to 4 that the compact sum does not reproduce; the counted SwiGLU is the
+    clamped one (a layer without a SwiGLU limit keeps the dense layout)."""
     if not envs.SGLANG_HOTCOLD_PREFILL_COMPACT.get() or collector is not None:
         return False
-    if _cold_kernel_mode() == "legacy":
-        return False
-    if x.is_cuda and torch.cuda.is_current_stream_capturing():
+    if _cold_kernel_mode() == "legacy" or swiglu_limit is None:
         return False
     return _compact_sum_serves(x.dtype, top_k)
 
@@ -446,23 +449,64 @@ def _compact_sum_serves(dtype, top_k):
     return gguf_moe_cold_sum_serves(dtype, top_k)
 
 
-def _compact_rows(ids):
-    """(rows, count): the row of every cold route in a compact [count, .] layout
-    (int32 [tokens, top_k], route order, -1 for the other routes) and the number
-    of cold routes as a 0-d int32 tensor on the device (no host read here)."""
+def _compact_row_map_reference(ids, sorted_ids, post_padded):
+    """The row map in torch ops (what gguf_moe_cold_rows computes in one launch;
+    the CPU tests' stand-in and the kernel's reference): ``rows`` int32
+    [tokens, top_k], 0, 1, 2, ... over the cold routes in route order and -1 for
+    the others; ``sorted_rows``, the row of every sorted column of the alignment
+    (``tokens * top_k`` for a padding column: an id past the routes; -1 for a
+    route that is not cold; both are skipped by the kernels, as outputs and as
+    the down projection's sorted ids); ``count`` int32 [1], the cold routes."""
+    numel = ids.numel()
     active = ids.reshape(-1) >= 0
     rows = torch.cumsum(active, dim=0, dtype=torch.int32) - 1
-    count = rows[-1] + 1
-    return rows.masked_fill(~active, -1).view(ids.shape), count
+    count = (rows[-1:] + 1).to(torch.int32)
+    rows = rows.masked_fill(~active, -1)
+    picked = rows.index_select(0, sorted_ids.clamp(0, numel - 1))
+    sorted_rows = torch.where(
+        (sorted_ids >= 0) & (sorted_ids < numel), picked, torch.full_like(picked, numel)
+    )
+    return rows.view(ids.shape), sorted_rows, count
 
 
-def _compact_sorted_rows(sorted_ids, rows, count):
-    """The compact row of every sorted column of the alignment: padding (ids past
-    the routes) maps to ``count`` (a 0-d tensor), an inactive route to -1; both
-    are skipped by the kernels, as outputs and as the down projection's sorted ids."""
-    numel = rows.numel()
-    picked = rows.reshape(-1).index_select(0, sorted_ids.clamp(0, numel - 1))
-    return torch.where((sorted_ids >= 0) & (sorted_ids < numel), picked, count)
+def _compact_row_map(ids, sorted_ids, post_padded):
+    """(rows, sorted_rows, count) of a compact call, one launch, nothing read on the host."""
+    if not ids.is_cuda:
+        return _compact_row_map_reference(ids, sorted_ids, post_padded)
+    from sglang.kernels.ops.moe.gguf_moe_cold_rows import gguf_moe_cold_rows
+
+    return gguf_moe_cold_rows(ids, sorted_ids, post_padded)
+
+
+def _counted_swiglu(h, count, limit):
+    """The clamped SwiGLU of the first count[0] rows of h (the count read on the device)."""
+    from sglang.kernels.ops.moe.gguf_moe_cold_swiglu import gguf_moe_cold_swiglu
+
+    return gguf_moe_cold_swiglu(h, count, limit)
+
+
+def _mmq_staged_project_counted(
+    a, weight, sorted_rows, expert_ids, post_padded, qtype, rows, bound, wide, count
+):
+    """The down projection of a compact call: a holds one row per cold route in a buffer of
+    ``bound`` rows, its sorted ids are the compact rows, and only the first count[0] rows are
+    quantised (the count read on the device)."""
+    from sglang.kernels.ops.moe.gguf_moe_mmq_staged import gguf_moe_mmq_staged
+
+    return gguf_moe_mmq_staged(
+        a,
+        weight,
+        sorted_rows,
+        expert_ids,
+        post_padded,
+        qtype,
+        rows,
+        1,
+        bound,
+        wide,
+        zero_init=False,
+        row_count=count,
+    )
 
 
 def _compact_weight_and_sum(y, topk_weights, rows):
@@ -596,6 +640,9 @@ def cold_moe(
                 project = (
                     _f16_staged_project  # not the int8 kernels' bits: behind its switch
                 )
+            elif block:
+                # the int8 staged kernel: the one whose activation quantisation takes a device count
+                compact = select_prefill_compact(x, top_k, collector, swiglu_limit)
             if block == 0:
                 block, project = (
                     select_mmq_wide(tokens, w13_type, w2_type),
@@ -607,23 +654,24 @@ def cold_moe(
                     raise RuntimeError(
                         "the cold w13 and w2 types need one MMQ block size"
                     )
-            else:
-                compact = select_prefill_compact(x, top_k, collector)
             if compact:
-                # The same arithmetic per route on [cold routes, .] tensors: the kernels
-                # write each route's row at its compact position, the SwiGLU and the down
-                # projection's activation quantisation run over those rows only, and one
-                # kernel applies the route weights and sums in the dense path's rounding
-                # and order (gguf_moe_cold_sum.py). Same output bits.
-                rows, count = _compact_rows(ids)
+                # The same arithmetic per route with one row per COLD route: the kernels write
+                # each route's row at its compact position, the SwiGLU and the down projection's
+                # activation quantisation run over those rows only, and one kernel applies the
+                # route weights and sums in the dense path's rounding and order
+                # (gguf_moe_cold_sum.py). Same output bits. The buffers keep the dense sizes
+                # (`bound` rows: no shape depends on the routes) and the number of cold routes
+                # never leaves the device: the row map leaves it in `count`, the counted
+                # kernels read it there. Nothing below waits on the host, so the launches of
+                # the whole call are queued behind one another as on the dense layout (a host
+                # read of the count here left the card idle after every gate/up kernel).
+                bound = tokens * top_k
                 sorted_ids, expert_ids, post_padded = _mmq_align(
                     ids, block, w13_qweight.shape[0]
                 )
-                sorted_rows = _compact_sorted_rows(sorted_ids, rows, count)
-                # The gate/up kernel is launched into a buffer of the static bound (only its first
-                # rows are written) BEFORE the cold route count is read on the host: the read then
-                # waits behind that kernel instead of leaving the device idle while the next
-                # launches are prepared.
+                rows, sorted_rows, count = _compact_row_map(
+                    ids, sorted_ids, post_padded
+                )
                 h = project(
                     x,
                     w13_qweight,
@@ -636,15 +684,11 @@ def cold_moe(
                     tokens,
                     block,
                     sorted_rows=sorted_rows,
-                    out_rows=tokens * top_k,
+                    out_rows=bound,
                 )
-                count = int(count)
-                if count == 0:
-                    return x.new_zeros((tokens, rows2))
-                h = h[:count]
-                a = _clamped_swiglu(h, swiglu_limit)
+                a = _counted_swiglu(h, count, swiglu_limit)
                 # the down projection's input is one row per cold route: its sorted ids are the compact rows
-                y = project(
+                y = _mmq_staged_project_counted(
                     a,
                     w2_qweight,
                     sorted_rows,
@@ -652,10 +696,11 @@ def cold_moe(
                     post_padded,
                     w2_type,
                     rows2,
-                    1,
-                    count,
+                    bound,
                     block,
+                    count,
                 )
+                # every output row is written: a token without a cold route gets +0
                 return _compact_weight_and_sum(y, topk_weights, rows)
         sorted_ids, expert_ids, post_padded = _mmq_align(
             ids, block, w13_qweight.shape[0]
@@ -828,17 +873,31 @@ class ColdGGUFExperts(nn.Module):
         wide = (
             select_mmq_wide(0, self.w13_type, self.w2_type) if mmq and not staged else 0
         )
-        compact = bool(staged or wide) and envs.SGLANG_HOTCOLD_PREFILL_COMPACT.get()
-        if compact:
-            from sglang.kernels.ops.moe.gguf_moe_cold_sum import (
-                _jit_gguf_moe_cold_sum_module,
-            )
-
-            # the routed top-k is not known here: built for DeepSeek-V4's six; another top-k builds at its first call
-            _jit_gguf_moe_cold_sum_module(torch.bfloat16, 6)
         half_float = bool(staged) and select_prefill_float(
             0, self.w13_type, self.w2_type
         )
+        # the compact rows run on the int8 staged kernel and the clamped SwiGLU (cold_moe)
+        compact = (
+            bool(staged)
+            and not half_float
+            and self.swiglu_limit is not None
+            and bool(envs.SGLANG_HOTCOLD_PREFILL_COMPACT.get())
+        )
+        if compact:
+            from sglang.kernels.ops.moe.gguf_moe_cold_rows import (
+                _jit_gguf_moe_cold_rows_module,
+            )
+            from sglang.kernels.ops.moe.gguf_moe_cold_sum import (
+                _jit_gguf_moe_cold_sum_module,
+            )
+            from sglang.kernels.ops.moe.gguf_moe_cold_swiglu import (
+                _jit_gguf_moe_cold_swiglu_module,
+            )
+
+            _jit_gguf_moe_cold_rows_module()
+            _jit_gguf_moe_cold_swiglu_module(torch.bfloat16)
+            # the routed top-k is not known here: built for DeepSeek-V4's six; another top-k builds at its first call
+            _jit_gguf_moe_cold_sum_module(torch.bfloat16, 6)
         if half_float:
             from sglang.kernels.ops.moe.gguf_moe_f16_staged import (
                 _jit_gguf_moe_f16_staged_module,
@@ -891,8 +950,11 @@ class ColdGGUFExperts(nn.Module):
                 build = f"wide block {wide}"
             else:
                 build = f"block {_mmq_block(types[0])}" if mmq else ""
-            if compact:
-                build += ", compact rows"
+            if mmq and (staged or wide):
+                # which layout serves a call above the threshold (SGLANG_HOTCOLD_PREFILL_COMPACT)
+                build += (
+                    ", compact rows by a device count" if compact else ", dense rows"
+                )
             if half_float:
                 # SGLANG_HOTCOLD_PREFILL_FLOAT: other output bits than the int8 kernels above the threshold
                 build += ", half-float products"

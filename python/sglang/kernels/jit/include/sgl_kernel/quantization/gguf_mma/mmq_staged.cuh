@@ -589,5 +589,63 @@ __global__ void __launch_bounds__(kStThreads, 1) gguf_moe_mmq_staged_iq2_s_kerne
 #undef SGLANG_MMQ_STAGED_CASE
 }
 
+// quantize_mmq_q8_1_d4 over the first row_count[0] rows only, the count read ON THE DEVICE (a compact
+// cold-tier call: the down projection's input holds one row per cold route in a buffer sized for every
+// route, and the host does not know how many there are). The statements of a row are those of
+// quantize_mmq_q8_1_d4: the same int8 values and scales. y keeps the layout of `nrows` rows per block.
+// grid (min(nrows, kStCountedGrid), ceil(k / 4 / 128)), block (128): CTA (b, c) takes rows b, b + grid.x, ...
+constexpr int kStCountedGrid = 4096;
+
+template <typename scalar_t>
+__global__ void quantize_mmq_q8_1_d4_counted(
+    const scalar_t* __restrict__ x,
+    block_q8_1_mmq* __restrict__ y,
+    const int32_t* __restrict__ row_count,
+    const int k,
+    const int nrows) {
+  const int ix0 = (blockDim.x * blockIdx.y + threadIdx.x) * 4;
+  if (ix0 >= k) {
+    return;  // k % 128 == 0: whole warps leave together
+  }
+  const int counted = row_count[0];
+  const int count = counted < nrows ? counted : nrows;
+  for (int64_t row = blockIdx.x; row < count; row += gridDim.x) {
+    const scalar_t* xr = x + row * k + ix0;
+    const float x0 = static_cast<float>(xr[0]);
+    const float x1 = static_cast<float>(xr[1]);
+    const float x2 = static_cast<float>(xr[2]);
+    const float x3 = static_cast<float>(xr[3]);
+
+    float amax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+    for (int mask = 4; mask > 0; mask >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
+    }
+
+    const float d = amax / 127;
+    char4 q;
+    q.x = amax == 0.0f ? 0 : roundf(x0 / d);
+    q.y = amax == 0.0f ? 0 : roundf(x1 / d);
+    q.z = amax == 0.0f ? 0 : roundf(x2 / d);
+    q.w = amax == 0.0f ? 0 : roundf(x3 / d);
+
+    const int64_t ib = (int64_t)(ix0 / 128) * nrows + row;
+    const int iqs = ix0 % 128;
+    reinterpret_cast<char4*>(y[ib].qs)[iqs / 4] = q;
+    if (iqs % 32 == 0) {
+      y[ib].d4[iqs / 32] = __half2float(__float2half(d));
+    }
+  }
+}
+
+template <typename scalar_t>
+static void quantize_mmq_q8_1_d4_counted_cuda(
+    const scalar_t* x, void* y, const int32_t* row_count, const int k, const int nrows, cudaStream_t stream) {
+  const dim3 grid(
+      nrows < kStCountedGrid ? nrows : kStCountedGrid, (k / 4 + kQuantizeMmqBlock - 1) / kQuantizeMmqBlock, 1);
+  quantize_mmq_q8_1_d4_counted<scalar_t>
+      <<<grid, kQuantizeMmqBlock, 0, stream>>>(x, (block_q8_1_mmq*)y, row_count, k, nrows);
+}
+
 }  // namespace gguf_mma
 }  // namespace sglang

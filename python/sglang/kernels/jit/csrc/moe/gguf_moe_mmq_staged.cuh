@@ -20,6 +20,9 @@ namespace gguf_mmq_staged_detail {
 
 // sorted_rows == nullptr: route s is written to output row s and the output is [tokens * top_k, N].
 // Otherwise sorted_rows[c] is the output row of sorted column c (a compact output of any row count).
+// row_count != nullptr (int32 [1] on the device): only the first row_count[0] rows of the input hold
+// activations (a compact input in a buffer sized for every route); the activation quantisation runs
+// over those rows and reads the count on the device. The routes must not point past them.
 template <typename scalar_t, int kQuantType, int kWide>
 void launch(
     tvm::ffi::TensorView input,
@@ -30,6 +33,7 @@ void launch(
     tvm::ffi::TensorView num_tokens_post_padded,
     tvm::ffi::TensorView output,
     tvm::ffi::TensorView quantized_input,
+    const tvm::ffi::TensorView* row_count,
     int64_t top_k,
     int64_t row,
     int64_t tokens) {
@@ -77,15 +81,29 @@ void launch(
   CHECK_HOST(reinterpret_cast<std::uintptr_t>(quantized_input.data_ptr()) % 16 == 0)
       << "the activation scratch is read 16 bytes at a time";
   CHECK_HOST(tokens * top_k <= kMaxIndex / row);
+  if (row_count != nullptr) {
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(*row_count);
+  }
   if (tokens == 0 || blocks.unwrap() == 0) return;
 
   const auto stream = LaunchKernel::resolve_device(device.unwrap());
-  gguf_mma::quantize_mmq_q8_1_d4_cuda<scalar_t>(
-      static_cast<const scalar_t*>(input.data_ptr()),
-      quantized_input.data_ptr(),
-      static_cast<int>(k),
-      static_cast<int>(tokens),
-      stream);
+  if (row_count == nullptr) {
+    gguf_mma::quantize_mmq_q8_1_d4_cuda<scalar_t>(
+        static_cast<const scalar_t*>(input.data_ptr()),
+        quantized_input.data_ptr(),
+        static_cast<int>(k),
+        static_cast<int>(tokens),
+        stream);
+  } else {
+    gguf_mma::quantize_mmq_q8_1_d4_counted_cuda<scalar_t>(
+        static_cast<const scalar_t*>(input.data_ptr()),
+        quantized_input.data_ptr(),
+        static_cast<const int32_t*>(row_count->data_ptr()),
+        static_cast<int>(k),
+        static_cast<int>(tokens),
+        stream);
+  }
+  CHECK_CUDA(cudaGetLastError());
 
   constexpr int kSharedBytes = gguf_mma::mmq_staged_shared_words<kWide>() * sizeof(int);
   const bool need_check = row % gguf_mma::kMmqY != 0;
@@ -146,6 +164,7 @@ void gguf_moe_mmq_staged(
       num_tokens_post_padded,
       output,
       quantized_input,
+      nullptr,
       top_k,
       row,
       tokens);
@@ -176,6 +195,40 @@ void gguf_moe_mmq_staged_rows(
       num_tokens_post_padded,
       output,
       quantized_input,
+      nullptr,
+      top_k,
+      row,
+      tokens);
+}
+
+/// \brief The projection of a compact input: only the first row_count[0] rows of `input` hold activations.
+/// \param input [rows, K] with rows = `tokens` (a buffer sized for every route; top_k is 1).
+/// \param sorted_token_ids The input (and output) row of each sorted column; an id outside [0, tokens) pads.
+/// \param row_count int32 [1] on the device: the rows the activation quantisation covers; every valid id is below it.
+/// \param output [tokens, N]; only the rows of valid ids are written.
+template <typename scalar_t, int kQuantType, int kWide>
+void gguf_moe_mmq_staged_counted(
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView sorted_token_ids,
+    tvm::ffi::TensorView expert_ids,
+    tvm::ffi::TensorView num_tokens_post_padded,
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView quantized_input,
+    tvm::ffi::TensorView row_count,
+    int64_t top_k,
+    int64_t row,
+    int64_t tokens) {
+  gguf_mmq_staged_detail::launch<scalar_t, kQuantType, kWide>(
+      input,
+      weight,
+      sorted_token_ids,
+      nullptr,
+      expert_ids,
+      num_tokens_post_padded,
+      output,
+      quantized_input,
+      &row_count,
       top_k,
       row,
       tokens);
