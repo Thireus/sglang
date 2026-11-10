@@ -58,7 +58,9 @@ class TestHostEmbedding(CustomTestCase):
         table = HostEmbeddingTable(shard, key)
         rows = table.rows(list(range(VOCAB)))
         self.assertEqual(rows.dtype, torch.bfloat16)
-        self.assertTrue(torch.equal(rows.view(torch.uint16), self.table.view(torch.uint16)))
+        self.assertTrue(
+            torch.equal(rows.view(torch.uint16), self.table.view(torch.uint16))
+        )
 
     def test_staged_anchors_then_mask_rows(self):
         module = PPDraftHostEmbedding(
@@ -122,7 +124,9 @@ class TestHostEmbeddingOnTheCheckpoint(CustomTestCase):
         for start in range(0, table.num_rows, 16384):
             ids = list(range(start, min(start + 16384, table.num_rows)))
             self.assertTrue(
-                torch.equal(table.rows(ids).view(torch.uint16), want[ids].view(torch.uint16)),
+                torch.equal(
+                    table.rows(ids).view(torch.uint16), want[ids].view(torch.uint16)
+                ),
                 start,
             )
 

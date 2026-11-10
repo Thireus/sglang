@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.engram import EngramHasher
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

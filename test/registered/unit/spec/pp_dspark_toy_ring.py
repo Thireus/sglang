@@ -34,11 +34,8 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -68,7 +65,9 @@ def toy_next(history: List[int]) -> int:
     return (sum(history[-3:]) * 31 + len(history) * 7 + 11) % (VOCAB - 3) + 3
 
 
-def plain_output(prompt: List[int], max_new: int, stop: Optional[int] = None) -> List[int]:
+def plain_output(
+    prompt: List[int], max_new: int, stop: Optional[int] = None
+) -> List[int]:
     tokens, out = list(prompt), []
     while len(out) < max_new:
         tok = toy_next(tokens)
@@ -296,7 +295,15 @@ class ToyProposer:
         self.num_proposals = 0
 
     def propose(
-        self, *, batch, draft_input, verify_window, bs, device, target_model, sampling_info,
+        self,
+        *,
+        batch,
+        draft_input,
+        verify_window,
+        bs,
+        device,
+        target_model,
+        sampling_info,
         anchor_prepared=False,
     ):
         self.num_proposals += 1
@@ -349,8 +356,13 @@ class ToyTargetWorker:
         )
 
     def forward_batch_generation(
-        self, batch=None, forward_batch=None, pp_proxy_tensors=None, is_verify=False,
-        skip_attn_backend_init=None, capture_hidden_mode=None,
+        self,
+        batch=None,
+        forward_batch=None,
+        pp_proxy_tensors=None,
+        is_verify=False,
+        skip_attn_backend_init=None,
+        capture_hidden_mode=None,
     ):
         if batch is not None:
             # A plain round, as ForwardBatch.init_new reads it.
@@ -617,7 +629,9 @@ class ToyStage(SchedulerPPMixin):
             self.finished_rids[req.rid] = list(req.output_ids)
             self.finished_commits[req.rid] = req.tokens[: req.kv_committed_len]
             self.spec_verify_cts[req.rid] = req.spec_verify_ct
-            last_stage = self.model_worker.pp_last_stage if self.rank == PP - 1 else None
+            last_stage = (
+                self.model_worker.pp_last_stage if self.rank == PP - 1 else None
+            )
             if last_stage is not None:
                 last_stage.note_request_finished(req.rid)
             self.ring.note_finished(self.rank)
@@ -770,8 +784,12 @@ class ToyRing:
             mock.patch.object(
                 scheduler_pp_mixin, "set_time_batch", lambda *a, **k: None
             ),
-            mock.patch.object(DFlashVerifyInput, "prepare_for_verify", prepare_for_verify),
-            mock.patch.object(DFlashDraftInputV2, "prepare_for_decode", prepare_for_decode),
+            mock.patch.object(
+                DFlashVerifyInput, "prepare_for_verify", prepare_for_verify
+            ),
+            mock.patch.object(
+                DFlashDraftInputV2, "prepare_for_decode", prepare_for_decode
+            ),
         ]
         for p in patches:
             p.start()

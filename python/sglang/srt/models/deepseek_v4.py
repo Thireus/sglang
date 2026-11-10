@@ -4054,9 +4054,7 @@ class DeepseekV4Model(nn.Module):
                 stage_sources,
             )
 
-            stages = pipeline_stages(
-                config.num_hidden_layers, self.pp_group.world_size
-            )
+            stages = pipeline_stages(config.num_hidden_layers, self.pp_group.world_size)
             rank = self.pp_group.rank_in_group
             assert stages[rank] == range(self.start_layer, self.end_layer), (
                 f"stage {rank} holds layers [{self.start_layer}, {self.end_layer}), "
@@ -5547,7 +5545,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             install_draft_dump(
                 self,
                 envs.SGLANG_DSV41_DRAFT_DUMP_DIR.get(),
-                getattr(self.config, "text_config", self.config).dspark_target_layer_ids,
+                getattr(
+                    self.config, "text_config", self.config
+                ).dspark_target_layer_ids,
             )
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]

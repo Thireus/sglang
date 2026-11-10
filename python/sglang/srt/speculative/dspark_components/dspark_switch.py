@@ -16,7 +16,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # Break-even tokens per verify by requests decoding, from the ring model of the pipeline
 # (the plain and verify period at this box's measured stage times). A window's own
 # figures replace them through SGLANG_PP_DSPARK_BREAKEVEN.
-DEFAULT_BREAKEVEN_EXCHANGE_FIRST = {1: 1.97, 2: 2.65, 3: 2.63, 6: 2.70, 9: 2.76, 25: 3.59}
+DEFAULT_BREAKEVEN_EXCHANGE_FIRST = {
+    1: 1.97,
+    2: 2.65,
+    3: 2.63,
+    6: 2.70,
+    9: 2.76,
+    25: 3.59,
+}
 DEFAULT_BREAKEVEN_LAUNCH_FIRST = {1: 1.97, 2: 2.06, 3: 2.14, 6: 2.21, 9: 2.27, 25: 2.81}
 
 DRAFT_MARGIN = 1.1
@@ -26,8 +33,12 @@ NEW_REQUEST_TOKENS_PER_VERIFY = 3.0
 EWMA_WEIGHT = 0.2
 
 
-def parse_breakeven(text: Optional[str], default: Dict[int, float]) -> List[Tuple[int, float]]:
-    table = default if not text else {int(k): float(v) for k, v in json.loads(text).items()}
+def parse_breakeven(
+    text: Optional[str], default: Dict[int, float]
+) -> List[Tuple[int, float]]:
+    table = (
+        default if not text else {int(k): float(v) for k, v in json.loads(text).items()}
+    )
     if not table:
         raise ValueError("SGLANG_PP_DSPARK_BREAKEVEN is empty")
     return sorted(table.items())
@@ -60,7 +71,9 @@ class DsparkPPSwitch:
     ) -> None:
         assert mode in ("auto", "on", "off"), mode
         self.mode = mode
-        self.breakeven = list(breakeven) or sorted(DEFAULT_BREAKEVEN_EXCHANGE_FIRST.items())
+        self.breakeven = list(breakeven) or sorted(
+            DEFAULT_BREAKEVEN_EXCHANGE_FIRST.items()
+        )
         self.max_verify_bs = int(max_verify_bs)
         self._tokens_per_verify: Dict[str, float] = {}
         self._micro_batches: Dict[int, _MicroBatchState] = {}
@@ -96,7 +109,8 @@ class DsparkPPSwitch:
 
     def tokens_per_verify(self, rids: Sequence[str]) -> float:
         return sum(
-            self._tokens_per_verify.get(rid, NEW_REQUEST_TOKENS_PER_VERIFY) for rid in rids
+            self._tokens_per_verify.get(rid, NEW_REQUEST_TOKENS_PER_VERIFY)
+            for rid in rids
         ) / max(1, len(rids))
 
     def should_draft(

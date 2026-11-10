@@ -8,8 +8,8 @@ import torch
 from torch import nn
 
 import sglang.srt.models.deepseek_v4 as dsv4
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import deepseek_v2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,7 +25,9 @@ class _ToyTower(nn.Module):
 
 
 class _Stage(nn.Module):
-    prepare_language_model_inputs = dsv4.DeepseekV4ForCausalLM.prepare_language_model_inputs
+    prepare_language_model_inputs = (
+        dsv4.DeepseekV4ForCausalLM.prepare_language_model_inputs
+    )
 
     def __init__(self, tower):
         super().__init__()

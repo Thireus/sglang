@@ -231,9 +231,7 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     if cfg.speculative_algorithm == "DSPARK":
         # The relayed launch is checked where the model config is known:
         # dspark_pp_launch.validate_pp_dspark_launch, from _handle_dspark.
-        if not (
-            envs.SGLANG_ENABLE_PP_SPEC.get() and cfg.disaggregation_mode == "null"
-        ):
+        if not (envs.SGLANG_ENABLE_PP_SPEC.get() and cfg.disaggregation_mode == "null"):
             assert cfg.disaggregation_mode == "prefill", (
                 "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
             )

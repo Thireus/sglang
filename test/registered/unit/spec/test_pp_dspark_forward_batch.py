@@ -8,11 +8,8 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.dspark_components.dspark_pp_relay import (
     DSparkPPRelayInput,

@@ -93,14 +93,21 @@ def _past_accept_token(position: int) -> int:
 class _Run:
     def __init__(self, layout: KVLayout, ring_size: int, requests: int, seed: int):
         gen = torch.Generator(device=DEVICE).manual_seed(seed)
-        self.weight = torch.randn(HEAD_DIM, generator=gen, device=DEVICE, dtype=torch.float32)
+        self.weight = torch.randn(
+            HEAD_DIM, generator=gen, device=DEVICE, dtype=torch.float32
+        )
         if _gpu():
             self.weight = self.weight.to(torch.bfloat16)
             self.cache = torch.zeros(
-                NUM_PAGES, layout.page_bytes(PAGE_SIZE), dtype=torch.uint8, device=DEVICE
+                NUM_PAGES,
+                layout.page_bytes(PAGE_SIZE),
+                dtype=torch.uint8,
+                device=DEVICE,
             )
         else:
-            self.cache = torch.zeros(NUM_PAGES * PAGE_SIZE, HEAD_DIM, dtype=torch.float32)
+            self.cache = torch.zeros(
+                NUM_PAGES * PAGE_SIZE, HEAD_DIM, dtype=torch.float32
+            )
         angles = torch.randn(4096, ROPE_DIM // 2, generator=gen, device=DEVICE)
         self.freqs = torch.view_as_real(
             torch.polar(torch.ones_like(angles), angles)
@@ -120,7 +127,10 @@ class _Run:
     def row(self, key: Row) -> torch.Tensor:
         if key not in self.inputs:
             self.inputs[key] = torch.randn(
-                2 * HEAD_DIM, generator=self.input_gen, device=DEVICE, dtype=torch.float32
+                2 * HEAD_DIM,
+                generator=self.input_gen,
+                device=DEVICE,
+                dtype=torch.float32,
             )
         return self.inputs[key]
 
@@ -130,7 +140,8 @@ class _Run:
         rows = [r for block in blocks for r in block]
         count = pad * draft_len
         kv = torch.stack(
-            [self.row(r) for r in rows] + [torch.zeros(2 * HEAD_DIM, device=DEVICE)] * count
+            [self.row(r) for r in rows]
+            + [torch.zeros(2 * HEAD_DIM, device=DEVICE)] * count
         )
         to = lambda values, dtype: torch.tensor(values, device=DEVICE, dtype=dtype)
         loc = [SLOT_BASE * (1 + r[0]) + r[1] for r in rows]
@@ -222,11 +233,15 @@ class TestC2VerifyAgainstDecode(CustomTestCase):
             for offset, token in enumerate(stream):
                 key = (rid, starts[rid] + offset, token)
                 if key[1] % 2 == 1:
-                    self.assertTrue(torch.equal(one.latents[key], blocks.latents[key]), key)
+                    self.assertTrue(
+                        torch.equal(one.latents[key], blocks.latents[key]), key
+                    )
                     committed += 1
         self.assertGreater(committed, 40)
         differs = (one.cache != blocks.cache).sum().item()
-        self.assertEqual(differs, 0, f"main-KV differs in {differs} of {one.cache.numel()}")
+        self.assertEqual(
+            differs, 0, f"main-KV differs in {differs} of {one.cache.numel()}"
+        )
 
     def test_committed_pairs_equal_decoding_one_by_one(self):
         layouts = (KVLayout.V4, KVLayout.V41) if _gpu() else (KVLayout.V4,)

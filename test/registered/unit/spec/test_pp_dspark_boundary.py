@@ -8,7 +8,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import deepseek_v41_pp_sources as pp
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -137,7 +138,9 @@ class TestProxyBuffers(CustomTestCase):
             pp.PRE_KEY: torch.zeros(54, HC),
             pp.source_input_key(20): torch.zeros(54, HIDDEN),
         }
-        runner.buffers = SimpleNamespace(pp_proxy_tensors=buffers, num_token_non_padded=None)
+        runner.buffers = SimpleNamespace(
+            pp_proxy_tensors=buffers, num_token_non_padded=None
+        )
         runner._set_dp_real_num_tokens = lambda n: None
         runner._copy_replay_inputs = lambda fb: None
         runner._capture_graph_size = lambda bs, num_tokens: bs
@@ -274,7 +277,9 @@ class TestGraphFamilies(CustomTestCase):
                 ),
                 envs.SGLANG_ENABLE_PP_SPEC.override(flag),
             ):
-                return cuda_graph_setup._maybe_add_pp_dspark_plain_family(target, runner)
+                return cuda_graph_setup._maybe_add_pp_dspark_plain_family(
+                    target, runner
+                )
 
         # The flag on, another algorithm; the algorithm, no flag: the one runner.
         self.assertIs(launch("EAGLE", True), runner)

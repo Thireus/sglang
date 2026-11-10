@@ -671,7 +671,9 @@ class SchedulerPPMixin:
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
 
-    def _pp_dspark_launches_first(self: Scheduler, batch: Optional[ScheduleBatch]) -> bool:
+    def _pp_dspark_launches_first(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> bool:
         """Under the DSpark relay a plain round keeps the plain order, and a verify
         round takes it only with SGLANG_PP_DSPARK_LAUNCH_FIRST."""
         if not self._pp_dspark_relay:

@@ -15,13 +15,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.draft_worker_common import build_block_pos_offsets
 from sglang.srt.speculative.dspark_components.dspark_pp_relay import (
     DSparkPPRelayInput,
     prepare_plain_round,
     relay_verify_input,
     relay_verify_window,
 )
-from sglang.srt.speculative.draft_worker_common import build_block_pos_offsets
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch

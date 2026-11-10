@@ -142,11 +142,7 @@ class TestNothingRollsBack(CustomTestCase):
             chain = tokens[pos : pos + k] + [1000 + i for i in range(WIDTH - k)]
             for col, token in enumerate(chain):
                 for back in range(max(0, pos + col - 128), pos + col):
-                    want = (
-                        chain[back - pos]
-                        if back >= pos
-                        else tokens[back]
-                    )
+                    want = chain[back - pos] if back >= pos else tokens[back]
                     self.assertEqual(stage.swa[back], row_value(back, want))
                 stage.write_row(pos + col, token, None)
             pos += k

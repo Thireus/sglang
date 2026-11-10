@@ -22,7 +22,9 @@ def _injector(ring=None):
         draft_model=None,
         draft_model_runner=SimpleNamespace(
             runner_ids=runner_ids,
-            token_to_kv_pool=SimpleNamespace(swa_req_ring_size=ring, sliding_window=128),
+            token_to_kv_pool=SimpleNamespace(
+                swa_req_ring_size=ring, sliding_window=128
+            ),
         ),
         model_runner=None,
         device="cpu",

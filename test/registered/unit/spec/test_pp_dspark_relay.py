@@ -28,7 +28,7 @@ from sglang.srt.managers.scheduler_pp_mixin import (
     _pp_exchange_outputs_before_forward,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_pp_relay import DSparkPPRelayInput
 from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -240,9 +240,7 @@ class TestRelayOnThreeStages(_RingCase):
             next_token_ids=torch.zeros(6, dtype=torch.int64),
             accept_lens=torch.ones(1, dtype=torch.int32),
             new_seq_lens=torch.ones(1, dtype=torch.int64),
-            next_draft_input=DSparkPPRelayInput.degenerate(
-                ["a"], torch.tensor([3]), 6
-            ),
+            next_draft_input=DSparkPPRelayInput.degenerate(["a"], torch.tensor([3]), 6),
             next_verify_chain=torch.zeros(6, dtype=torch.int64),
         )
         result.next_draft_input.bonus_tokens = torch.tensor([3])
@@ -346,7 +344,9 @@ class TestRelayOnThreeStages(_RingCase):
                 committed = stage.engram.committed.get(i + 1, [])
                 # Every token but the last has been the anchor of a commit, or the
                 # run went past the request's end by at most one block.
-                self.assertEqual(committed[: len(output) - 1], output[:-1][: len(committed)])
+                self.assertEqual(
+                    committed[: len(output) - 1], output[:-1][: len(committed)]
+                )
                 self.assertGreaterEqual(len(committed), len(output) - 1 - WIDTH)
 
     def test_all_stages_insert_the_same_committed_tokens(self):

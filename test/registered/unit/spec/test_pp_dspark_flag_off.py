@@ -20,7 +20,7 @@ from sglang.srt.managers.scheduler_pp_mixin import (
     _pp_exchange_outputs_before_forward,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_pp_launch import (
     pp_dspark_relay_enabled,
 )
@@ -209,8 +209,10 @@ class _FlagOff(ast.NodeTransformer):
         offset = len(args.args) - len(args.defaults)
         for i, arg in enumerate(args.args):
             default = args.defaults[i - offset] if i >= offset else None
-            if arg.arg in NEW_PARAMETERS and default is not None and (
-                self._drops(arg.arg)
+            if (
+                arg.arg in NEW_PARAMETERS
+                and default is not None
+                and (self._drops(arg.arg))
             ):
                 continue
             kept.append(arg)
@@ -219,7 +221,11 @@ class _FlagOff(ast.NodeTransformer):
         args.args, args.defaults = kept, defaults
         kw_kept, kw_defaults = [], []
         for arg, default in zip(args.kwonlyargs, args.kw_defaults):
-            if arg.arg in NEW_PARAMETERS and default is not None and self._drops(arg.arg):
+            if (
+                arg.arg in NEW_PARAMETERS
+                and default is not None
+                and self._drops(arg.arg)
+            ):
                 continue
             kw_kept.append(arg)
             kw_defaults.append(default)
@@ -235,12 +241,7 @@ def _strip_docstring_and_pass(tree):
         body = getattr(node, "body", None)
         if isinstance(body, list):
             node.body = [
-                s
-                for s in body
-                if not (
-                    isinstance(s, ast.Pass)
-                    and len(body) > 1
-                )
+                s for s in body if not (isinstance(s, ast.Pass) and len(body) > 1)
             ]
             if (
                 isinstance(node, ast.FunctionDef)
@@ -286,7 +287,12 @@ class TestFlagOffBehaviour(CustomTestCase):
         stage = SchedulerPPMixin()
         self.assertFalse(stage._pp_dspark_relay)
         self.assertFalse(stage._pp_dspark_launches_first(None))
-        for pp_size, algorithm in ((3, None), (3, "EAGLE"), (3, "DSPARK"), (1, "DSPARK")):
+        for pp_size, algorithm in (
+            (3, None),
+            (3, "EAGLE"),
+            (3, "DSPARK"),
+            (1, "DSPARK"),
+        ):
             self.assertFalse(
                 pp_dspark_relay_enabled(pp_size=pp_size, spec_algorithm=algorithm)
             )
@@ -295,7 +301,9 @@ class TestFlagOffBehaviour(CustomTestCase):
         with envs.SGLANG_ENABLE_PP_SPEC.override(True):
             self.assertFalse(pp_dspark_relay_enabled(pp_size=3, spec_algorithm="EAGLE"))
             self.assertFalse(pp_dspark_relay_enabled(pp_size=3, spec_algorithm=None))
-            self.assertFalse(pp_dspark_relay_enabled(pp_size=1, spec_algorithm="DSPARK"))
+            self.assertFalse(
+                pp_dspark_relay_enabled(pp_size=1, spec_algorithm="DSPARK")
+            )
 
     def test_exchange_order_without_the_argument_is_the_stock_order(self):
         for mode in (ForwardMode.DECODE, ForwardMode.EXTEND):
@@ -344,7 +352,9 @@ class TestFlagOffBehaviour(CustomTestCase):
 )
 class TestFlagOffIsTheBaseProgram(CustomTestCase):
     def test_every_touched_file_folds_to_the_base(self):
-        base_root = Path(os.environ["SGLANG_TEST_DSPARK_BASE_TREE"]) / "python/sglang/srt"
+        base_root = (
+            Path(os.environ["SGLANG_TEST_DSPARK_BASE_TREE"]) / "python/sglang/srt"
+        )
         here = Path(__file__).resolve().parents[4] / "python/sglang/srt"
         for rel in TOUCHED:
             with self.subTest(file=rel):

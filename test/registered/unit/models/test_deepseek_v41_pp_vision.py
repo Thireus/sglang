@@ -17,18 +17,19 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import initialize_moe_config
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.mm_utils import pad_mm_tokens
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     MM_PAD_SHIFT_VALUE,
-    Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import deepseek_v2
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.multimodal.deepseek_v41_image_processing import image_token_types
 from sglang.srt.multimodal.dsv41 import vl_routing
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_context,
