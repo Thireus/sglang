@@ -18,10 +18,11 @@ def _arch(major):
 
 class TestFullTopKRouting(CustomTestCase):
     """The ratio-1/2 index layers' full top-k: DeepGEMM's FP4 paged logits decode on
-    SM100 only (upstream's is_sm100), while prefill keeps DeepGEMM's flattened-K
-    logits on SM100 and SM12x alike (patch 017)."""
+    SM100 only (patch 017), while prefill keeps DeepGEMM's flattened-K logits on
+    SM100 and SM12x alike (upstream's is_sm100_or_newer)."""
 
     def _make(self, major):
+        v41_indexer.is_sm100_or_newer.cache_clear()
         v41_indexer._use_deep_gemm_prefill.cache_clear()
         try:
             with (
@@ -33,6 +34,7 @@ class TestFullTopKRouting(CustomTestCase):
                     token_to_kv_pool=None, req_to_token=None
                 )
         finally:
+            v41_indexer.is_sm100_or_newer.cache_clear()
             v41_indexer._use_deep_gemm_prefill.cache_clear()
 
     def test_sm12x_decodes_without_deep_gemm(self):

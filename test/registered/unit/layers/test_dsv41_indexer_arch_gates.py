@@ -124,14 +124,17 @@ class TestV41IndexerArchGates(CustomTestCase):
         with self._route(_FakeNonCudaArch()):
             self.assertFalse(indexer.is_sm100_or_newer())
 
-    def test_full_topk_indexer_routes_sm120_to_deep_gemm(self):
+    def test_full_topk_indexer_routes_sm120_prefill_to_deep_gemm(self):
+        # The fork decodes the SM12x full top-k from the Triton paged scores: the
+        # model hook turns SGLANG_FP8_PAGED_MQA_LOGITS_TORCH on there, so the
+        # paged metadata carries no DeepGEMM schedule.
         with self._route(_FakeCudaArch((12, 1))):
             full = indexer.make_full_topk_indexer(
                 token_to_kv_pool=SimpleNamespace(),
                 req_to_token=torch.empty(0),
             )
             self.assertTrue(full.use_deep_gemm_prefill)
-            self.assertTrue(full.use_deep_gemm_decode)
+            self.assertFalse(full.use_deep_gemm_decode)
 
     def test_full_topk_indexer_keeps_hopper_on_torch(self):
         with self._route(_FakeCudaArch((9, 0))):
