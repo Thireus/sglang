@@ -9,13 +9,26 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+def gguf_moe_vec_rows_per_block() -> int:
+    """Rows (warps) per CTA of the vector kernel: SGLANG_GGUF_MOE_VEC_ROWS_PER_BLOCK, 1..32."""
+    rows = envs.SGLANG_GGUF_MOE_VEC_ROWS_PER_BLOCK.get()
+    if not 1 <= rows <= 32:
+        raise ValueError(
+            f"SGLANG_GGUF_MOE_VEC_ROWS_PER_BLOCK must be 1..32 (1024 threads a CTA), got {rows}"
+        )
+    return rows
+
+
 @cache_once
-def _jit_gguf_moe_vec_module(dtype: torch.dtype, quant_type: int) -> Module:
+def _jit_gguf_moe_vec_module(
+    dtype: torch.dtype, quant_type: int, rows_per_block: int | None = None
+) -> Module:
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError(f"Unsupported GGUF input dtype: {dtype}")
     if quant_type not in (
@@ -46,6 +59,11 @@ def _jit_gguf_moe_vec_module(dtype: torch.dtype, quant_type: int) -> Module:
     # Match the AOT common_ops SM90 fast-math build; its other build is precise.
     sm90 = current_arch().is_sm(9, 0)
     flags = ["--use_fast_math"] if sm90 else []
+    if rows_per_block is None:
+        rows_per_block = gguf_moe_vec_rows_per_block()
+    # The grid is (rows / rows_per_block, 1, routes) CTAs of rows_per_block warps: the
+    # same dot product per row, fewer CTAs for the routes that only write zeros.
+    flags.append(f"-DGGML_CUDA_MMV_Y={int(rows_per_block)}")
     return load_jit(
         "gguf_moe_vec",
         *args,

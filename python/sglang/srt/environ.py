@@ -1973,7 +1973,32 @@ class Envs:
     # kernel), "vec" or "mmq"; the threshold; and the imatrix collector's directory
     # (eager only, empty = off).
     SGLANG_HOTCOLD_COLD_KERNEL = EnvStr("auto")
+    # Rows (warps) per CTA of the GGUF MoE vector kernel, 1 to 32. One row per CTA
+    # (ggml's default) launches rows x routes CTAs, and a route with a negative id
+    # still pays for all of its CTAs: with 45 of 324 routes active (54 tokens) the
+    # two projections took 1.63 ms at 1 row, 0.48 ms at 8 (RTX 5090, IQ2_S). The
+    # output does not depend on it (bit-identical at 1, 2, 4, 8, 16 and 32).
+    SGLANG_GGUF_MOE_VEC_ROWS_PER_BLOCK = EnvInt(8)
+    # MMQ serves a batch of more than this many tokens, the vector kernel the rest.
+    # The vector kernel reads an expert's rows once per route, MMQ once per block of
+    # 16 routes of that expert. On the engine's real routes (2 to 5 routes per cold
+    # expert at 54 tokens) a 54-token layer call took 1.07 to 2.11 ms with the vector
+    # kernel and 1.00 to 1.44 ms with MMQ, and the two meet near 24 tokens; on
+    # independent routes MMQ is 8 to 21 % slower at 54 tokens (RTX 5090, layer 20).
+    # 24 is the measured alternative; it changes the bits of 25 to 64-token batches.
     SGLANG_HOTCOLD_MMQ_MIN_TOKENS = EnvInt(64)
+    # MMQ's BLOCK (routes of one expert per CTA) is 32 from this many tokens, 16
+    # below; 0 keeps 16 everywhere (the default). Same output bits. A CTA unpacks its
+    # weight tile once whatever its fill: at 8192 tokens BLOCK 32 was 14 to 21 %
+    # faster, at 2048 tokens 13 % faster with half of the routes cold and 14 % slower
+    # with 13 % of them cold.
+    SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS = EnvInt(0)
+    # The multi-route vector kernel (cold kernel "vecm", IQ2_S): the vector kernel's
+    # arithmetic with the routes grouped per expert, VECM_ROUTES (2, 4 or 8) routes
+    # of one expert per CTA, bit-identical output. VEC_MULTI=1 makes "auto" choose
+    # it wherever it would choose the vector kernel.
+    SGLANG_HOTCOLD_VEC_MULTI = EnvBool(False)
+    SGLANG_HOTCOLD_VECM_ROUTES = EnvInt(4)
     SGLANG_DSV41_HOTCOLD_IMATRIX_DIR = EnvStr("")
     # Hot/cold diagnostics: ZERO_COLD drops the cold tier's output at serve time
     # (the layer behaves like a drop of its cold experts, router weights kept);
