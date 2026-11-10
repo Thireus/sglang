@@ -3981,6 +3981,16 @@ def dsv41_forward_skip_reason(forward_batch, num_tokens: int, min_tokens: int):
     return None
 
 
+def _flashinfer_autotuning() -> Optional[str]:
+    """'flashinfer autotune' while FlashInfer's autotuner runs, else None."""
+    try:
+        from flashinfer.autotuner import AutoTuner
+
+        return "flashinfer autotune" if AutoTuner.get().is_tuning_mode else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _parse_layer_set(spec: str):
     """ "0-12,20" -> {0..12, 20}; "" -> None (every layer)."""
     spec = (spec or "").strip()
@@ -4371,6 +4381,9 @@ class DeepseekV4Model(nn.Module):
     pp_source_plan = None
     # SGLANG_DSV41_DUMP_DIR / SGLANG_DSV41_HOTCOLD_STATS; None when both are unset.
     dsv41_diag: Optional[_Dsv41Diag] = None
+    # SGLANG_DSV41_EXPERT_IMATRIX_DIR (layers/moe/expert_imatrix.py), set by
+    # DeepseekV4ForCausalLM.post_load_weights; None when unset.
+    dsv41_expert_imatrix = None
 
     def __init__(
         self,
@@ -5143,11 +5156,23 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         diag = self.dsv41_diag
-        if diag is None:
+        imx = self.dsv41_expert_imatrix
+        if diag is None and imx is None:
             return self._forward_entry(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
-        diag.begin(self, input_ids, positions, forward_batch)
+        if imx is not None:
+            num_tokens = (
+                positions.shape[0] if positions is not None else input_ids.shape[0]
+            )
+            imx.begin(
+                dsv41_forward_skip_reason(forward_batch, num_tokens, imx.min_tokens)
+                or _flashinfer_autotuning(),
+                input_ids,
+                forward_batch,
+            )
+        if diag is not None:
+            diag.begin(self, input_ids, positions, forward_batch)
         output = None
         try:
             output = self._forward_entry(
@@ -5155,7 +5180,10 @@ class DeepseekV4Model(nn.Module):
             )
             return output
         finally:
-            diag.end(output)
+            if diag is not None:
+                diag.end(output)
+            if imx is not None:
+                imx.end()
 
     def _forward_entry(
         self,
@@ -5978,6 +6006,19 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        if (
+            envs.SGLANG_DSV41_EXPERT_IMATRIX_DIR.get()
+            and self.model.dsv41_expert_imatrix is None
+        ):
+            from sglang.srt.layers.moe import expert_imatrix
+
+            parallel = get_parallel()
+            collector = expert_imatrix.collector_from_env(
+                self.pp_group.rank_in_group, getattr(parallel, "tp_rank", 0)
+            )
+            self.model.dsv41_expert_imatrix = expert_imatrix.install(
+                self.model, collector
+            )
         if envs.SGLANG_DSV41_DRAFT_DUMP_DIR.get() and self.pp_group.is_last_rank:
             from sglang.srt.speculative.dspark_components.dspark_pp_dump import (
                 install_draft_dump,
