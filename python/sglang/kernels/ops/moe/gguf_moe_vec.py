@@ -82,6 +82,7 @@ def gguf_moe_a8_vec(
     type: int,
     row: int,
     tokens: int,
+    rows_per_block: int | None = None,
 ) -> torch.Tensor:
     """Project packed GGUF experts, writing zero for every negative route.
 
@@ -90,13 +91,15 @@ def gguf_moe_a8_vec(
     local expert indices or negative sentinels; their total size is tokens * top_k.
     The down projection retains the original route shape with top_k=1.
     Quantization, vector reduction and output rounding match the AOT operation.
+    ``rows_per_block`` picks the build (rows of N per CTA); None follows
+    SGLANG_GGUF_MOE_VEC_ROWS_PER_BLOCK. The output does not depend on it.
     """
     output = torch.zeros((tokens * top_k, row), dtype=input.dtype, device=input.device)
     padded = (input.shape[1] + 511) // 512 * 512
     quantized_input = torch.empty(
         (tokens, padded // 32 * 9), dtype=torch.int32, device=input.device
     )
-    _jit_gguf_moe_vec_module(input.dtype, int(type)).project(
+    _jit_gguf_moe_vec_module(input.dtype, int(type), rows_per_block).project(
         input, weight, topk_ids, output, quantized_input, top_k, row, tokens
     )
     return output

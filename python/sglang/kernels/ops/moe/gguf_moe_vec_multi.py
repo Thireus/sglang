@@ -23,11 +23,18 @@ GGUF_MOE_VEC_MULTI_TYPES = (22,)
 GGUF_MOE_VEC_MULTI_ROUTES = (2, 4, 8)
 GGUF_MOE_VEC_MULTI_DEFAULT_ROUTES = 4
 GGUF_MOE_VEC_MULTI_DEFAULT_ROWS = 8
+# CTAs per group of rows; a CTA walks every lanes-th block of routes
+# (SGLANG_HOTCOLD_VECM_LANES in the hot/cold layer; 8, 16 and 32 measure within 2 %).
+GGUF_MOE_VEC_MULTI_DEFAULT_LANES = 16
 
 
 @cache_once
 def _jit_gguf_moe_vec_multi_module(
-    dtype: torch.dtype, quant_type: int, routes: int, rows_per_block: int
+    dtype: torch.dtype,
+    quant_type: int,
+    routes: int,
+    rows_per_block: int,
+    prefix: bool = True,
 ) -> Module:
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError(f"Unsupported GGUF input dtype: {dtype}")
@@ -39,7 +46,7 @@ def _jit_gguf_moe_vec_multi_module(
         raise ValueError(f"Unsupported GGUF multi-route block size: {routes}")
     if not 1 <= rows_per_block <= 32:
         raise ValueError(f"rows per CTA must be 1..32, got {rows_per_block}")
-    args = make_cpp_args(dtype, quant_type, routes, rows_per_block)
+    args = make_cpp_args(dtype, quant_type, routes, rows_per_block, bool(prefix))
     return load_jit(
         "gguf_moe_vec_multi",
         *args,
@@ -61,6 +68,9 @@ def gguf_moe_vec_multi(
     tokens: int,
     routes: int = GGUF_MOE_VEC_MULTI_DEFAULT_ROUTES,
     rows_per_block: int = GGUF_MOE_VEC_MULTI_DEFAULT_ROWS,
+    lanes: int = GGUF_MOE_VEC_MULTI_DEFAULT_LANES,
+    zero_init: bool = True,
+    prefix: bool = True,
 ) -> torch.Tensor:
     """Project aligned routes through packed IQ2_S experts; inactive routes stay zero.
 
@@ -68,15 +78,21 @@ def gguf_moe_vec_multi(
     ``weight`` uint8 [E, row, row_bytes]. The routing tensors come from
     ``moe_align_block_size(ids, routes, E, pad_expert_ids=True)``; negative ids, padding
     and blocks past ``num_tokens_post_padded`` are skipped on the device, so the call is
-    CUDA-graph safe. Returns [tokens * top_k, row] in the input dtype.
+    CUDA-graph safe. The grid is (row / rows_per_block, lanes) whatever the batch: a CTA
+    walks every ``lanes``-th block. ``prefix=False`` tests every route inside the loops
+    instead of running the code built for the block's route count (for measurements).
+    Returns [tokens * top_k, row] in the input dtype. The
+    kernel writes the rows of the active routes only: ``zero_init=False`` skips the zero
+    fill for a caller that never reads another row (those rows are then undefined).
     """
-    output = torch.zeros((tokens * top_k, row), dtype=input.dtype, device=input.device)
+    alloc = torch.zeros if zero_init else torch.empty
+    output = alloc((tokens * top_k, row), dtype=input.dtype, device=input.device)
     padded = (input.shape[1] + 511) // 512 * 512
     quantized_input = torch.empty(
         (tokens, padded // 32 * 9), dtype=torch.int32, device=input.device
     )
     _jit_gguf_moe_vec_multi_module(
-        input.dtype, int(type), int(routes), int(rows_per_block)
+        input.dtype, int(type), int(routes), int(rows_per_block), bool(prefix)
     ).project(
         input,
         weight,
@@ -88,5 +104,6 @@ def gguf_moe_vec_multi(
         top_k,
         row,
         tokens,
+        int(lanes),
     )
     return output

@@ -276,7 +276,11 @@ class TestColdKernelPath(_Base):
             use_kernels=False,
         )
         calls = []
-        with patch.object(hc, "VEC_MAX_ROWS", 2 * 3 + 1):
+        # "legacy": the vector kernel serves every decode batch (the default takes the multi-route kernel)
+        with (
+            patch.dict(os.environ, {"SGLANG_HOTCOLD_COLD_KERNEL": "legacy"}),
+            patch.object(hc, "VEC_MAX_ROWS", 2 * 3 + 1),
+        ):
             ctx = self._seams(calls)
             for c in ctx:
                 c.start()
@@ -307,9 +311,10 @@ class TestColdKernelPath(_Base):
             use_kernels=False,
         )
         calls = []
+        # "legacy" = the earlier kernels' rule: the vector kernel, then MMQ in blocks of _mmq_block
         env = {
             "SGLANG_HOTCOLD_MMQ_MIN_TOKENS": "4",
-            "SGLANG_HOTCOLD_COLD_KERNEL": "auto",
+            "SGLANG_HOTCOLD_COLD_KERNEL": "legacy",
         }
         with (
             patch.dict(os.environ, env),
@@ -338,11 +343,16 @@ class TestColdKernelPath(_Base):
         sel = hc.select_cold_kernel
         with patch.object(hc, "_mmq_types", lambda: frozenset({22, 144, 145})):
             with patch.dict(os.environ, {"SGLANG_HOTCOLD_COLD_KERNEL": "auto"}):
-                self.assertEqual(sel(64, 22, 22), "vec")
+                self.assertEqual(
+                    sel(64, 22, 22), "vecm"
+                )  # IQ2_S decode batches: the multi-route vector kernel
                 self.assertEqual(sel(65, 22, 22), "mmq")
                 self.assertEqual(
                     sel(54, 145, 145), "vec"
-                )  # every captured batch (<= 54) stays on vec
+                )  # the other types stay on vec up to the threshold
+            with patch.dict(os.environ, {"SGLANG_HOTCOLD_COLD_KERNEL": "legacy"}):
+                self.assertEqual(sel(64, 22, 22), "vec")
+                self.assertEqual(sel(65, 22, 22), "mmq")
             with patch.dict(os.environ, {"SGLANG_HOTCOLD_COLD_KERNEL": "vec"}):
                 self.assertEqual(sel(4096, 22, 22), "vec")
         with patch.object(hc, "_mmq_types", lambda: frozenset()):
