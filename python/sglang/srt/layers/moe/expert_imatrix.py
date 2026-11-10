@@ -26,9 +26,21 @@ it accumulates on the GPU, in float64:
   matmuls with TF32 off, SwiGLU in fp32: gate.clamp(max=limit),
   up.clamp(-limit, limit), silu(gate) * up). ``X_ONLY`` skips it. The
   dequant of the layer's 384 experts dominates its cost, so with
-  ``A2_FLUSH_TOKENS`` > 0 the routed inputs are kept (a bf16 copy) and the
-  recompute runs once per that many tokens, and before every dump but a
-  SIGUSR1 one (which records ``a2_pending_tokens`` instead).
+  ``A2_FLUSH_TOKENS`` > 0 the routed inputs are kept (a bf16 copy; in host
+  memory with ``PENDING_ON_CPU``, so that the card holds one layer's batch only
+  while it is flushed) and the recompute runs once per that many tokens, and
+  before every dump but a SIGUSR1 one (which records ``a2_pending_tokens``
+  instead).
+* with ``FIRST_MOMENTS``: ``sum_x`` [E, hidden] and ``sum_a`` [E, intermediate],
+  the plain sums of x and of a over the same routes (each route once; WEIGHTING
+  count or both). sum / count is the expert's mean input: the direction along
+  which a quantisation error gives every token the same output error. Two
+  checks run at every dump and go into the meta block (``moment_checks``): the
+  per-expert sums of x and x^2 add up to the layer's totals, which are kept by
+  another path (routes per token times the token's row); and
+  sum^2 <= count * sum of squares for every expert and channel, for x and for a
+  (Cauchy-Schwarz: a sum accumulated into the wrong expert or with another
+  weighting breaks it).
 
 Only real extend forwards are counted (the model passes the result of
 ``dsv41_forward_skip_reason``: no capture, no warm-up, no decode, at least
@@ -334,14 +346,16 @@ def accumulate_x2(
     sum_x2: Optional[torch.Tensor],
     wsum_x2: Optional[torch.Tensor],
     route_chunk: int = 8192,
+    sum_x: Optional[torch.Tensor] = None,
 ) -> None:
     count.index_add_(0, experts, torch.ones_like(experts, dtype=count.dtype))
     wsum.index_add_(0, experts, weights)
     for s in range(0, experts.numel(), route_chunk):
         e = experts[s : s + route_chunk]
-        rows = (
-            x.index_select(0, tokens[s : s + route_chunk]).to(torch.float64).square_()
-        )
+        rows = x.index_select(0, tokens[s : s + route_chunk]).to(torch.float64)
+        if sum_x is not None:
+            sum_x.index_add_(0, e, rows)
+        rows.square_()
         if sum_x2 is not None:
             sum_x2.index_add_(0, e, rows)
         if wsum_x2 is not None:
@@ -367,8 +381,9 @@ def accumulate_a2(
     sum_a2: Optional[torch.Tensor],
     wsum_a2: Optional[torch.Tensor],
     chunk_bytes: int,
+    sum_a: Optional[torch.Tensor] = None,
 ) -> int:
-    """Adds a^2 of every valid route; returns the number of expert chunks."""
+    """Adds a^2 (and, with ``sum_a``, a) of every valid route; returns the number of expert chunks."""
     if experts.numel() == 0:
         return 0
     uniq, counts, tok_s, w_s = _group_by_expert(experts, tokens, weights)
@@ -385,11 +400,12 @@ def accumulate_a2(
             for j, eid in enumerate(ids):
                 a0, a1 = starts[c0 + j], starts[c0 + j + 1]
                 xs = x.index_select(0, tok_s[a0:a1]).float()
-                a2 = (
-                    clamped_swiglu_fp32(xs @ gate[j].T, xs @ up[j].T, limit)
-                    .to(torch.float64)
-                    .square_()
+                a2 = clamped_swiglu_fp32(xs @ gate[j].T, xs @ up[j].T, limit).to(
+                    torch.float64
                 )
+                if sum_a is not None:
+                    sum_a[eid].add_(a2.sum(0))
+                a2.square_()
                 if sum_a2 is not None:
                     sum_a2[eid].add_(a2.sum(0))
                 if wsum_a2 is not None:
@@ -441,6 +457,7 @@ class _LayerSums:
         weighting: str,
         x_only: bool,
         device,
+        first_moments: bool = False,
     ):
         f64 = dict(dtype=torch.float64, device=device)
         self.layer_id = layer_id
@@ -457,6 +474,15 @@ class _LayerSums:
         self.wsum_a2 = (
             torch.zeros(num_experts, inter, **f64) if wgt and not x_only else None
         )
+        # first moments (each route once) and the layer totals their check compares with
+        self.sum_x = torch.zeros(num_experts, hidden, **f64) if first_moments else None
+        self.sum_a = (
+            torch.zeros(num_experts, inter, **f64)
+            if first_moments and not x_only
+            else None
+        )
+        self.tot_x = torch.zeros(hidden, **f64) if first_moments else None
+        self.tot_x2 = torch.zeros(hidden, **f64) if first_moments else None
         self.calls = 0
         self.last_forward = -1
         self.pending: list = []
@@ -469,10 +495,53 @@ class _LayerSums:
             "wsum": self.wsum,
             "invalid_routes": self.invalid_routes,
         }
-        for name in ("sum_x2", "wsum_x2", "sum_a2", "wsum_a2"):
+        for name in (
+            "sum_x2",
+            "wsum_x2",
+            "sum_a2",
+            "wsum_a2",
+            "sum_x",
+            "sum_a",
+            "tot_x",
+            "tot_x2",
+        ):
             t = getattr(self, name)
             if t is not None:
                 out[name] = t
+        return out
+
+    def moment_check(self) -> Optional[dict]:
+        """The first moments against the layer totals and against Cauchy-Schwarz; None without first moments."""
+        if self.sum_x is None:
+            return None
+        tiny = 1e-300
+        out = {
+            "x_total_rel": float(
+                (self.sum_x.sum(0) - self.tot_x).norm()
+                / self.tot_x.norm().clamp_min(tiny)
+            )
+        }
+        ok = out["x_total_rel"] < 1e-9
+        n = self.count.to(torch.float64).unsqueeze(1)
+        if self.sum_x2 is not None:
+            out["x2_total_rel"] = float(
+                (self.sum_x2.sum(0) - self.tot_x2).norm()
+                / self.tot_x2.norm().clamp_min(tiny)
+            )
+            out["cs_x_max"] = float(
+                (self.sum_x.square() / (n * self.sum_x2).clamp_min(tiny)).max()
+            )
+            ok = ok and out["x2_total_rel"] < 1e-9 and out["cs_x_max"] <= 1.0 + 1e-6
+        if (
+            self.sum_a is not None
+            and self.sum_a2 is not None
+            and not self.pending_tokens
+        ):
+            out["cs_a_max"] = float(
+                (self.sum_a.square() / (n * self.sum_a2).clamp_min(tiny)).max()
+            )
+            ok = ok and out["cs_a_max"] <= 1.0 + 1e-6
+        out["pass"] = bool(ok)
         return out
 
 
@@ -494,11 +563,19 @@ class ExpertImatrixCollector:
         sync_timing: bool = True,
         a2_flush_tokens: int = 0,
         windows: Sequence[str] = (),
+        first_moments: bool = False,
+        pending_on_cpu: bool = False,
     ):
         if weighting not in WEIGHTINGS:
             raise ExpertImatrixError(
                 f"{TAG}: WEIGHTING must be one of {WEIGHTINGS}, got {weighting!r}"
             )
+        if first_moments and weighting == "weight":
+            raise ExpertImatrixError(
+                f"{TAG}: FIRST_MOMENTS counts each route once: WEIGHTING must be count or both"
+            )
+        self.first_moments = bool(first_moments)
+        self.pending_on_cpu = bool(pending_on_cpu)
         self.directory = directory
         self.weighting = weighting
         self.x_only = bool(x_only)
@@ -561,7 +638,14 @@ class ExpertImatrixCollector:
         if layer_id in self.layers:
             raise ExpertImatrixError(f"{TAG}: layer {layer_id} registered twice")
         self.layers[layer_id] = _LayerSums(
-            layer_id, num_experts, hidden, inter, self.weighting, self.x_only, device
+            layer_id,
+            num_experts,
+            hidden,
+            inter,
+            self.weighting,
+            self.x_only,
+            device,
+            first_moments=self.first_moments,
         )
         self.experts_modules[layer_id] = experts
         if weights_src is not None:
@@ -700,7 +784,21 @@ class ExpertImatrixCollector:
         t0 = time.perf_counter()
         e, tok, w, invalid = flat_routes(ids, weights, st.count.shape[0])
         st.invalid_routes.add_(invalid)
-        accumulate_x2(x, e, tok, w, st.count, st.wsum, st.sum_x2, st.wsum_x2)
+        accumulate_x2(
+            x, e, tok, w, st.count, st.wsum, st.sum_x2, st.wsum_x2, sum_x=st.sum_x
+        )
+        if st.tot_x is not None:
+            # the layer totals by another path: (valid routes of the token) x (the token's row)
+            flat = ids.reshape(-1).long()
+            per_token = (
+                ((flat >= 0) & (flat < st.count.shape[0]))
+                .view(ids.shape)
+                .sum(1)
+                .to(torch.float64)
+            )
+            x64 = x.to(torch.float64)
+            st.tot_x.add_(per_token @ x64)
+            st.tot_x2.add_(per_token @ x64.square_())
         if self.sync_timing and x.is_cuda:
             torch.cuda.current_stream().synchronize()
         t1 = time.perf_counter()
@@ -710,7 +808,12 @@ class ExpertImatrixCollector:
             if self.a2_flush_tokens > 0:
                 # the dequant of the layer's experts dominates the recompute: keep the
                 # routed inputs and run it once per a2_flush_tokens tokens
-                st.pending.append((x.detach().clone(), e, tok, w))
+                kept = (
+                    x.detach().to("cpu", copy=True)
+                    if self.pending_on_cpu
+                    else x.detach().clone()
+                )
+                st.pending.append((kept, e, tok, w))
                 st.pending_tokens += x.shape[0]
                 if st.pending_tokens >= self.a2_flush_tokens:
                     self._flush(layer_id)
@@ -725,6 +828,7 @@ class ExpertImatrixCollector:
                     st.sum_a2,
                     st.wsum_a2,
                     self.chunk_bytes,
+                    sum_a=st.sum_a,
                 )
             if self.sync_timing and x.is_cuda:
                 torch.cuda.current_stream().synchronize()
@@ -754,8 +858,12 @@ class ExpertImatrixCollector:
             off += x.shape[0]
         st.pending = []
         st.pending_tokens = 0
+        x_all = torch.cat(xs).to(
+            st.count.device
+        )  # one layer's batch on the card, only for this flush
+        del xs
         self.a2_chunks += accumulate_a2(
-            torch.cat(xs),
+            x_all,
             torch.cat(es),
             torch.cat(toks),
             torch.cat(ws),
@@ -764,6 +872,7 @@ class ExpertImatrixCollector:
             st.sum_a2,
             st.wsum_a2,
             self.chunk_bytes,
+            sum_a=st.sum_a,
         )
         self.a2_flushes += 1
 
@@ -815,6 +924,8 @@ class ExpertImatrixCollector:
             "layers": sorted(self.layers),
             "weighting": self.weighting,
             "x_only": self.x_only,
+            "first_moments": self.first_moments,
+            "pending_on_cpu": self.pending_on_cpu,
             "count_rule": "each valid route once (padded ids never); weighted sums multiply by the router weight",
             "a_rule": "a = silu(gate.clamp(max=limit)) * up.clamp(-limit, limit), fp32 from the exact MXFP4 dequant, TF32 off",
             "chunk_bytes": self.chunk_bytes,
@@ -871,6 +982,17 @@ class ExpertImatrixCollector:
         self.dumps += 1
         meta = self.meta()
         meta["reason"] = reason
+        if self.first_moments:
+            meta["moment_checks"] = {}
+            for layer_id, st in sorted(self.layers.items()):
+                chk = st.moment_check()
+                meta["moment_checks"][str(layer_id)] = chk
+                if chk is not None and not chk["pass"]:
+                    self._warn_once(
+                        f"moments{layer_id}",
+                        f"layer {layer_id}: the first-moment check FAILED ({chk}): "
+                        "the sums of x or a do not match the layer totals or break Cauchy-Schwarz",
+                    )
         arrays["meta"] = np.array(json.dumps(meta, sort_keys=True))
         tmp = self.path + ".partial.npz"
         np.savez(tmp, **arrays)
@@ -1013,6 +1135,8 @@ def collector_from_env(pp_rank: int, tp_rank: int) -> Optional[ExpertImatrixColl
             for p in (envs.SGLANG_DSV41_EXPERT_IMATRIX_WINDOWS.get() or "").split(",")
             if p.strip()
         ],
+        first_moments=envs.SGLANG_DSV41_EXPERT_IMATRIX_FIRST_MOMENTS.get(),
+        pending_on_cpu=envs.SGLANG_DSV41_EXPERT_IMATRIX_PENDING_ON_CPU.get(),
         pp_rank=pp_rank,
         tp_rank=tp_rank,
     )
@@ -1105,7 +1229,8 @@ def install(model, collector: ExpertImatrixCollector) -> ExpertImatrixCollector:
             TAG,
         )
     logger.info(
-        "%s: armed on pid %d (pp %d, tp %d) for MoE layers %d-%d (%d layers), weighting %s, x_only %s, "
+        "%s: armed on pid %d (pp %d, tp %d) for MoE layers %d-%d (%d layers), weighting %s, x_only %s, first moments %s, "
+        "pending inputs %s, a flush every %d tokens, "
         "chunk %d MiB, min tokens %d, save every %d, snapshots at forwards %s, check %d tokens, window filter %s; writes %s",
         TAG,
         os.getpid(),
@@ -1116,6 +1241,9 @@ def install(model, collector: ExpertImatrixCollector) -> ExpertImatrixCollector:
         len(blocks),
         collector.weighting,
         collector.x_only,
+        collector.first_moments,
+        "in host memory" if collector.pending_on_cpu else "on the card",
+        collector.a2_flush_tokens,
         collector.chunk_bytes >> 20,
         collector.min_tokens,
         collector.save_every,

@@ -2104,6 +2104,17 @@ class Envs:
     # forward counts only if each of its requests is one of those windows, seen
     # for the first time (smoke loads, probes and repeats are skipped).
     SGLANG_DSV41_EXPERT_IMATRIX_WINDOWS = EnvStr("")
+    # Also keep the first moments: per layer and expert the sum of x and (unless
+    # X_ONLY) the sum of a over the routes, each route once ("sum_x", "sum_a";
+    # WEIGHTING count or both). With the route count they give the mean input of
+    # every projection, which a quantiser can use to keep the constant part of
+    # its output error at zero. Checked at every dump (meta "moment_checks").
+    SGLANG_DSV41_EXPERT_IMATRIX_FIRST_MOMENTS = EnvBool(False)
+    # Keep the routed inputs that wait for the a recompute (A2_FLUSH_TOKENS) in
+    # host memory instead of on the card: the card then holds one layer's batch
+    # only while that layer is flushed. For a stage whose weights leave little
+    # free memory (13 layers of 384 experts on a 96 GB card: about 2.6 GiB).
+    SGLANG_DSV41_EXPERT_IMATRIX_PENDING_ON_CPU = EnvBool(False)
     # DeepSeek-V4 default when a request carries no reasoning_effort: a
     # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

@@ -9,7 +9,11 @@
   experts (up-first and gate-first w13, swizzled and plain scales, one and
   several experts a chunk), the whole-output recompute of the self-check;
 * the collector's forward filter, per-forward bookkeeping (layer misses, a
-  layer seen twice, the ids hashes), its dump and meta block.
+  layer seen twice, the ids hashes), its dump and meta block;
+* the first moments (FIRST_MOMENTS): the sums of x and of a against plain
+  loops, their arrays and the two checks in the dump (layer totals,
+  Cauchy-Schwarz), a planted wrong sum that the check must catch, and the
+  unchanged output with the switch off.
 
 The FlashInfer swizzle check and the fused kernel are GPU-only and not run here.
 """
@@ -437,6 +441,269 @@ class TestCollector(CustomTestCase):
         ids, w = _routes(torch.Generator().manual_seed(14), 5, 3, 6)
         with self.assertRaises(eim.ExpertImatrixError):
             c.observe(4, torch.zeros(6, 128), StandardTopKOutput(w, ids, None))
+
+
+class TestFirstMoments(CustomTestCase):
+    """FIRST_MOMENTS: sum_x / sum_a (each route once), the layer totals and the checks written at a dump."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_sum_x_against_plain_loop(self):
+        gen = torch.Generator().manual_seed(21)
+        num_experts, tokens, top_k, hidden = 12, 37, 4, 16
+        x = (torch.randn(tokens, hidden, generator=gen) * 3 + 0.7).to(torch.bfloat16)
+        ids, weights = _routes(gen, tokens, top_k, num_experts)
+        ref = np.zeros((num_experts, hidden))
+        xd = x.double().numpy()
+        for t in range(tokens):
+            for k in range(top_k):
+                e = int(ids[t, k])
+                if 0 <= e < num_experts:
+                    ref[e] += xd[t]
+        for chunk in (5, 8192):
+            count = torch.zeros(num_experts, dtype=torch.int64)
+            wsum = torch.zeros(num_experts, dtype=torch.float64)
+            s2 = torch.zeros(num_experts, hidden, dtype=torch.float64)
+            s1 = torch.zeros(num_experts, hidden, dtype=torch.float64)
+            e, tok, w, _ = eim.flat_routes(ids, weights, num_experts)
+            eim.accumulate_x2(
+                x, e, tok, w, count, wsum, s2, None, route_chunk=chunk, sum_x=s1
+            )
+            np.testing.assert_allclose(s1.numpy(), ref, rtol=1e-12, atol=1e-12)
+            # the squares are unchanged by the extra sum
+            s2b = torch.zeros(num_experts, hidden, dtype=torch.float64)
+            eim.accumulate_x2(
+                x,
+                e,
+                tok,
+                w,
+                torch.zeros_like(count),
+                torch.zeros_like(wsum),
+                s2b,
+                None,
+                route_chunk=chunk,
+            )
+            self.assertTrue(torch.equal(s2, s2b))
+        self.assertEqual(
+            s1[3].tolist(), (ref[3]).tolist()
+        )  # expert 3: one token routed twice counts twice
+
+    def test_sum_a_against_reference(self):
+        num_experts, hidden, inter = 6, 128, 128
+        src, gate, up, _ = _tiny_layer(
+            22, num_experts, hidden, inter, up_first=True, swizzled=True
+        )
+        gen = torch.Generator().manual_seed(23)
+        x = (torch.randn(29, hidden, generator=gen) * 0.05).to(torch.bfloat16)
+        ids, weights = _routes(gen, 29, 3, num_experts)
+        ref = torch.zeros(num_experts, inter, dtype=torch.float64)
+        for t in range(29):
+            for k in range(3):
+                e = int(ids[t, k])
+                if 0 <= e < num_experts:
+                    ref[e] += _swiglu64(
+                        gate[e] @ x[t].double(), up[e] @ x[t].double(), LIMIT
+                    )
+        for chunk_bytes in (1, 1 << 30):
+            s2 = torch.zeros(num_experts, inter, dtype=torch.float64)
+            s1 = torch.zeros(num_experts, inter, dtype=torch.float64)
+            e, tok, w, _ = eim.flat_routes(ids, weights, num_experts)
+            eim.accumulate_a2(x, e, tok, w, src, LIMIT, s2, None, chunk_bytes, sum_a=s1)
+            np.testing.assert_allclose(
+                s1.numpy(), ref.numpy(), rtol=2e-4, atol=1e-6 * float(ref.abs().max())
+            )
+            s2b = torch.zeros(num_experts, inter, dtype=torch.float64)
+            eim.accumulate_a2(x, e, tok, w, src, LIMIT, s2b, None, chunk_bytes)
+            self.assertTrue(torch.equal(s2, s2b))
+
+    def _collector(self, name, **kw):
+        c = eim.ExpertImatrixCollector(
+            os.path.join(self.tmp.name, name),
+            chunk_bytes=1 << 30,
+            save_every=0,
+            sync_timing=False,
+            check_tokens=0,
+            **kw,
+        )
+        src, *_ = _tiny_layer(4, 6, 128, 128, up_first=True, swizzled=False)
+        c.add_layer(4, None, 6, 128, 128, "cpu", weights_src=src, limit=LIMIT)
+        return c
+
+    def _feed(self, c, forwards=3, seed=24):
+        g = torch.Generator().manual_seed(seed)
+        for _ in range(forwards):
+            c.begin(None, None, None)
+            x = (torch.randn(16, 128, generator=g) * 0.05 + 0.02).to(torch.bfloat16)
+            ids, w = _routes(g, 16, 3, 6)
+            c.observe(4, x, StandardTopKOutput(w, ids, None))
+            c.end()
+
+    def test_dump_arrays_and_checks_pass(self):
+        for weighting, flush in (("count", 0), ("both", 40)):
+            c = self._collector(
+                f"fm-{weighting}",
+                weighting=weighting,
+                first_moments=True,
+                a2_flush_tokens=flush,
+            )
+            self._feed(c)
+            c.dump("expected")
+            z = np.load(c.path, allow_pickle=False)
+            meta = json.loads(str(z["meta"]))
+            self.assertTrue(meta["first_moments"])
+            chk = meta["moment_checks"]["4"]
+            self.assertTrue(chk["pass"], chk)
+            self.assertLess(chk["x_total_rel"], 1e-12)
+            self.assertLess(chk["x2_total_rel"], 1e-12)
+            self.assertLessEqual(chk["cs_x_max"], 1.0 + 1e-9)
+            self.assertLessEqual(chk["cs_a_max"], 1.0 + 1e-9)
+            self.assertEqual(z["L4.sum_x"].shape, (6, 128))
+            self.assertEqual(z["L4.sum_a"].shape, (6, 128))
+            self.assertEqual(z["L4.tot_x"].shape, (128,))
+            # the mean input is not zero here (the inputs carry an offset), and experts 4 and 5 have no route
+            self.assertGreater(float(np.abs(z["L4.sum_x"][:4]).sum()), 0.0)
+            self.assertEqual(float(np.abs(z["L4.sum_x"][4:]).sum()), 0.0)
+            self.assertEqual(float(np.abs(z["L4.sum_a"][4:]).sum()), 0.0)
+
+    def test_batched_sum_a_equals_per_forward(self):
+        runs = {}
+        for flush in (0, 40):
+            c = self._collector(
+                f"fl{flush}",
+                weighting="count",
+                first_moments=True,
+                a2_flush_tokens=flush,
+            )
+            self._feed(c, forwards=5)
+            c.dump("expected")
+            runs[flush] = c.layers[4]
+        torch.testing.assert_close(runs[40].sum_a, runs[0].sum_a, rtol=1e-6, atol=1e-12)
+        self.assertTrue(torch.equal(runs[40].sum_x, runs[0].sum_x))
+
+    def test_planted_wrong_sums_fail_the_check(self):
+        # a sum added to another expert: the totals still agree, Cauchy-Schwarz does not
+        c = self._collector("mut1", weighting="count", first_moments=True)
+        self._feed(c)
+        st = c.layers[4]
+        st.sum_x[5] += st.sum_x[0]
+        st.sum_x[0].zero_()
+        chk = st.moment_check()
+        self.assertFalse(chk["pass"])
+        self.assertLess(chk["x_total_rel"], 1e-12)
+        self.assertGreater(chk["cs_x_max"], 1.0 + 1e-6)
+        # a route lost from the first moment: the totals disagree
+        c = self._collector("mut2", weighting="count", first_moments=True)
+        self._feed(c)
+        st = c.layers[4]
+        st.sum_x[1] *= 0.5
+        chk = st.moment_check()
+        self.assertFalse(chk["pass"])
+        self.assertGreater(chk["x_total_rel"], 1e-6)
+        # the same for a: a doubled sum breaks Cauchy-Schwarz
+        c = self._collector("mut3", weighting="count", first_moments=True)
+        self._feed(c)
+        st = c.layers[4]
+        st.sum_a *= 40.0
+        chk = st.moment_check()
+        self.assertFalse(chk["pass"])
+        self.assertGreater(chk["cs_a_max"], 1.0 + 1e-6)
+        # and the failed check is in the dump's meta block
+        c.dump("expected")
+        meta = json.loads(str(np.load(c.path, allow_pickle=False)["meta"]))
+        self.assertFalse(meta["moment_checks"]["4"]["pass"])
+
+    def test_x_only_keeps_sum_x_only_and_weight_only_is_refused(self):
+        c = eim.ExpertImatrixCollector(
+            os.path.join(self.tmp.name, "xo"),
+            weighting="count",
+            x_only=True,
+            save_every=0,
+            sync_timing=False,
+            first_moments=True,
+        )
+        c.add_layer(0, None, 6, 128, 128, "cpu")
+        st = c.layers[0]
+        self.assertIsNotNone(st.sum_x)
+        self.assertIsNone(st.sum_a)
+        g = torch.Generator().manual_seed(25)
+        c.begin(None, None, None)
+        x = (torch.randn(16, 128, generator=g) * 0.05).to(torch.bfloat16)
+        ids, w = _routes(g, 16, 3, 6)
+        c.observe(0, x, StandardTopKOutput(w, ids, None))
+        c.end()
+        chk = st.moment_check()
+        self.assertTrue(chk["pass"], chk)
+        self.assertNotIn("cs_a_max", chk)
+        with self.assertRaises(eim.ExpertImatrixError):
+            eim.ExpertImatrixCollector(
+                os.path.join(self.tmp.name, "w"), weighting="weight", first_moments=True
+            )
+
+    def test_switch_off_changes_nothing(self):
+        c = self._collector("off", weighting="both")
+        self._feed(c)
+        c.dump("expected")
+        z = np.load(c.path, allow_pickle=False)
+        meta = json.loads(str(z["meta"]))
+        self.assertFalse(meta["first_moments"])
+        self.assertNotIn("moment_checks", meta)
+        for name in ("sum_x", "sum_a", "tot_x", "tot_x2"):
+            self.assertNotIn(f"L4.{name}", z.files)
+        self.assertIsNone(c.layers[4].moment_check())
+        # the squares are the same numbers with the switch on
+        c2 = self._collector("on", weighting="both", first_moments=True)
+        self._feed(c2)
+        self.assertTrue(torch.equal(c.layers[4].sum_x2, c2.layers[4].sum_x2))
+        self.assertTrue(torch.equal(c.layers[4].sum_a2, c2.layers[4].sum_a2))
+        self.assertTrue(torch.equal(c.layers[4].wsum_a2, c2.layers[4].wsum_a2))
+
+
+class TestPendingOnCpu(CustomTestCase):
+    """PENDING_ON_CPU: the kept routed inputs are host copies; the sums are the same numbers."""
+
+    def test_same_sums_and_no_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = {}
+            for on in (False, True):
+                c = eim.ExpertImatrixCollector(
+                    os.path.join(tmp, f"p{int(on)}"),
+                    weighting="count",
+                    save_every=0,
+                    sync_timing=False,
+                    a2_flush_tokens=40,
+                    check_tokens=0,
+                    first_moments=True,
+                    pending_on_cpu=on,
+                )
+                src, *_ = _tiny_layer(4, 6, 128, 128, up_first=True, swizzled=False)
+                c.add_layer(4, None, 6, 128, 128, "cpu", weights_src=src, limit=LIMIT)
+                g = torch.Generator().manual_seed(31)
+                for _ in range(5):
+                    c.begin(None, None, None)
+                    x = (torch.randn(16, 128, generator=g) * 0.05).to(torch.bfloat16)
+                    ids, w = _routes(g, 16, 3, 6)
+                    c.observe(4, x, StandardTopKOutput(w, ids, None))
+                    if c.layers[4].pending:
+                        kept = c.layers[4].pending[-1][0]
+                        self.assertEqual(kept.device.type, "cpu")
+                        self.assertNotEqual(
+                            kept.data_ptr(), x.data_ptr()
+                        )  # a copy, not the engine's buffer
+                    x.zero_()  # the engine reuses its buffer: the kept copy must not change
+                    c.end()
+                c.dump("expected")
+                meta = json.loads(str(np.load(c.path, allow_pickle=False)["meta"]))
+                self.assertEqual(meta["pending_on_cpu"], on)
+                self.assertTrue(meta["moment_checks"]["4"]["pass"])
+                runs[on] = c.layers[4]
+            for name in ("sum_x2", "sum_a2", "sum_x", "sum_a"):
+                self.assertTrue(
+                    torch.equal(getattr(runs[True], name), getattr(runs[False], name)),
+                    name,
+                )
+            self.assertGreater(float(runs[True].sum_a2.sum()), 0.0)
 
 
 class TestWindowFilter(CustomTestCase):
