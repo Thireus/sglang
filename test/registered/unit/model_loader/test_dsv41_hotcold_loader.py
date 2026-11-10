@@ -80,9 +80,11 @@ class TestManifestRules(CustomTestCase):
             ),
             "overlap": lambda r: r["layers"]["0"].update(cold=[1, 2, 3, 4, 6]),
             "missing [1]": lambda r: r["layers"]["0"].update(cold=[3, 4, 6]),
-            "same (H, C)": lambda r: (
+            # layers may differ in (H, C) since the per-stage counts; a declared H must still hold for every layer
+            "H is 4 but layers [1]": lambda r: (
                 r["layers"]["1"].update(hot=[1, 2, 3], cold=[0, 4, 5, 6, 7]),
                 r["layers"]["1"].update(forced_hot=[1]),
+                r.update(H=4),
             ),
             "row_bytes.w2": lambda r: r["cold_quant"]["row_bytes"].update(w2=81),
             "one ggml type": lambda r: (

@@ -146,11 +146,17 @@ class HotColdFusedMoE(nn.Module):
         if entry is None:
             raise ValueError(f"layer {layer_id} is not in the hot/cold manifest")
         self.layer_id = layer_id
-        self.num_hot = manifest.num_hot
-        self.num_cold = manifest.num_cold
+        # this layer's counts: a manifest may give each layer its own H (per pipeline stage)
+        self.num_hot = manifest.num_hot_of(layer_id)
+        self.num_cold = manifest.num_cold_of(layer_id)
+        if getattr(hot, "num_experts", self.num_hot) != self.num_hot:
+            raise ValueError(
+                f"hot/cold layer {layer_id}: the hot FusedMoE has {hot.num_experts} experts, "
+                f"the manifest {self.num_hot} hot slots"
+            )
         self.hot = hot
         self.cold = ColdGGUFExperts(
-            num_cold=manifest.num_cold,
+            num_cold=self.num_cold,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             w13_type=manifest.w13_type,
