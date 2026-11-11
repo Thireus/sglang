@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 # The vector kernel's grid limit: tokens * top_k <= 65535 (gguf_moe_vec.cuh).
 VEC_MAX_ROWS = 65535
 
+# check_kernels logs the cold tier's kernels once a process.
+_KERNELS_LOGGED = False
+
 
 def _mmq_types():
     try:
@@ -444,7 +447,8 @@ class ColdGGUFExperts(nn.Module):
             return
         from sglang.kernels.ops.moe.gguf_moe_vec import _jit_gguf_moe_vec_module
 
-        for t in {self.w13_type, self.w2_type}:
+        types = sorted({self.w13_type, self.w2_type})
+        for t in types:
             try:
                 _jit_gguf_moe_vec_module(torch.bfloat16, t)
             except ValueError as e:
@@ -453,6 +457,30 @@ class ColdGGUFExperts(nn.Module):
                     f"serve cold type {t} (IQ4_KS = 144 and IQ2_KS = 145 need the GGUF MoE"
                     f" kernels that add those types): {e}"
                 ) from e
+        # The MMQ build too, when auto or mmq can take it: a prefill above the
+        # token threshold then runs a kernel compiled at load, not at its first call.
+        mode = envs.SGLANG_HOTCOLD_COLD_KERNEL.get()
+        mmq = mode != "vec" and set(types) <= _mmq_types()
+        if mmq:
+            from sglang.kernels.ops.moe.gguf_moe_mmq import _jit_gguf_moe_mmq_module
+
+            for t in types:
+                _jit_gguf_moe_mmq_module(torch.bfloat16, t, _mmq_block(t))
+        global _KERNELS_LOGGED
+        if not _KERNELS_LOGGED:
+            _KERNELS_LOGGED = True
+            logger.info(
+                "hot/cold cold tier: kernel mode %s, vector kernel built for ggml type %s, "
+                "MMQ %s",
+                mode,
+                "/".join(str(t) for t in types),
+                (
+                    f"built (block {_mmq_block(types[0])}) above "
+                    f"{envs.SGLANG_HOTCOLD_MMQ_MIN_TOKENS.get()} tokens"
+                    if mmq
+                    else "off"
+                ),
+            )
 
     def reference_weights(self):
         if self._reference is None:

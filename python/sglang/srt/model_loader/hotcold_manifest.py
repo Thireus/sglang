@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import re
 import struct
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_FORMAT = "dsv41-hotcold/1"
 
@@ -406,10 +409,29 @@ def attach_hotcold_manifest(
         moe_intermediate_size=int(text.moe_intermediate_size),
         num_hidden_layers=int(text.num_hidden_layers),
     )
-    if os.path.isdir(model_path):
+    indexed = os.path.isdir(model_path)
+    if indexed:
         check_checkpoint_index(model_path, manifest)
     for c in configs:
         c.hotcold_manifest_path = path
+    logger.info(
+        "hot/cold manifest %s: format %s, %d layers, %d hot + %d cold of %d routed "
+        "experts a layer, cold ggml types w1 %d w3 %d w2 %d, row bytes %d / %d / %d, "
+        "index %s",
+        path,
+        MANIFEST_FORMAT,
+        len(manifest.layers),
+        manifest.num_hot,
+        manifest.num_cold,
+        manifest.n_routed_experts,
+        manifest.ggml_type["w1"],
+        manifest.ggml_type["w3"],
+        manifest.ggml_type["w2"],
+        manifest.row_bytes["w1"],
+        manifest.row_bytes["w3"],
+        manifest.row_bytes["w2"],
+        "checked" if indexed else "not checked",
+    )
     return manifest
 
 
@@ -515,11 +537,15 @@ class HotColdWeightMap:
     def check_complete(self) -> None:
         expect_hot = 6 * self.manifest.num_hot
         errors = []
+        stage, hot_total, cold_total = [], 0, 0
         for layer_id in sorted(self.manifest.layers):
             if not self._on_stage(layer_id):
                 continue
             hot = len(self.hot_seen.get(layer_id, ()))
             cold = len(self.cold_loaded.get(layer_id, ()))
+            stage.append(layer_id)
+            hot_total += hot
+            cold_total += cold
             if hot != expect_hot or cold != 3:
                 errors.append(
                     f"layer {layer_id}: {hot} hot tensors (expected {expect_hot}), "
@@ -528,3 +554,15 @@ class HotColdWeightMap:
         if errors:
             details = "\n".join(f"- {e}" for e in errors)
             raise HotColdManifestError(f"Hot/cold load incomplete:\n{details}")
+        logger.info(
+            "hot/cold load: layers %s..%s (%d), %d hot tensors (%d a layer, %d slots), "
+            "%d cold tensors (3 a layer, %d slots)",
+            stage[0] if stage else "none",
+            stage[-1] if stage else "none",
+            len(stage),
+            hot_total,
+            expect_hot,
+            self.manifest.num_hot,
+            cold_total,
+            self.manifest.num_cold,
+        )
