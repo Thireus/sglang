@@ -2104,6 +2104,38 @@ class Envs:
     SGLANG_HOTCOLD_VEC_MULTI_MIN_TOKENS = EnvInt(3)
     SGLANG_HOTCOLD_VECM_ROUTES = EnvInt(4)
     SGLANG_HOTCOLD_VECM_LANES = EnvInt(16)
+    # The decode pack of a hot/cold layer: the same output bits from fewer
+    # launches (a decode or verify batch ran 21 kernels a layer where a plain layer
+    # runs 8). Each switch is on by default and 0 gives the earlier launches
+    # exactly; "legacy" (COLD_KERNEL) keeps the earlier launches of the cold tier
+    # whatever they say.
+    # SPLIT_KERNEL: the route split (the hot and the cold id of every route, from
+    # the layer's two remap tables) in one kernel instead of an add and two
+    # index_select; integers, every batch size.
+    # DECODE_ALIGN: on the multi-route vector kernel's path that same launch also
+    # groups the cold routes per cold expert in blocks (moe_align_block_size's
+    # job, two launches), without the blocks of the routes that are not cold.
+    # Needs SPLIT_KERNEL; a layer of at most 1,024 cold experts.
+    # DECODE_SWIGLU_Q8: on the multi-route vector kernel's path the cold tier's
+    # clamped SwiGLU also writes the down projection's Q8_1 activation
+    # quantisation, and only for the rows of the cold routes (two launches over
+    # every route's row become one over the cold rows). Not with the imatrix
+    # collector, nor in a layer without a SwiGLU limit.
+    # DECODE_SUM_FOLD: on the vector kernels' paths one kernel applies the route
+    # weights, sums over top-k and adds the sum into the hot tier's output, in the
+    # rounding and order of the three launches it replaces (the weighted value
+    # rounded to the dtype, the fp32 sum through torch's four interleaved
+    # accumulators, rounded, then the dtype's add). A top-k of 5 to 16; not while
+    # the layer's stats or dump read the cold tier's own output.
+    SGLANG_HOTCOLD_SPLIT_KERNEL = EnvBool(True)
+    SGLANG_HOTCOLD_DECODE_ALIGN = EnvBool(True)
+    SGLANG_HOTCOLD_DECODE_SWIGLU_Q8 = EnvBool(True)
+    SGLANG_HOTCOLD_DECODE_SUM_FOLD = EnvBool(True)
+    # The multi-route kernel's lanes by batch size: "tokens:lanes,..." with
+    # ascending token counts; a batch takes the lanes of the first entry whose token
+    # count it does not exceed and VECM_LANES above the last. "" or "0": VECM_LANES
+    # for every batch. Same output bits at any lane count.
+    SGLANG_HOTCOLD_VECM_LANE_TABLE = EnvStr("")
     SGLANG_DSV41_HOTCOLD_IMATRIX_DIR = EnvStr("")
     # Hot/cold diagnostics: ZERO_COLD drops the cold tier's output at serve time
     # (the layer behaves like a drop of its cold experts, router weights kept);
