@@ -10,7 +10,7 @@ The routing comes from ``moe_align_block_size(ids, wide, E, pad_expert_ids=True)
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -40,7 +40,10 @@ def _jit_gguf_moe_mmq_wide_module(
         "gguf_moe_mmq_wide",
         *args,
         cuda_files=["moe/gguf_moe_mmq_wide.cuh"],
-        cuda_wrappers=[("project", f"gguf_moe_mmq_wide<{args}>")],
+        cuda_wrappers=[
+            ("project", f"gguf_moe_mmq_wide<{args}>"),
+            ("project_rows", f"gguf_moe_mmq_wide_rows<{args}>"),
+        ],
     )
 
 
@@ -58,6 +61,8 @@ def gguf_moe_mmq_wide(
     wide: int = GGUF_MOE_MMQ_WIDE_DEFAULT_BLOCK,
     skip: bool = True,
     zero_init: bool = True,
+    sorted_rows: Optional[torch.Tensor] = None,
+    out_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """Project aligned routes through packed IQ2_S experts; inactive routes stay zero.
 
@@ -70,19 +75,46 @@ def gguf_moe_mmq_wide(
     in the input dtype. The kernel
     writes the rows of the active routes only: ``zero_init=False`` skips the zero fill
     for a caller that never reads another row (those rows are then undefined).
+
+    ``sorted_rows`` (int32, aligned with ``sorted_token_ids``) with ``out_rows``
+    writes sorted column ``c`` to row ``sorted_rows[c]`` of an ``[out_rows, row]``
+    output instead of row ``sorted_token_ids[c]``: a caller that keeps the rows of
+    its active routes only. The arithmetic of a (route, row) is the same.
     """
     k = input.shape[1]
     alloc = torch.zeros if zero_init else torch.empty
-    output = alloc((tokens * top_k, row), dtype=input.dtype, device=input.device)
+    module = _jit_gguf_moe_mmq_wide_module(
+        input.dtype, int(type), int(wide), bool(skip)
+    )
+    if sorted_rows is None:
+        output = alloc((tokens * top_k, row), dtype=input.dtype, device=input.device)
+        quantized_input = torch.empty(
+            (k // 128, tokens, 36), dtype=torch.int32, device=input.device
+        )
+        module.project(
+            input,
+            weight,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            output,
+            quantized_input,
+            top_k,
+            row,
+            tokens,
+        )
+        return output
+    if out_rows is None:
+        raise ValueError("sorted_rows needs out_rows")
+    output = alloc((int(out_rows), row), dtype=input.dtype, device=input.device)
     quantized_input = torch.empty(
         (k // 128, tokens, 36), dtype=torch.int32, device=input.device
     )
-    _jit_gguf_moe_mmq_wide_module(
-        input.dtype, int(type), int(wide), bool(skip)
-    ).project(
+    module.project_rows(
         input,
         weight,
         sorted_token_ids,
+        sorted_rows,
         expert_ids,
         num_tokens_post_padded,
         output,
