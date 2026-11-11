@@ -12,6 +12,7 @@
 #include <sgl_kernel/quantization/gguf/moe_vec_multi.cuh>
 #include <sgl_kernel/quantization/gguf/quantize_q8_1.cuh>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 
@@ -21,11 +22,13 @@ namespace sglang {
 /// \param input Activations [tokens, K]; route s reads row s / top_k (top_k = 1 for the down projection).
 /// \param weight Packed IQ2_S experts [E, row, K / 256 * 82].
 /// \param sorted_token_ids Route ids grouped per expert in blocks of kRoutes; ids >= tokens * top_k pad.
-/// \param expert_ids Expert of each block; negative blocks are skipped. Its size sets the grid.
+/// \param expert_ids Expert of each block; negative blocks are skipped. Its size bounds the blocks read.
 /// \param num_tokens_post_padded int32[>=1]; blocks at or past it are skipped on the device.
-/// \param output Zero-initialised [tokens * top_k, row]; only valid routes are written.
+/// \param lanes CTAs per row group: each walks every lanes-th block (1..65535).
+/// \param output [tokens * top_k, row]; only the rows of valid routes are written (a caller that reads the
+///        others zero-fills it first).
 /// \param quantized_input Private Q8_1 scratch, int32 [tokens, padded K / 32 * 9] (the vector op's format).
-template <typename scalar_t, int kQuantType, int kRoutes, int kRows>
+template <typename scalar_t, int kQuantType, int kRoutes, int kRows, bool kPrefix>
 void gguf_moe_vec_multi(
     tvm::ffi::TensorView input,
     tvm::ffi::TensorView weight,
@@ -36,7 +39,8 @@ void gguf_moe_vec_multi(
     tvm::ffi::TensorView quantized_input,
     int64_t top_k,
     int64_t row,
-    int64_t tokens) {
+    int64_t tokens,
+    int64_t lanes) {
   using namespace host;
   static_assert(kQuantType == 22, "the multi-route vector kernel serves IQ2_S (22) only");
   static_assert(kRoutes >= 1 && kRoutes <= 16 && kRows >= 1 && kRows <= 32);
@@ -63,7 +67,8 @@ void gguf_moe_vec_multi(
   TensorMatcher({padded}).with_dtype<int32_t>().with_device(device).verify(sorted_token_ids);
   TensorMatcher({blocks}).with_dtype<int32_t>().with_device(device).verify(expert_ids);
   CHECK_HOST(blocks.unwrap() <= (padded.unwrap() + kRoutes - 1) / kRoutes);
-  CHECK_HOST(blocks.unwrap() <= 65535) << "GGUF multi-route vector blocks exceed the CUDA y-grid limit";
+  CHECK_HOST(blocks.unwrap() <= kMaxIndex);
+  CHECK_HOST(lanes >= 1 && lanes <= 65535) << "GGUF multi-route vector lanes exceed the CUDA y-grid limit";
   TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(num_tokens_post_padded);
   CHECK_HOST(num_tokens_post_padded.numel() >= 1);
   TensorMatcher({tokens * top_k, row}).with_dtype<scalar_t>().with_device(device).verify(output);
@@ -79,9 +84,10 @@ void gguf_moe_vec_multi(
       static_cast<int>(k),
       static_cast<int>(tokens),
       stream);
-  const dim3 grid(static_cast<unsigned>((row + kRows - 1) / kRows), static_cast<unsigned>(blocks.unwrap()), 1);
+  const dim3 grid(
+      static_cast<unsigned>((row + kRows - 1) / kRows), static_cast<unsigned>(std::min(lanes, blocks.unwrap())), 1);
   const dim3 block(WARP_SIZE, kRows, 1);
-  gguf::moe_vec_multi_iq2_s<scalar_t, kRoutes><<<grid, block, 0, stream>>>(
+  gguf::moe_vec_multi_iq2_s<scalar_t, kRoutes, kPrefix><<<grid, block, 0, stream>>>(
       weight.data_ptr(),
       quantized_input.data_ptr(),
       static_cast<scalar_t*>(output.data_ptr()),
@@ -93,7 +99,8 @@ void gguf_moe_vec_multi(
       static_cast<int>(padded_k / 32 * 9),
       static_cast<int>(top_k),
       static_cast<int>(tokens * top_k),
-      static_cast<int>(experts.unwrap()));
+      static_cast<int>(experts.unwrap()),
+      static_cast<int>(blocks.unwrap()));
   CHECK_CUDA(cudaGetLastError());
 }
 

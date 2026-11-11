@@ -50,14 +50,32 @@ def _mmq_types():
     return frozenset(GGUF_MOE_MMQ_TYPES)
 
 
-def select_cold_kernel(tokens: int, w13_type: int, w2_type: int) -> str:
-    """'mmq' or 'vec' for a batch of ``tokens``; the same answer for a given
-    (tokens, types), so a captured graph and its replay agree."""
+_COLD_KERNEL_MODES = ("auto", "vec", "vecm", "mmq", "legacy")
+_IQ2_S = 22
+# Routes of one expert per CTA the wide-block MMQ kernel is built for (gguf_moe_mmq_wide.py).
+_MMQ_WIDE_BLOCKS = (16, 32, 64, 128)
+
+
+def _cold_kernel_mode() -> str:
     mode = envs.SGLANG_HOTCOLD_COLD_KERNEL.get()
-    if mode not in ("auto", "vec", "mmq", "vecm"):
+    if mode not in _COLD_KERNEL_MODES:
         raise ValueError(
-            f"SGLANG_HOTCOLD_COLD_KERNEL must be auto, vec, vecm or mmq, got {mode!r}"
+            f"SGLANG_HOTCOLD_COLD_KERNEL must be auto, vec, vecm, mmq or legacy, got {mode!r}"
         )
+    return mode
+
+
+def select_cold_kernel(tokens: int, w13_type: int, w2_type: int) -> str:
+    """'mmq', 'vecm' or 'vec' for a batch of ``tokens``; the same answer for a given
+    (tokens, types), so a captured graph and its replay agree. The choice never
+    looks at the routes: a captured graph has no data-dependent branch.
+
+    auto: MMQ above SGLANG_HOTCOLD_MMQ_MIN_TOKENS tokens when it is built for the
+    types; up to that many tokens, for IQ2_S, the multi-route vector kernel from
+    SGLANG_HOTCOLD_VEC_MULTI_MIN_TOKENS tokens (SGLANG_HOTCOLD_VEC_MULTI=0 turns it
+    off), else the vector kernel. legacy: the earlier kernels (the vector
+    kernel at one row per CTA, MMQ in blocks of 16)."""
+    mode = _cold_kernel_mode()
     if mode == "vec":
         return "vec"
     if mode == "vecm":
@@ -74,17 +92,40 @@ def select_cold_kernel(tokens: int, w13_type: int, w2_type: int) -> str:
         return "mmq"
     if supported and tokens > envs.SGLANG_HOTCOLD_MMQ_MIN_TOKENS.get():
         return "mmq"
-    if envs.SGLANG_HOTCOLD_VEC_MULTI.get() and {int(w13_type), int(w2_type)} == {22}:
+    if (
+        mode == "auto"
+        and {int(w13_type), int(w2_type)} == {_IQ2_S}
+        and envs.SGLANG_HOTCOLD_VEC_MULTI.get()
+        and envs.SGLANG_HOTCOLD_VEC_MULTI_MIN_TOKENS.get()
+        <= tokens
+        <= envs.SGLANG_HOTCOLD_MMQ_MIN_TOKENS.get()
+    ):
         return "vecm"
     return "vec"
 
 
+def select_mmq_wide(tokens: int, w13_type: int, w2_type: int) -> int:
+    """Routes of one expert per CTA of the wide-block MMQ kernel for this batch
+    (SGLANG_HOTCOLD_MMQ_WIDE; IQ2_S only), or 0 for the 16-route kernel. Same bits
+    either way; one answer per (tokens, types)."""
+    if _cold_kernel_mode() == "legacy" or {int(w13_type), int(w2_type)} != {_IQ2_S}:
+        return 0
+    wide = envs.SGLANG_HOTCOLD_MMQ_WIDE.get()
+    if wide <= 0:
+        return 0
+    if wide not in _MMQ_WIDE_BLOCKS:
+        raise ValueError(
+            f"SGLANG_HOTCOLD_MMQ_WIDE must be 0 or one of {_MMQ_WIDE_BLOCKS}, got {wide}"
+        )
+    return wide
+
+
 def select_mmq_block(tokens: int, qtype: int) -> int:
-    """MMQ's BLOCK for a batch of ``tokens``: 32 from
+    """BLOCK of the 16-route MMQ kernel for a batch of ``tokens``: 32 from
     ``SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS`` tokens (0 = never), else the type's
     default; one answer per token count, so both projections of a call agree."""
     wide = envs.SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS.get()
-    if wide > 0 and tokens >= wide:
+    if wide > 0 and tokens >= wide and _cold_kernel_mode() != "legacy":
         return 32
     return _mmq_block(qtype)
 
@@ -204,10 +245,17 @@ class HotColdImatrixCollector:
 
 
 # Kernel seams: the CPU tests replace these to drive cold_moe's CUDA branch.
+def _vec_rows_per_block():
+    """ggml's one row per CTA under "legacy"; else None (the op's own default)."""
+    return 1 if envs.SGLANG_HOTCOLD_COLD_KERNEL.get() == "legacy" else None
+
+
 def _vec_project(x, weight, ids, top_k, qtype, rows, tokens):
     from sglang.kernels.ops.moe.gguf_moe_vec import gguf_moe_a8_vec
 
-    return gguf_moe_a8_vec(x, weight, ids, top_k, qtype, rows, tokens)
+    return gguf_moe_a8_vec(
+        x, weight, ids, top_k, qtype, rows, tokens, rows_per_block=_vec_rows_per_block()
+    )
 
 
 def _mmq_block(qtype):
@@ -243,6 +291,27 @@ def _mmq_project(
     )
 
 
+def _mmq_wide_project(
+    x, weight, sorted_ids, expert_ids, post_padded, qtype, rows, top_k, tokens, wide
+):
+    from sglang.kernels.ops.moe.gguf_moe_mmq_wide import gguf_moe_mmq_wide
+
+    # No zero fill of the output: see cold_moe (only the rows of the cold routes are read).
+    return gguf_moe_mmq_wide(
+        x,
+        weight,
+        sorted_ids,
+        expert_ids,
+        post_padded,
+        qtype,
+        rows,
+        top_k,
+        tokens,
+        wide,
+        zero_init=False,
+    )
+
+
 def _vecm_project(
     x, weight, sorted_ids, expert_ids, post_padded, qtype, rows, top_k, tokens, routes
 ):
@@ -259,6 +328,8 @@ def _vecm_project(
         top_k,
         tokens,
         routes,
+        lanes=envs.SGLANG_HOTCOLD_VECM_LANES.get(),
+        zero_init=False,
     )
 
 
@@ -344,14 +415,33 @@ def cold_moe(
     rows2 = w2_qweight.shape[1]
     if kernel is None:
         kernel = select_cold_kernel(tokens, w13_type, w2_type)
-    if kernel == "mmq":
-        block = select_mmq_block(tokens, w13_type)
-        if select_mmq_block(tokens, w2_type) != block:
-            raise RuntimeError("the cold w13 and w2 types need one MMQ block size")
+    if kernel in ("mmq", "vecm"):
+        # Both take the routes grouped per expert in blocks (moe_align_block_size):
+        # a CTA reads or unpacks its weight rows once for the routes of its block.
+        # The grouped kernels write the rows of the cold routes only and their
+        # outputs are not zero-filled: the rows of the other routes are undefined in
+        # h, a and y. Nothing reads them: the down projection gathers the rows of
+        # its routes (a padded column reads row 0 and its product is dropped), the
+        # collector indexes the cold routes, and _weight_and_sum writes zero for an
+        # inactive route without reading its row.
+        if kernel == "vecm":
+            # the vector kernel's arithmetic, `block` routes of one expert per CTA
+            block, project = envs.SGLANG_HOTCOLD_VECM_ROUTES.get(), _vecm_project
+        else:
+            block, project = (
+                select_mmq_wide(tokens, w13_type, w2_type),
+                _mmq_wide_project,
+            )
+            if block == 0:
+                block, project = select_mmq_block(tokens, w13_type), _mmq_project
+                if select_mmq_block(tokens, w2_type) != block:
+                    raise RuntimeError(
+                        "the cold w13 and w2 types need one MMQ block size"
+                    )
         sorted_ids, expert_ids, post_padded = _mmq_align(
             ids, block, w13_qweight.shape[0]
         )
-        h = _mmq_project(
+        h = project(
             x,
             w13_qweight,
             sorted_ids,
@@ -366,7 +456,7 @@ def cold_moe(
         a = _clamped_swiglu(h, swiglu_limit)
         if collector is not None:
             collector.accumulate(layer_id, x, a, cold_ids)
-        y = _mmq_project(
+        y = project(
             a,
             w2_qweight,
             sorted_ids,
@@ -377,40 +467,6 @@ def cold_moe(
             1,
             tokens * top_k,
             block,
-        )
-    elif kernel == "vecm":
-        # The vector kernel's arithmetic with the routes grouped per expert: a CTA
-        # unpacks its weight rows once for up to `routes` routes of that expert.
-        routes = envs.SGLANG_HOTCOLD_VECM_ROUTES.get()
-        sorted_ids, expert_ids, post_padded = _mmq_align(
-            ids, routes, w13_qweight.shape[0]
-        )
-        h = _vecm_project(
-            x,
-            w13_qweight,
-            sorted_ids,
-            expert_ids,
-            post_padded,
-            w13_type,
-            inter2,
-            top_k,
-            tokens,
-            routes,
-        )
-        a = _clamped_swiglu(h, swiglu_limit)
-        if collector is not None:
-            collector.accumulate(layer_id, x, a, cold_ids)
-        y = _vecm_project(
-            a,
-            w2_qweight,
-            sorted_ids,
-            expert_ids,
-            post_padded,
-            w2_type,
-            rows2,
-            1,
-            tokens * top_k,
-            routes,
         )
     else:
         # The vector kernel's grid holds tokens * top_k <= 65535 rows: an eager
@@ -521,7 +577,7 @@ class ColdGGUFExperts(nn.Module):
         types = sorted({self.w13_type, self.w2_type})
         for t in types:
             try:
-                _jit_gguf_moe_vec_module(torch.bfloat16, t)
+                _jit_gguf_moe_vec_module(torch.bfloat16, t, _vec_rows_per_block())
             except ValueError as e:
                 raise RuntimeError(
                     f"hot/cold layer {self.layer_id}: the GGUF vector kernel does not "
@@ -530,10 +586,11 @@ class ColdGGUFExperts(nn.Module):
                 ) from e
         # The MMQ build too, when auto or mmq can take it: a prefill above the
         # token threshold then runs a kernel compiled at load, not at its first call.
-        mode = envs.SGLANG_HOTCOLD_COLD_KERNEL.get()
-        if types == [22] and (
+        mode = _cold_kernel_mode()
+        multi = types == [_IQ2_S] and (
             mode == "vecm" or (mode == "auto" and envs.SGLANG_HOTCOLD_VEC_MULTI.get())
-        ):
+        )
+        if multi:
             from sglang.kernels.ops.moe.gguf_moe_vec_multi import (
                 GGUF_MOE_VEC_MULTI_DEFAULT_ROWS,
                 _jit_gguf_moe_vec_multi_module,
@@ -541,16 +598,25 @@ class ColdGGUFExperts(nn.Module):
 
             _jit_gguf_moe_vec_multi_module(
                 torch.bfloat16,
-                22,
+                _IQ2_S,
                 envs.SGLANG_HOTCOLD_VECM_ROUTES.get(),
                 GGUF_MOE_VEC_MULTI_DEFAULT_ROWS,
+                True,
             )
         mmq = mode not in ("vec", "vecm") and set(types) <= _mmq_types()
-        if mmq:
+        # one answer per types: the token count does not enter
+        wide = select_mmq_wide(0, self.w13_type, self.w2_type) if mmq else 0
+        if wide:
+            from sglang.kernels.ops.moe.gguf_moe_mmq_wide import (
+                _jit_gguf_moe_mmq_wide_module,
+            )
+
+            _jit_gguf_moe_mmq_wide_module(torch.bfloat16, _IQ2_S, wide, True)
+        elif mmq:
             from sglang.kernels.ops.moe.gguf_moe_mmq import _jit_gguf_moe_mmq_module
 
             blocks = {_mmq_block(t) for t in types}
-            if envs.SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS.get() > 0:
+            if envs.SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS.get() > 0 and mode != "legacy":
                 blocks.add(32)
             for t in types:
                 for block in sorted(blocks):
@@ -558,17 +624,35 @@ class ColdGGUFExperts(nn.Module):
         global _KERNELS_LOGGED
         if not _KERNELS_LOGGED:
             _KERNELS_LOGGED = True
+            if multi:
+                decode = (
+                    f"multi-route vector kernel ({envs.SGLANG_HOTCOLD_VECM_ROUTES.get()} routes a block, "
+                    f"{envs.SGLANG_HOTCOLD_VECM_LANES.get()} lanes)"
+                    + (
+                        ""
+                        if mode == "vecm"
+                        else f" from {envs.SGLANG_HOTCOLD_VEC_MULTI_MIN_TOKENS.get()} tokens"
+                    )
+                )
+            else:
+                decode = (
+                    "vector kernel at 1 row per CTA"
+                    if mode == "legacy"
+                    else "vector kernel"
+                )
+            # The line keeps its first three fields (the boot proof reads them); the rest names the builds.
             logger.info(
                 "hot/cold cold tier: kernel mode %s, vector kernel built for ggml type %s, "
-                "MMQ %s",
+                "MMQ %s; decode: %s",
                 mode,
                 "/".join(str(t) for t in types),
                 (
-                    f"built (block {_mmq_block(types[0])}) above "
+                    f"built ({f'wide block {wide}' if wide else f'block {_mmq_block(types[0])}'}) above "
                     f"{envs.SGLANG_HOTCOLD_MMQ_MIN_TOKENS.get()} tokens"
                     if mmq
                     else "off"
                 ),
+                decode,
             )
 
     def reference_weights(self):

@@ -1968,10 +1968,14 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
-    # Hot/cold checkpoints (layers/moe/hotcold.py): the cold tier's kernel, "auto"
-    # (MMQ above the token threshold when built for the cold types, else the vector
-    # kernel), "vec" or "mmq"; the threshold; and the imatrix collector's directory
-    # (eager only, empty = off).
+    # Hot/cold checkpoints (layers/moe/hotcold.py): the cold tier's kernel. "auto":
+    # up to SGLANG_HOTCOLD_MMQ_MIN_TOKENS tokens a vector kernel (for IQ2_S the
+    # multi-route one from SGLANG_HOTCOLD_VEC_MULTI_MIN_TOKENS tokens), above it MMQ
+    # when built for the cold types (for IQ2_S the wide-block kernel). "vec", "vecm",
+    # "mmq": that kernel at every size. "legacy": the earlier kernels (the
+    # vector kernel at one row per CTA, MMQ in blocks of 16), the same output bits
+    # as "auto", for an A/B. The imatrix collector's directory comes last (eager
+    # only, empty = off).
     SGLANG_HOTCOLD_COLD_KERNEL = EnvStr("auto")
     # Rows (warps) per CTA of the GGUF MoE vector kernel, 1 to 32. One row per CTA
     # (ggml's default) launches rows x routes CTAs, and a route with a negative id
@@ -1979,26 +1983,42 @@ class Envs:
     # two projections took 1.63 ms at 1 row, 0.48 ms at 8 (RTX 5090, IQ2_S). The
     # output does not depend on it (bit-identical at 1, 2, 4, 8, 16 and 32).
     SGLANG_GGUF_MOE_VEC_ROWS_PER_BLOCK = EnvInt(8)
-    # MMQ serves a batch of more than this many tokens, the vector kernel the rest.
-    # The vector kernel reads an expert's rows once per route, MMQ once per block of
-    # 16 routes of that expert. On the engine's real routes (2 to 5 routes per cold
-    # expert at 54 tokens) a 54-token layer call took 1.07 to 2.11 ms with the vector
-    # kernel and 1.00 to 1.44 ms with MMQ, and the two meet near 24 tokens; on
-    # independent routes MMQ is 8 to 21 % slower at 54 tokens (RTX 5090, layer 20).
-    # 24 is the measured alternative; it changes the bits of 25 to 64-token batches.
+    # MMQ serves a batch of more than this many tokens, the vector kernels the rest.
+    # MMQ rounds a row's sum in another order than the vector kernels (at most 2
+    # bf16 ulp per element), so moving it changes the bits of the batches in
+    # between; 64 keeps every captured decode batch (54 tokens at most) on the
+    # vector kernels, as the earlier kernels did.
     SGLANG_HOTCOLD_MMQ_MIN_TOKENS = EnvInt(64)
-    # MMQ's BLOCK (routes of one expert per CTA) is 32 from this many tokens, 16
-    # below; 0 keeps 16 everywhere (the default). Same output bits. A CTA unpacks its
-    # weight tile once whatever its fill: at 8192 tokens BLOCK 32 was 14 to 21 %
-    # faster, at 2048 tokens 13 % faster with half of the routes cold and 14 % slower
-    # with 13 % of them cold.
+    # The wide-block MMQ kernel (IQ2_S): up to this many routes of one expert per
+    # CTA (16, 32, 64 or 128) instead of 16, and only the groups of 8 columns that
+    # hold a route are multiplied; 0 = the 16-route kernel. Same output bits. A CTA
+    # unpacks its weight tile once whatever its fill: about 10 us per block of an
+    # expert for both projections, plus about 4 us per group of 8 routes (RTX 5090).
+    # Against the 16-route kernel the cold tier takes 14 to 23 % less time at a
+    # 2,048-token chunk when 8 to 19 % of the routes are cold and 27 to 31 % less at
+    # 30 to 51 % (layers 0, 20 and 39, real and synthetic routes); 5 to 31 % less
+    # at 512 tokens, 30 to 36 % less at 8,192.
+    SGLANG_HOTCOLD_MMQ_WIDE = EnvInt(64)
+    # With SGLANG_HOTCOLD_MMQ_WIDE=0: the 16-route kernel's BLOCK is 32 from this
+    # many tokens, 16 below; 0 keeps 16 everywhere. Same output bits.
     SGLANG_HOTCOLD_MMQ_WIDE_MIN_TOKENS = EnvInt(0)
-    # The multi-route vector kernel (cold kernel "vecm", IQ2_S): the vector kernel's
-    # arithmetic with the routes grouped per expert, VECM_ROUTES (2, 4 or 8) routes
-    # of one expert per CTA, bit-identical output. VEC_MULTI=1 makes "auto" choose
-    # it wherever it would choose the vector kernel.
-    SGLANG_HOTCOLD_VEC_MULTI = EnvBool(False)
+    # The multi-route vector kernel (IQ2_S): the vector kernel's arithmetic with the
+    # routes grouped per expert in blocks of VECM_ROUTES (2, 4 or 8) routes, a grid
+    # of VECM_LANES CTAs per 8 rows whatever the batch (a CTA walks every LANES-th
+    # block; the vector kernel launches a CTA per route and 8 rows, also for the
+    # routes that are not cold). Same output bits. "auto" takes it from
+    # VEC_MULTI_MIN_TOKENS tokens (VEC_MULTI=0: never): on the engine's routes
+    # (RTX 5090, layers 0, 20 and 39, CUDA graph replay of the routed experts) a
+    # 54-token call takes 0.92 to 1.75 ms against 1.09 to 1.90 ms with the vector
+    # kernel at 8 rows when 8 to 19 % of the routes are cold and 0.56 to 2.07 ms
+    # against 0.98 to 2.42 ms at 28 to 82 %; from 5 tokens up no batch was slower
+    # by more than 1 % (1 to 20 % faster at 6 tokens for a batch class, 8 to 43 %
+    # at 54); at 3 tokens it is 4 % faster in the median and at most 4 % slower;
+    # at 1 token the routing step costs it 3 to 9 %, at 2 tokens it is a wash.
+    SGLANG_HOTCOLD_VEC_MULTI = EnvBool(True)
+    SGLANG_HOTCOLD_VEC_MULTI_MIN_TOKENS = EnvInt(3)
     SGLANG_HOTCOLD_VECM_ROUTES = EnvInt(4)
+    SGLANG_HOTCOLD_VECM_LANES = EnvInt(16)
     SGLANG_DSV41_HOTCOLD_IMATRIX_DIR = EnvStr("")
     # Hot/cold diagnostics: ZERO_COLD drops the cold tier's output at serve time
     # (the layer behaves like a drop of its cold experts, router weights kept);
