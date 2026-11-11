@@ -418,6 +418,8 @@ class ToyStage(SchedulerPPMixin):
         )
         self.forward_stream_ctx = nullcontext()
         self.copy_stream_ctx = nullcontext()
+        # No unified memory: the loop's stage-capacity agreement stays off (upstream #49301).
+        self.token_to_kv_pool_allocator = None
         self.waiting: List[ToyReq] = []
         self.iterations = 0
         self.verify_log: List[tuple] = []
@@ -432,6 +434,11 @@ class ToyStage(SchedulerPPMixin):
     def init_pp_loop_state(self):
         super().init_pp_loop_state()
         self.running_mbs = [ToyBatch() for _ in range(self.pp_loop_size)]
+
+    def _apply_war_barrier(self):
+        # The PP loops order schedule-stream writes behind the launched forward's
+        # reads (upstream #49310): a device stream wait, and a toy has no streams.
+        pass
 
     def increment_scheduler_iterations(self):
         self.iterations += 1
