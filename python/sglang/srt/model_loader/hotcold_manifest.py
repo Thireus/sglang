@@ -45,6 +45,7 @@ COLD_PROJECTIONS = ("w1", "w3", "w2")
 _NATIVE_EXPERT_RE = re.compile(
     r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$"
 )
+_COLD_RAW_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts_cold\.(w[123])\.qweight$")
 # Names after DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format.
 _COLD_HF_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts_cold\.(gate_proj|up_proj|down_proj)\.qweight$"
@@ -566,3 +567,125 @@ class HotColdWeightMap:
             cold_total,
             self.manifest.num_cold,
         )
+
+    def _loaded_slice(self, params_dict: dict, name: str) -> Optional[torch.Tensor]:
+        """The parameter slice a raw checkpoint tensor was loaded into: hot
+        ``w13_*[slot]`` in FlashInfer's [up; gate] order (w3 rows, then w1),
+        ``w2_*[slot]``; cold ``w13_qweight[:, :I]`` (w1), ``[:, I:]`` (w3),
+        ``w2_qweight``. None for a tensor this map does not own."""
+        m = _NATIVE_EXPERT_RE.match(name)
+        if m is not None:
+            layer_id, expert, proj, kind = (
+                int(m.group(1)),
+                int(m.group(2)),
+                m.group(3),
+                m.group(4),
+            )
+            entry = self.manifest.layer(layer_id)
+            if entry is None or expert not in entry.hot_slot:
+                return None
+            leaf = "weight" if kind == "weight" else "weight_scale_inv"
+            prefix = "w2_" if proj == "w2" else "w13_"
+            param = params_dict.get(
+                f"model.layers.{layer_id}.mlp.experts.hot.{prefix}{leaf}"
+            )
+            if param is None:
+                return None
+            rows = param.data[entry.hot_slot[expert]]
+            if proj == "w2":
+                return rows
+            half = rows.shape[0] // 2
+            return rows[:half] if proj == "w3" else rows[half:]
+        m = _COLD_RAW_RE.match(name)
+        if m is not None:
+            layer_id, proj = int(m.group(1)), m.group(2)
+            leaf = "w2_qweight" if proj == "w2" else "w13_qweight"
+            param = params_dict.get(f"model.layers.{layer_id}.mlp.experts.cold.{leaf}")
+            if param is None:
+                return None
+            if proj == "w2":
+                return param.data
+            half = param.data.shape[1] // 2
+            return param.data[:, :half] if proj == "w1" else param.data[:, half:]
+        return None
+
+    def verify_against_shards(
+        self, params_dict: dict, model_dir: str
+    ) -> Dict[int, dict]:
+        """Re-read every hot and cold tensor of this stage's hot/cold layers from
+        the checkpoint's shards and compare its bytes with the parameter slice it
+        was loaded into (``_loaded_slice``). Run after the load and before
+        ``process_weights_after_loading``: the SM120 hot method interleaves its
+        scales in place. One log line per layer (an error line on a mismatch);
+        returns {layer: {"hot": (equal, total), "cold": (equal, total),
+        "mismatch": [names]}}. Diagnostics (SGLANG_DSV41_HOTCOLD_VERIFY_LOAD)."""
+        from safetensors import safe_open
+
+        with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f).get("weight_map") or {}
+        by_layer: Dict[int, List[Tuple[str, str]]] = {}
+        for name, shard in weight_map.items():
+            m = _NATIVE_EXPERT_RE.match(name) or _COLD_RAW_RE.match(name)
+            if m is None:
+                continue
+            layer_id = int(m.group(1))
+            if self.manifest.layer(layer_id) is None or not self._on_stage(layer_id):
+                continue
+            by_layer.setdefault(layer_id, []).append((shard, name))
+        handles = {}
+        report: Dict[int, dict] = {}
+        for layer_id in sorted(by_layer):
+            counts = {"hot": [0, 0], "cold": [0, 0]}
+            mismatch: List[str] = []
+            for shard, name in sorted(by_layer[layer_id]):
+                tier = "cold" if _COLD_RAW_RE.match(name) else "hot"
+                counts[tier][1] += 1
+                if shard not in handles:
+                    handles[shard] = safe_open(
+                        os.path.join(model_dir, shard), framework="pt", device="cpu"
+                    )
+                dest = self._loaded_slice(params_dict, name)
+                src = handles[shard].get_tensor(name)
+                if dest is not None and _same_bytes(dest, src):
+                    counts[tier][0] += 1
+                else:
+                    mismatch.append(
+                        name if dest is not None else f"{name} (no parameter)"
+                    )
+            report[layer_id] = {
+                "hot": tuple(counts["hot"]),
+                "cold": tuple(counts["cold"]),
+                "mismatch": mismatch,
+            }
+            line = (
+                f"hot/cold verify layer {layer_id}: hot {counts['hot'][0]}/{counts['hot'][1]} and cold "
+                f"{counts['cold'][0]}/{counts['cold'][1]} tensors byte-equal to the shards"
+            )
+            if mismatch:
+                logger.error(
+                    "%s; MISMATCH %d: %s", line, len(mismatch), ", ".join(mismatch[:8])
+                )
+            else:
+                logger.info("%s", line)
+        handles.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return report
+
+
+def _same_bytes(dest: torch.Tensor, src: torch.Tensor) -> bool:
+    """Whether a loaded parameter slice holds exactly the bytes of the checkpoint
+    tensor (dtype ignored: E8M0 scales and packed FP4 compare as bytes)."""
+    if (
+        tuple(dest.shape) != tuple(src.shape)
+        or dest.element_size() != src.element_size()
+    ):
+        return False
+    if dest.element_size() == 1:
+        a, b = dest.view(torch.uint8), src.view(torch.uint8)
+    else:
+        a, b = (
+            dest.contiguous().view(-1).view(torch.uint8),
+            src.contiguous().view(-1).view(torch.uint8),
+        )
+    return bool(torch.equal(a, b.to(a.device)))
