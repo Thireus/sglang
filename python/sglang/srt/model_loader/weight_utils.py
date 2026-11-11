@@ -1502,11 +1502,11 @@ def multi_thread_pt_weights_iterator(
 def get_gguf_extra_tensor_names(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> List[str]:
-    import gguf
+    from sglang.srt.model_loader.gguf_ik import open_gguf
 
-    reader = gguf.GGUFReader(gguf_file)
+    source = open_gguf(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
-    exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
+    exact_gguf_keys = set([tensor.name for tensor in source.tensor_infos()])
     extra_keys = expected_gguf_keys - exact_gguf_keys
     return [gguf_to_hf_name_map[key] for key in extra_keys]
 
@@ -1517,11 +1517,16 @@ def gguf_quant_weights_iterator(
     """
     Iterate over the quant weights in the model gguf files and convert
     them to torch tensors
+
+    ``gguf_file`` is one .gguf file or any shard of a split set
+    (``<name>-NNNNN-of-MMMMM.gguf``). Tensors of an ik_llama.cpp row-interleaved
+    type (``_R4`` / ``_R8``) are restored to their base type; a type the GGUF
+    path has no kernel for is refused before anything is loaded.
     """
 
-    import gguf
+    from sglang.srt.model_loader.gguf_ik import open_gguf, served_tensor, served_type
 
-    reader = gguf.GGUFReader(gguf_file)
+    source = open_gguf(gguf_file)
 
     # MoE expert weight name patterns
     MOE_WEIGHT_PATTERNS = {
@@ -1531,8 +1536,7 @@ def gguf_quant_weights_iterator(
     }
 
     # First pass: yield weight types
-    for tensor in reader.tensors:
-        weight_type = tensor.tensor_type
+    for tensor in source.tensors():
         tensor_name = tensor.name
 
         # Check if this is a MoE expert weight (packed format)
@@ -1550,6 +1554,7 @@ def gguf_quant_weights_iterator(
                 layer_id = int(match.group(1))
                 weight_pattern = match.group(2)
                 hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+                weight_type = served_type(tensor) if hf_weight_name else None
 
                 if hf_weight_name and weight_type.name != "F32":
                     # Yield weight type for each expert
@@ -1561,15 +1566,14 @@ def gguf_quant_weights_iterator(
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
+            weight_type = served_type(tensor)
 
             if weight_type.name != "F32":
                 weight_type_name = name.replace("weight", "qweight_type")
                 yield weight_type_name, torch.tensor(weight_type)
 
     # Second pass: yield actual weights
-    for tensor in reader.tensors:
-        weight = tensor.data
-        weight_type = tensor.tensor_type
+    for tensor in source.tensors():
         tensor_name = tensor.name
 
         # Check if this is a MoE expert weight (packed format)
@@ -1588,6 +1592,7 @@ def gguf_quant_weights_iterator(
                 hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
 
                 if hf_weight_name:
+                    weight_type, weight = served_tensor(tensor)
                     # Packed format: [num_experts, ...]
                     num_experts = weight.shape[0]
                     for expert_id in range(num_experts):
@@ -1602,6 +1607,7 @@ def gguf_quant_weights_iterator(
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
+            weight_type, weight = served_tensor(tensor)
 
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
