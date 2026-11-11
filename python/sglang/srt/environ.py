@@ -2013,13 +2013,27 @@ class Envs:
     # ms when 8 % of the routes are cold, 1.96 against 3.06 ms at 16 %, 3.19 against
     # 5.17 ms at 43 %.
     SGLANG_HOTCOLD_MMQ_STAGED = EnvInt(64)
-    # An eager MMQ call (a prefill) keeps the rows of the cold routes only: the
+    # A staged MMQ call (a prefill) keeps the rows of the cold routes only: the
     # SwiGLU, the down projection's activation quantisation, the route weights and
-    # the sum over top-k run over [cold routes, .] instead of [tokens * top_k, .]
-    # (0.05 to 0.12 ms against 0.25 to 0.30 ms for those steps at 2,048 tokens). Same
-    # output bits: the compact sum keeps the dense path's rounding and the order of
-    # torch's fp32 accumulators. The cold route count is read on the host behind the
-    # gate/up kernel; a captured call keeps the dense layout. 0 = the dense layout.
+    # the sum over top-k touch one row per cold route instead of one per route.
+    # Same output bits: the compact sum keeps the dense path's rounding and the
+    # order of torch's fp32 accumulators. The buffers keep the dense sizes and the
+    # number of cold routes stays ON THE DEVICE (one kernel maps the rows and
+    # leaves the count in a tensor, the SwiGLU and the activation quantisation
+    # read it there): the call has no host read and no shape that depends on the
+    # routes, eager or captured. The first version read the count on the host
+    # behind the gate/up kernel; in the engine that read idled the cards (a
+    # 124K-token prompt's first token went from 8.70 to 9.25 s) although the
+    # kernels' device time was lower. Wall clock of a 2,048-token call in a train
+    # of back-to-back calls, over a plain layer's (RTX 5090, layer 13, 16 and
+    # 32 % of the routes cold): +0.94 and +1.70 ms with the count on the device,
+    # +1.14 and +1.88 ms on the dense layout. A bare train on an idle host does
+    # not show the host read's cost: it appears, 0.3 to 0.9 ms a call, once about
+    # 1.5 ms of host work follows each call, as in the engine. Judge any path
+    # that reads on the host in the engine, not in a bare train.
+    # 0 = the dense layout. The wide-block kernel, the half-float switch, the
+    # imatrix collector, a top-k of 2 to 4 and a layer without a SwiGLU limit keep
+    # the dense layout whatever this says.
     SGLANG_HOTCOLD_PREFILL_COMPACT = EnvBool(True)
     # OFF by default: it changes the output bits of the calls above MMQ_MIN_TOKENS
     # (prefill; no decode batch). The staged kernel's products then run in the hot
