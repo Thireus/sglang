@@ -145,6 +145,7 @@ class HotColdFusedMoE(nn.Module):
         self._recheck_every = envs.SGLANG_DSV41_HOTCOLD_RECHECK_EVERY.get()
         self._recheck_ref = None
         self._eager_forwards = 0
+        self._stats_left = envs.SGLANG_DSV41_HOTCOLD_STATS.get()
         global _ZERO_COLD_LOGGED
         if self.zero_cold and not _ZERO_COLD_LOGGED:
             _ZERO_COLD_LOGGED = True
@@ -230,7 +231,85 @@ class HotColdFusedMoE(nn.Module):
         if self.zero_cold:
             return hot_out
         cold_out = self.cold(hidden_states, topk_weights, cold_ids)
+        if (
+            self._stats_left > 0
+            and hidden_states.shape[0] > 0
+            and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+        ):
+            self._stats_left -= 1
+            self._log_stats(
+                hidden_states,
+                topk_weights,
+                hot_ids,
+                cold_ids,
+                hot_topk,
+                hot_out,
+                cold_out,
+            )
         return hot_out.add_(cold_out)
+
+    def _log_stats(
+        self, x, topk_weights, hot_ids, cold_ids, hot_topk, hot_out, cold_out
+    ) -> None:
+        """Diagnostics (SGLANG_DSV41_HOTCOLD_STATS): one line of routing and output
+        sizes, and both tiers recomputed on a copy of the input, the cold one with
+        its other kernel when that kernel is built for its types."""
+        from sglang.srt.layers.quantization.hotcold import (
+            _mmq_types,
+            select_cold_kernel,
+        )
+
+        tokens = x.shape[0]
+        hot_route = hot_ids < self.num_hot
+        weights = topk_weights.float()
+        mass = float((weights * hot_route).sum() / weights.sum().clamp_min(1e-30))
+        all_cold = float((~hot_route).all(dim=1).float().mean())
+        xf = x.float()
+        rms = lambda t: float(t.float().pow(2).mean().sqrt())
+        kernel = select_cold_kernel(tokens, self.cold.w13_type, self.cold.w2_type)
+        other = "vec" if kernel == "mmq" else "mmq"
+        if (
+            other == "mmq"
+            and not {self.cold.w13_type, self.cold.w2_type} <= _mmq_types()
+        ):
+            other = None
+        x2 = x.clone()
+        hot2 = self.hot(x2, hot_topk)
+        hot_diff = float((hot2.float() - hot_out.float()).abs().max())
+        if other is not None and x.is_cuda:
+            cold2 = self.cold(x2, topk_weights, cold_ids, kernel=other)
+            cold_rel = float(
+                (cold2.float() - cold_out.float()).norm()
+                / cold_out.float().norm().clamp_min(1e-30)
+            )
+            other_txt = f"cold({other}) vs cold({kernel}) rel {cold_rel:.2e}"
+        else:
+            other_txt = f"cold kernel {kernel}"
+        nonfinite = (
+            int((~torch.isfinite(hot_out)).sum()),
+            int((~torch.isfinite(cold_out)).sum()),
+        )
+        logger.info(
+            "hot/cold stats layer %d: %d tokens, x %s %s rms %.3g max %.3g, weight sum/token %.4f, "
+            "hot routes %.1f %% (weight mass %.1f %%), all-cold tokens %.1f %%, out rms hot %.3g cold %.3g, "
+            "nonfinite hot/cold %d/%d; recompute on a copy: hot max|diff| %.2e, %s",
+            self.layer_id,
+            tokens,
+            str(x.dtype).replace("torch.", ""),
+            "contiguous" if x.is_contiguous() else f"strides {tuple(x.stride())}",
+            rms(xf),
+            float(xf.abs().max()),
+            float(weights.sum(dim=1).mean()),
+            100 * float(hot_route.float().mean()),
+            100 * mass,
+            100 * all_cold,
+            rms(hot_out),
+            rms(cold_out),
+            nonfinite[0],
+            nonfinite[1],
+            hot_diff,
+            other_txt,
+        )
 
 
 def hotcold_layer_enabled(
