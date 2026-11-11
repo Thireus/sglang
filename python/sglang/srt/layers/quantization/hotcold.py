@@ -23,6 +23,7 @@ reproduce the kernels' q8_1 activation rounding.
 from __future__ import annotations
 
 import atexit
+import functools
 import logging
 import os
 import signal
@@ -170,6 +171,98 @@ def select_prefill_compact(
     if _cold_kernel_mode() == "legacy" or swiglu_limit is None:
         return False
     return _compact_sum_serves(x.dtype, top_k)
+
+
+@functools.lru_cache(maxsize=16)
+def _parse_lane_table(table: str):
+    """((max tokens, lanes), ...) of SGLANG_HOTCOLD_VECM_LANE_TABLE; () when it is off."""
+    table = table.strip()
+    if table in ("", "0"):
+        return ()
+    entries = []
+    for item in table.split(","):
+        try:
+            tokens, lanes = (int(v) for v in item.split(":"))
+        except ValueError:
+            raise ValueError(
+                f"SGLANG_HOTCOLD_VECM_LANE_TABLE must read tokens:lanes,..., got {table!r}"
+            ) from None
+        if tokens < 1 or not 1 <= lanes <= 65535:
+            raise ValueError(
+                f"SGLANG_HOTCOLD_VECM_LANE_TABLE: {item!r} is not a token count and a lane count"
+            )
+        if entries and tokens <= entries[-1][0]:
+            raise ValueError(
+                f"SGLANG_HOTCOLD_VECM_LANE_TABLE: the token counts must ascend, got {table!r}"
+            )
+        entries.append((tokens, lanes))
+    return tuple(entries)
+
+
+def select_vecm_lanes(tokens: int) -> int:
+    """CTAs per group of rows of the multi-route vector kernel for a batch of
+    ``tokens`` (SGLANG_HOTCOLD_VECM_LANE_TABLE, else SGLANG_HOTCOLD_VECM_LANES); one
+    answer per token count, so both projections of a call and a captured graph
+    and its replay agree. Same bits at any lane count."""
+    lanes = envs.SGLANG_HOTCOLD_VECM_LANES.get()
+    if _cold_kernel_mode() == "legacy":
+        return lanes
+    for max_tokens, table_lanes in _parse_lane_table(
+        envs.SGLANG_HOTCOLD_VECM_LANE_TABLE.get()
+    ):
+        if tokens <= max_tokens:
+            return table_lanes
+    return lanes
+
+
+def select_decode_align(tokens: int, w13_type: int, w2_type: int, num_cold: int) -> int:
+    """The block of routes when the layer's route split also groups the cold routes
+    per cold expert for this batch (SGLANG_HOTCOLD_DECODE_ALIGN: one launch for the
+    split and the alignment the multi-route vector kernel reads), else 0: the
+    cold tier aligns its routes itself. One answer per token count. The grouping
+    gives every cold route a column of its expert's blocks, as
+    moe_align_block_size does; no output bit depends on which."""
+    if not envs.SGLANG_HOTCOLD_DECODE_ALIGN.get() or _cold_kernel_mode() == "legacy":
+        return 0
+    if select_cold_kernel(tokens, w13_type, w2_type) != "vecm":
+        return 0
+    block = envs.SGLANG_HOTCOLD_VECM_ROUTES.get()
+    return block if _split_align_serves(num_cold, block) else 0
+
+
+def select_decode_swiglu_q8(
+    h: torch.Tensor, swiglu_limit: Optional[float], collector
+) -> bool:
+    """Whether a multi-route vector call computes its clamped SwiGLU and the down
+    projection's Q8_1 activation quantisation in one launch, for the rows of the
+    cold routes only (SGLANG_HOTCOLD_DECODE_SWIGLU_Q8). Same output bits. The
+    imatrix collector reads the activations of the earlier launches, and the
+    kernel is the clamped SwiGLU's (a layer without a limit keeps two launches)."""
+    if not envs.SGLANG_HOTCOLD_DECODE_SWIGLU_Q8.get() or collector is not None:
+        return False
+    if _cold_kernel_mode() == "legacy" or swiglu_limit is None:
+        return False
+    return _swiglu_q8_serves(h.dtype, h.shape[1] // 2)
+
+
+def select_decode_sum_fold(
+    y: torch.Tensor, top_k: int, fold_into: Optional[torch.Tensor]
+) -> bool:
+    """Whether a vector-kernel call (a decode batch) applies its route weights,
+    sums over top-k and adds the sum into ``fold_into`` (the hot tier's output)
+    in one launch (SGLANG_HOTCOLD_DECODE_SUM_FOLD). Same output bits as
+    apply_gguf_moe_weights, moe_sum and add_. moe_sum has kernels of its own for
+    a top-k of 2 to 4 that the kernel does not reproduce."""
+    if fold_into is None or not envs.SGLANG_HOTCOLD_DECODE_SUM_FOLD.get():
+        return False
+    if _cold_kernel_mode() == "legacy":
+        return False
+    return (
+        fold_into.dtype == y.dtype
+        and fold_into.is_contiguous()
+        and tuple(fold_into.shape) == (y.shape[0] // top_k, y.shape[1])
+        and _compact_sum_serves(y.dtype, top_k)
+    )
 
 
 def select_mmq_block(tokens: int, qtype: int) -> int:
@@ -516,7 +609,17 @@ def _compact_weight_and_sum(y, topk_weights, rows):
 
 
 def _vecm_project(
-    x, weight, sorted_ids, expert_ids, post_padded, qtype, rows, top_k, tokens, routes
+    x,
+    weight,
+    sorted_ids,
+    expert_ids,
+    post_padded,
+    qtype,
+    rows,
+    top_k,
+    tokens,
+    routes,
+    lanes=None,
 ):
     from sglang.kernels.ops.moe.gguf_moe_vec_multi import gguf_moe_vec_multi
 
@@ -531,9 +634,71 @@ def _vecm_project(
         top_k,
         tokens,
         routes,
-        lanes=envs.SGLANG_HOTCOLD_VECM_LANES.get(),
+        lanes=envs.SGLANG_HOTCOLD_VECM_LANES.get() if lanes is None else lanes,
         zero_init=False,
     )
+
+
+def _split_align_serves(num_cold, block):
+    from sglang.kernels.ops.moe.gguf_moe_split import gguf_moe_split_align_serves
+
+    return gguf_moe_split_align_serves(num_cold, block)
+
+
+def _swiglu_q8_serves(dtype, dim):
+    from sglang.kernels.ops.moe.gguf_moe_cold_swiglu import (
+        gguf_moe_cold_swiglu_q8_serves,
+    )
+
+    return gguf_moe_cold_swiglu_q8_serves(dtype, dim)
+
+
+def _swiglu_q8(h, ids, limit):
+    """(a, quantized): the clamped SwiGLU of the rows of the cold routes and the Q8_1
+    blocks the down projection reads, one launch."""
+    from sglang.kernels.ops.moe.gguf_moe_cold_swiglu import gguf_moe_cold_swiglu_q8
+
+    return gguf_moe_cold_swiglu_q8(h, ids.view(-1), limit)
+
+
+def _vecm_project_q8(
+    a,
+    quantized,
+    weight,
+    sorted_ids,
+    expert_ids,
+    post_padded,
+    qtype,
+    rows,
+    tokens,
+    routes,
+    lanes=None,
+):
+    """The down projection of a decode call whose activations come quantised: one launch."""
+    from sglang.kernels.ops.moe.gguf_moe_vec_multi import gguf_moe_vec_multi
+
+    return gguf_moe_vec_multi(
+        a,
+        weight,
+        sorted_ids,
+        expert_ids,
+        post_padded,
+        qtype,
+        rows,
+        1,
+        tokens,
+        routes,
+        lanes=envs.SGLANG_HOTCOLD_VECM_LANES.get() if lanes is None else lanes,
+        zero_init=False,
+        quantized_input=quantized,
+    )
+
+
+def _dense_sum_fold(y, topk_weights, ids, fold_into):
+    """fold_into += sum over top-k of weight * y, the rows of the cold routes only: one launch."""
+    from sglang.kernels.ops.moe.gguf_moe_cold_sum import gguf_moe_cold_sum
+
+    return gguf_moe_cold_sum(y, ids, topk_weights, dense=True, out=fold_into)
 
 
 def _clamped_swiglu(h, limit):
@@ -586,12 +751,24 @@ def cold_moe(
     collector: Optional[HotColdImatrixCollector] = None,
     use_kernels: Optional[bool] = None,
     kernel: Optional[str] = None,
+    fold_into: Optional[torch.Tensor] = None,
+    aligned: Optional[tuple] = None,
 ) -> torch.Tensor:
-    """Sum over the cold routes of ``topk_weights * expert(x)``; [tokens, hidden]."""
+    """Sum over the cold routes of ``topk_weights * expert(x)``; [tokens, hidden].
+
+    ``fold_into`` [tokens, hidden] (the hot tier's output): the sum is added to it
+    in place and it is returned, by ``add_`` or, on a decode batch, by the kernel
+    that makes the sum (``select_decode_sum_fold``); the same bits either way.
+    ``aligned`` (block, sorted_ids, expert_ids, num_post_padded): the cold routes
+    already grouped per expert by the layer's route split (``select_decode_align``);
+    the multi-route vector kernel takes it when the block is its own, and nothing
+    else reads it."""
     tokens, hidden = x.shape
     top_k = cold_ids.shape[1]
     inter2 = w13_qweight.shape[1]
     if tokens == 0:
+        if fold_into is not None:
+            return fold_into
         return x.new_zeros((0, w2_qweight.shape[1]))
     if use_kernels is None:
         use_kernels = x.is_cuda
@@ -607,7 +784,8 @@ def cold_moe(
         valid = (cold_ids >= 0).reshape(-1, 1)
         weights = topk_weights.reshape(-1, 1).float().masked_fill(~valid, 0.0)
         y = (y.float() * weights).to(x.dtype).masked_fill(~valid, 0)
-        return y.view(tokens, top_k, -1).float().sum(dim=1).to(x.dtype)
+        out = y.view(tokens, top_k, -1).float().sum(dim=1).to(x.dtype)
+        return out if fold_into is None else fold_into.add_(out)
 
     ids = (
         cold_ids
@@ -627,9 +805,15 @@ def cold_moe(
         # its routes (a padded column reads row 0 and its product is dropped), the
         # collector indexes the cold routes, and _weight_and_sum writes zero for an
         # inactive route without reading its row.
+        lanes = None
         if kernel == "vecm":
             # the vector kernel's arithmetic, `block` routes of one expert per CTA
             block, project = envs.SGLANG_HOTCOLD_VECM_ROUTES.get(), _vecm_project
+            lanes = select_vecm_lanes(tokens)
+            if lanes == envs.SGLANG_HOTCOLD_VECM_LANES.get():
+                lanes = None  # the op's own reading of the switch, as before the table
+            else:
+                project = functools.partial(_vecm_project, lanes=lanes)
         else:
             compact = False
             block, project = (
@@ -701,10 +885,15 @@ def cold_moe(
                     count,
                 )
                 # every output row is written: a token without a cold route gets +0
-                return _compact_weight_and_sum(y, topk_weights, rows)
-        sorted_ids, expert_ids, post_padded = _mmq_align(
-            ids, block, w13_qweight.shape[0]
-        )
+                out = _compact_weight_and_sum(y, topk_weights, rows)
+                return out if fold_into is None else fold_into.add_(out)
+        if kernel == "vecm" and aligned is not None and aligned[0] == block:
+            # decode pack: the route split grouped the cold routes in its own launch
+            _, sorted_ids, expert_ids, post_padded = aligned
+        else:
+            sorted_ids, expert_ids, post_padded = _mmq_align(
+                ids, block, w13_qweight.shape[0]
+            )
         h = project(
             x,
             w13_qweight,
@@ -717,21 +906,41 @@ def cold_moe(
             tokens,
             block,
         )
-        a = _clamped_swiglu(h, swiglu_limit)
-        if collector is not None:
-            collector.accumulate(layer_id, x, a, cold_ids)
-        y = project(
-            a,
-            w2_qweight,
-            sorted_ids,
-            expert_ids,
-            post_padded,
-            w2_type,
-            rows2,
-            1,
-            tokens * top_k,
-            block,
-        )
+        if kernel == "vecm" and select_decode_swiglu_q8(h, swiglu_limit, collector):
+            # Decode pack: the SwiGLU and the down projection's activation quantisation
+            # in one launch, over the rows of the cold routes only (the two launches
+            # below walk every route's row); the projection then takes the quantised
+            # rows as they are. Same bits per cold route.
+            a, quantized = _swiglu_q8(h, ids, swiglu_limit)
+            y = _vecm_project_q8(
+                a,
+                quantized,
+                w2_qweight,
+                sorted_ids,
+                expert_ids,
+                post_padded,
+                w2_type,
+                rows2,
+                tokens * top_k,
+                block,
+                lanes,
+            )
+        else:
+            a = _clamped_swiglu(h, swiglu_limit)
+            if collector is not None:
+                collector.accumulate(layer_id, x, a, cold_ids)
+            y = project(
+                a,
+                w2_qweight,
+                sorted_ids,
+                expert_ids,
+                post_padded,
+                w2_type,
+                rows2,
+                1,
+                tokens * top_k,
+                block,
+            )
     else:
         # The vector kernel's grid holds tokens * top_k <= 65535 rows: an eager
         # prefill above that runs in chunks (no captured batch comes near it).
@@ -755,7 +964,13 @@ def cold_moe(
                 )
             )
         y = parts[0] if len(parts) == 1 else torch.cat(parts)
-    return _weight_and_sum(y, topk_weights, ids, tokens, top_k)
+    if kernel in ("vec", "vecm") and select_decode_sum_fold(y, top_k, fold_into):
+        # Decode pack: route weights, the sum over top-k and the add into the hot
+        # tier's output in one launch that reads the rows of the cold routes only,
+        # in the rounding and order of the three launches below.
+        return _dense_sum_fold(y, topk_weights, ids, fold_into)
+    out = _weight_and_sum(y, topk_weights, ids, tokens, top_k)
+    return out if fold_into is None else fold_into.add_(out)
 
 
 class ColdGGUFExperts(nn.Module):
@@ -867,6 +1082,45 @@ class ColdGGUFExperts(nn.Module):
                 GGUF_MOE_VEC_MULTI_DEFAULT_ROWS,
                 True,
             )
+        # The decode pack's kernels (cold_moe, HotColdFusedMoE.split_routes), built here
+        # too: the first decode batch compiles nothing.
+        pack = []
+        if envs.SGLANG_HOTCOLD_SPLIT_KERNEL.get():
+            from sglang.kernels.ops.moe.gguf_moe_split import (
+                _jit_gguf_moe_split_module,
+            )
+
+            _jit_gguf_moe_split_module()
+            pack.append("route split")
+            if (
+                multi
+                and mode != "legacy"
+                and envs.SGLANG_HOTCOLD_DECODE_ALIGN.get()
+                and _split_align_serves(
+                    self.num_cold, envs.SGLANG_HOTCOLD_VECM_ROUTES.get()
+                )
+            ):
+                pack.append("cold routes grouped in the split")
+        if (
+            multi
+            and mode != "legacy"
+            and self.swiglu_limit is not None
+            and envs.SGLANG_HOTCOLD_DECODE_SWIGLU_Q8.get()
+        ):
+            from sglang.kernels.ops.moe.gguf_moe_cold_swiglu import (
+                _jit_gguf_moe_cold_swiglu_q8_module,
+            )
+
+            _jit_gguf_moe_cold_swiglu_q8_module(torch.bfloat16)
+            pack.append("SwiGLU with Q8_1")
+        if mode != "legacy" and envs.SGLANG_HOTCOLD_DECODE_SUM_FOLD.get():
+            from sglang.kernels.ops.moe.gguf_moe_cold_sum import (
+                _jit_gguf_moe_cold_sum_module,
+            )
+
+            # built for DeepSeek-V4's top-k of six, as the compact sum below
+            _jit_gguf_moe_cold_sum_module(torch.bfloat16, 6, True, True)
+            pack.append("sum folded into the hot output")
         mmq = mode not in ("vec", "vecm") and set(types) <= _mmq_types()
         # one answer per types: the token count does not enter
         staged = select_mmq_staged(0, self.w13_type, self.w2_type) if mmq else 0
@@ -944,6 +1198,10 @@ class ColdGGUFExperts(nn.Module):
                     if mode == "legacy"
                     else "vector kernel"
                 )
+            lane_table = envs.SGLANG_HOTCOLD_VECM_LANE_TABLE.get().strip()
+            if multi and mode != "legacy" and _parse_lane_table(lane_table):
+                decode += f", lanes by tokens {lane_table}"
+            decode += "; decode pack: " + (", ".join(pack) if pack else "off")
             if staged:
                 build = f"staged block {staged}"
             elif wide:
@@ -990,6 +1248,8 @@ class ColdGGUFExperts(nn.Module):
         topk_weights: torch.Tensor,
         cold_ids: torch.Tensor,
         kernel: Optional[str] = None,
+        fold_into: Optional[torch.Tensor] = None,
+        aligned: Optional[tuple] = None,
     ) -> torch.Tensor:
         collector = HotColdImatrixCollector.get()
         if collector is not None:
@@ -1013,4 +1273,11 @@ class ColdGGUFExperts(nn.Module):
             reference_weights=None if x.is_cuda else self.reference_weights(),
             collector=collector,
             kernel=kernel,
+            fold_into=fold_into,
+            aligned=aligned,
         )
+
+    def decode_align_block(self, tokens: int) -> int:
+        """The block of routes when the layer's route split should also group this
+        batch's cold routes for the multi-route vector kernel, else 0."""
+        return select_decode_align(tokens, self.w13_type, self.w2_type, self.num_cold)

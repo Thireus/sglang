@@ -9,6 +9,17 @@
 // with fp32 accumulators that start at +0: the four interleaved accumulators and the order of
 // their combination are those of torch's CUDA reduction for a short reduced axis, so the bits
 // match the dense path (an inactive slot adds +0 there, which changes nothing here either).
+//
+// Two more layouts for a DECODE batch, whose y keeps the dense layout (one row per route, the
+// rows of the inactive routes undefined):
+//   kDense  rows[token, slot] is only the route's activity (>= 0 active, e.g. the cold ids): the
+//           route's row is token * top_k + slot;
+//   kFold   out already holds the other tier's output and the sum is added to it in place, as
+//           torch's add_ does after the dense path: out = round_to_dtype(float(out) + float(sum)),
+//           with sum rounded to the dtype first (the tensor add_ reads). A token with no active
+//           route still adds +0 (a -0 in out becomes +0, as add_ makes it).
+// Three launches (route weights, moe_sum, add_) become one; the rounding points and the order
+// of the additions are the same.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
@@ -31,7 +42,7 @@ constexpr int kColdSumMaxTopK = 16;
 // and shared, and a thread then makes one load per ACTIVE route. kTopK is a template argument: the
 // slot loop unrolls and the four accumulators stay in registers (indexed by a run-time slot they
 // would live in local memory).
-template <typename scalar_t, int kVec, int kTopK>
+template <typename scalar_t, int kVec, int kTopK, bool kDense, bool kFold>
 __global__ void gguf_moe_cold_sum_kernel(
     const scalar_t* __restrict__ y,
     const int32_t* __restrict__ rows,
@@ -69,8 +80,9 @@ __global__ void gguf_moe_cold_sum_kernel(
         continue;  // the dense path adds +0 here: no change to an accumulator that starts at +0
       }
       const float w = s_weights[slot];
+      const int64_t row = kDense ? token * top_k + slot : static_cast<int64_t>(r);
       vec_t x;
-      x.load(y + static_cast<int64_t>(r) * hidden, v);
+      x.load(y + row * hidden, v);
 #pragma unroll
       for (int i = 0; i < kVec; ++i) {
         // the weighted value is rounded to the output dtype before it is summed, as the dense path stores it
@@ -84,16 +96,28 @@ __global__ void gguf_moe_cold_sum_kernel(
     for (int i = 0; i < kVec; ++i) {
       o[i] = cast<scalar_t>(((acc[0][i] + acc[1][i]) + acc[2][i]) + acc[3][i]);
     }
+    if constexpr (kFold) {
+      vec_t other;
+      other.load(out + token * hidden, v);
+#pragma unroll
+      for (int i = 0; i < kVec; ++i) {
+        // torch's add_ on the two rounded tensors: one fp32 addition, rounded to the dtype
+        o[i] = cast<scalar_t>(cast<fp32_t>(other[i]) + cast<fp32_t>(o[i]));
+      }
+    }
     o.store(out + token * hidden, v);
   }
 }
 
 /// \brief out[token] = sum over the token's active routes of weight * y[row], in the dense path's rounding and order.
-/// \param y Compact expert outputs [active, hidden] (rows past the active ones may exist and are not read).
-/// \param rows int32 [tokens, top_k]: the row of each route in y, negative for an inactive route.
+/// \param y Compact expert outputs [active, hidden] (rows past the active ones may exist and are not read); with
+///        kDense one row per route, [tokens * top_k, hidden] (the rows of the inactive routes are not read).
+/// \param rows int32 [tokens, top_k]: the row of each route in y, negative for an inactive route (with kDense only
+///        the sign is used).
 /// \param weights fp32 [tokens, top_k], contiguous.
-/// \param out [tokens, hidden]; every row is written (zeros for a token with no active route).
-template <typename scalar_t, int kTopK>
+/// \param out [tokens, hidden]; every row is written (zeros for a token with no active route). With kFold it holds
+///        the other tier's output on entry and that output plus the sum on return.
+template <typename scalar_t, int kTopK, bool kDense, bool kFold>
 void gguf_moe_cold_sum(
     tvm::ffi::TensorView y, tvm::ffi::TensorView rows, tvm::ffi::TensorView weights, tvm::ffi::TensorView out) {
   using namespace host;
@@ -110,6 +134,9 @@ void gguf_moe_cold_sum(
   const int64_t h = hidden.unwrap();
   CHECK_HOST(h > 0 && h % 8 == 0 && h <= std::numeric_limits<int32_t>::max());
   CHECK_HOST(tokens.unwrap() <= std::numeric_limits<int32_t>::max());
+  if constexpr (kDense) {
+    CHECK_HOST(active.unwrap() == tokens.unwrap() * kTopK) << "a dense y holds one row per route";
+  }
   if (tokens.unwrap() == 0) return;
 
   const auto stream = LaunchKernel::resolve_device(device.unwrap());
@@ -126,13 +153,13 @@ void gguf_moe_cold_sum(
   const auto out_ptr = static_cast<scalar_t*>(out.data_ptr());
   if constexpr (kWide == 16) {
     if (wide) {
-      gguf_moe_cold_sum_kernel<scalar_t, 16, kTopK>
+      gguf_moe_cold_sum_kernel<scalar_t, 16, kTopK, kDense, kFold>
           <<<grid, threads, 0, stream>>>(y_ptr, rows_ptr, weights_ptr, out_ptr, static_cast<int>(h));
       CHECK_CUDA(cudaGetLastError());
       return;
     }
   }
-  gguf_moe_cold_sum_kernel<scalar_t, 8, kTopK>
+  gguf_moe_cold_sum_kernel<scalar_t, 8, kTopK, kDense, kFold>
       <<<grid, threads, 0, stream>>>(y_ptr, rows_ptr, weights_ptr, out_ptr, static_cast<int>(h));
   CHECK_CUDA(cudaGetLastError());
 }

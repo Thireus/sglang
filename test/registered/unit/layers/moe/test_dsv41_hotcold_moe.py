@@ -5,7 +5,9 @@ sglang/test/hotcold_fixture.py (hot tier: the real FusedMoE + Fp8Config ->
 Mxfp4FlashinferCutlassMoEMethod parameters; cold tier: ColdGGUFExperts), loaded
 through HotColdWeightMap.take. What runs on CPU:
 
-* the route split (remap tables, sentinels), the sum of the two tiers, the clamp,
+* the route split (remap tables, sentinels; the one-launch kernel's seam and its
+  switch), the sum of the two tiers (the cold tier adding into the hot tier's
+  output, or returning its own while a dump or the stats read it), the clamp,
   the router weights, padded routes, the delegation and post-load contract, the
   imatrix collector, and cold_moe's kernel switch and chunking with the kernels
   replaced by float stand-ins;
@@ -140,6 +142,189 @@ class TestTwoTierForward(_Base):
         torch.testing.assert_close(
             self.run_layer(x, ids, w, packed=True), self.run_layer(x, ids, w)
         )
+
+    def test_split_kernel_seam_gives_the_gathers(self):
+        from sglang.srt.layers.moe import hotcold as hc_moe
+
+        ids = torch.tensor([[0, 1, -1], [7, 6, 5], [-1, -1, -1]], dtype=torch.int32)
+        want_hot, want_cold = self.experts.split_routes(ids)  # on CPU: the gathers
+        calls = []
+
+        def kernel(topk_ids, remap_hot, remap_cold):
+            calls.append(tuple(topk_ids.shape))
+            self.assertIs(remap_hot, self.experts.remap_hot)
+            self.assertIs(remap_cold, self.experts.remap_cold)
+            index = (topk_ids + 1).reshape(-1).long()
+            return (
+                remap_hot[index].view(topk_ids.shape),
+                remap_cold[index].view(topk_ids.shape),
+            )
+
+        with patch.object(hc_moe, "_split_kernel", kernel):
+            self.experts.split_routes(ids)
+            self.assertEqual(calls, [])  # not the kernel's ids (CPU): the gathers
+            with patch.object(
+                hc_moe, "_split_kernel_serves", lambda t: t.dtype == torch.int32
+            ):
+                hot, cold = self.experts.split_routes(ids)
+                self.assertEqual(calls, [(3, 3)])  # one launch for both tiers
+                self.assertTrue(torch.equal(hot, want_hot))
+                self.assertTrue(torch.equal(cold, want_cold))
+                self.assertEqual((hot.dtype, cold.dtype), (torch.int32, torch.int32))
+                self.experts.split_routes(ids.long())
+                self.assertEqual(len(calls), 1)  # int64 ids keep the gathers
+                with patch.dict(os.environ, {"SGLANG_HOTCOLD_SPLIT_KERNEL": "0"}):
+                    hot, cold = self.experts.split_routes(ids)
+                self.assertEqual(len(calls), 1)  # the switch at 0: the earlier launches
+                self.assertTrue(torch.equal(hot, want_hot))
+                self.assertTrue(torch.equal(cold, want_cold))
+
+    def test_the_cold_tier_adds_into_the_hot_output(self):
+        from sglang.srt.layers.moe import hotcold as hc_moe
+
+        x = torch.randn(6, 256, generator=self.gen)
+        ids, w = self.routes(list(range(8)), tokens=6)
+        seen = []
+        real = self.experts.cold.forward
+
+        def spy(x_, weights_, cold_ids, kernel=None, fold_into=None, aligned=None):
+            seen.append(fold_into)
+            self.assertIsNone(
+                aligned
+            )  # CPU ids: the cold tier groups its routes itself
+            return real(x_, weights_, cold_ids, kernel=kernel, fold_into=fold_into)
+
+        self.experts.cold.forward = spy
+        out = self.run_layer(x, ids, w)
+        # nothing reads the cold tier's own output: it gets the hot tier's and sums in place
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0], out)
+        ref, _ = fx.dense_moe_reference(self.ckpt, 0, x, ids, w, LIMIT)
+        torch.testing.assert_close(
+            out.double(), ref, rtol=0, atol=1e-5 * ref.abs().max().item()
+        )
+        # a dump reads both tiers before they are summed: the cold tier returns its own output
+        got = {}
+        hc_moe.set_dump_sink(
+            lambda layer_id, **t: got.update({k: v.clone() for k, v in t.items()})
+        )
+        self.addCleanup(hc_moe.set_dump_sink, None)
+        dumped = self.run_layer(x, ids, w)
+        self.assertIsNone(seen[1])
+        self.assertTrue(torch.equal(dumped, out))
+        self.assertTrue(torch.equal(got["hot_out"] + got["cold_out"], out))
+        hc_moe.set_dump_sink(None)
+        # the stats recompute both tiers: the same
+        self.experts._stats_left = 1
+        self.addCleanup(hc_moe.set_real_forward, False)
+        hc_moe.set_real_forward(True)
+        with self.assertLogs("sglang.srt.layers.moe.hotcold", level="INFO"):
+            logged = self.run_layer(x, ids, w)
+        self.assertIsNone(seen[2])
+        self.assertTrue(torch.equal(logged, out))
+        after = self.run_layer(
+            x, ids, w
+        )  # the stats budget is spent: back to the in-place sum
+        self.assertIs(seen[-1], after)
+
+    def test_decode_batch_groups_the_cold_routes_in_the_split(self):
+        from sglang.srt.layers.moe import hotcold as hc_moe
+
+        tables = (self.experts.remap_hot, self.experts.remap_cold)
+        marks = tuple(torch.zeros(1, dtype=torch.int32) for _ in range(3))
+        calls, seen = [], []
+
+        def gathers(topk_ids):
+            index = (topk_ids + 1).reshape(-1).long()
+            return tuple(t[index].view(topk_ids.shape) for t in tables)
+
+        def split(topk_ids, remap_hot, remap_cold):
+            calls.append(("split", topk_ids.shape[0]))
+            return gathers(topk_ids)
+
+        def split_align(topk_ids, remap_hot, remap_cold, num_cold, block):
+            calls.append(("split align", topk_ids.shape[0], num_cold, block))
+            self.assertIs(remap_hot, tables[0])
+            self.assertIs(remap_cold, tables[1])
+            return gathers(topk_ids) + marks
+
+        real = self.experts.cold.forward
+
+        def spy(x_, weights_, cold_ids, kernel=None, fold_into=None, aligned=None):
+            seen.append(aligned)
+            return real(x_, weights_, cold_ids, kernel=kernel, fold_into=fold_into)
+
+        self.experts.cold.forward = spy
+        x = torch.randn(7, 256, generator=self.gen)
+        ids, w = self.routes(list(range(8)), tokens=7)
+        want = self.run_layer(
+            x, ids, w
+        )  # CPU ids: the gathers, the cold tier's own alignment
+        self.assertEqual((calls, seen), ([], [None]))
+        builds = frozenset({22, 144, 145})
+        with (
+            patch.object(hc_moe, "_split_kernel_serves", lambda t: True),
+            patch.object(hc_moe, "_split_kernel", split),
+            patch.object(hc_moe, "_split_align_kernel", split_align),
+            patch.object(hc, "_mmq_types", lambda: builds),
+            patch.object(hc, "_split_align_serves", lambda num_cold, block: True),
+        ):
+            # 7 tokens: the multi-route kernel's batch; one launch splits and groups in its blocks of 4
+            got = self.run_layer(x, ids, w)
+            self.assertEqual(calls, [("split align", 7, 4, 4)])
+            self.assertEqual(seen[-1][0], 4)
+            for handed, mark in zip(seen[-1][1:], marks):
+                self.assertIs(handed, mark)
+            self.assertTrue(torch.equal(got, want))
+            calls.clear()
+            self.run_layer(
+                x[:2], ids[:2], w[:2]
+            )  # 2 tokens: the vector kernel groups nothing
+            self.assertEqual((calls, seen[-1]), ([("split", 2)], None))
+            calls.clear()
+            many = torch.randn(70, 256, generator=self.gen)
+            mids, mw = self.routes(list(range(8)), tokens=70)
+            self.run_layer(
+                many, mids, mw
+            )  # a prefill: its kernel has an alignment of its own
+            self.assertEqual((calls, seen[-1]), ([("split", 70)], None))
+            for off in (
+                {"SGLANG_HOTCOLD_DECODE_ALIGN": "0"},
+                {"SGLANG_HOTCOLD_COLD_KERNEL": "legacy"},
+                {"SGLANG_HOTCOLD_VEC_MULTI": "0"},
+            ):
+                calls.clear()
+                with patch.dict(os.environ, off):
+                    self.run_layer(x, ids, w)
+                self.assertEqual((calls, seen[-1]), ([("split", 7)], None), off)
+            calls.clear()
+            with patch.dict(os.environ, {"SGLANG_HOTCOLD_SPLIT_KERNEL": "0"}):
+                self.run_layer(
+                    x, ids, w
+                )  # no split kernel: the gathers, nothing grouped
+            self.assertEqual((calls, seen[-1]), ([], None))
+            with patch.object(hc, "_split_align_serves", lambda num_cold, block: False):
+                calls.clear()
+                self.run_layer(
+                    x, ids, w
+                )  # more cold experts than the kernel's scan holds
+                self.assertEqual((calls, seen[-1]), ([("split", 7)], None))
+
+    def test_cold_moe_adds_into_the_tensor_it_is_given(self):
+        x = torch.randn(5, 256, generator=self.gen)
+        ids, w = self.routes(list(range(8)), tokens=5)
+        _, cold_ids = self.experts.split_routes(ids)
+        cold = self.experts.cold
+        own = cold(x, w, cold_ids)
+        hot = torch.randn(5, 256, generator=self.gen)
+        target = hot.clone()
+        got = cold(x, w, cold_ids, fold_into=target)
+        self.assertIs(got, target)
+        self.assertTrue(torch.equal(got, hot + own))
+        empty = torch.zeros(0, 256)
+        self.assertIs(
+            cold(x[:0], w[:0], cold_ids[:0], fold_into=empty), empty
+        )  # no token: nothing to add
 
 
 class TestModuleContract(_Base):

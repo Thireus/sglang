@@ -28,6 +28,8 @@ namespace sglang {
 /// \param output [tokens * top_k, row]; only the rows of valid routes are written (a caller that reads the
 ///        others zero-fills it first).
 /// \param quantized_input Private Q8_1 scratch, int32 [tokens, padded K / 32 * 9] (the vector op's format).
+/// \param prequantized Non-zero: quantized_input already holds the Q8_1 blocks of every row a route reads
+///        (gguf_moe_cold_swiglu_q8 wrote them); the quantisation launch is skipped and input is not read.
 template <typename scalar_t, int kQuantType, int kRoutes, int kRows, bool kPrefix>
 void gguf_moe_vec_multi(
     tvm::ffi::TensorView input,
@@ -40,7 +42,8 @@ void gguf_moe_vec_multi(
     int64_t top_k,
     int64_t row,
     int64_t tokens,
-    int64_t lanes) {
+    int64_t lanes,
+    int64_t prequantized) {
   using namespace host;
   static_assert(kQuantType == 22, "the multi-route vector kernel serves IQ2_S (22) only");
   static_assert(kRoutes >= 1 && kRoutes <= 16 && kRows >= 1 && kRows <= 32);
@@ -78,12 +81,14 @@ void gguf_moe_vec_multi(
   if (tokens == 0 || blocks.unwrap() == 0) return;
 
   const auto stream = LaunchKernel::resolve_device(device.unwrap());
-  quantize_row_q8_1_cuda<scalar_t>(
-      static_cast<const scalar_t*>(input.data_ptr()),
-      quantized_input.data_ptr(),
-      static_cast<int>(k),
-      static_cast<int>(tokens),
-      stream);
+  if (prequantized == 0) {
+    quantize_row_q8_1_cuda<scalar_t>(
+        static_cast<const scalar_t*>(input.data_ptr()),
+        quantized_input.data_ptr(),
+        static_cast<int>(k),
+        static_cast<int>(tokens),
+        stream);
+  }
   const dim3 grid(
       static_cast<unsigned>((row + kRows - 1) / kRows), static_cast<unsigned>(std::min(lanes, blocks.unwrap())), 1);
   const dim3 block(WARP_SIZE, kRows, 1);

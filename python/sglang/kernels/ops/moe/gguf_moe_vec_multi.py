@@ -9,7 +9,7 @@ block of ``routes`` routes instead of once per route.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -71,6 +71,7 @@ def gguf_moe_vec_multi(
     lanes: int = GGUF_MOE_VEC_MULTI_DEFAULT_LANES,
     zero_init: bool = True,
     prefix: bool = True,
+    quantized_input: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Project aligned routes through packed IQ2_S experts; inactive routes stay zero.
 
@@ -84,13 +85,19 @@ def gguf_moe_vec_multi(
     Returns [tokens * top_k, row] in the input dtype. The
     kernel writes the rows of the active routes only: ``zero_init=False`` skips the zero
     fill for a caller that never reads another row (those rows are then undefined).
+    ``quantized_input`` int32 [tokens, padded K / 32 * 9]: the Q8_1 blocks of ``input``
+    when the caller already has them for every row a route reads
+    (``gguf_moe_cold_swiglu_q8``); the op then makes one launch instead of two and
+    takes only the shape and dtype of ``input``.
     """
     alloc = torch.zeros if zero_init else torch.empty
     output = alloc((tokens * top_k, row), dtype=input.dtype, device=input.device)
     padded = (input.shape[1] + 511) // 512 * 512
-    quantized_input = torch.empty(
-        (tokens, padded // 32 * 9), dtype=torch.int32, device=input.device
-    )
+    prequantized = quantized_input is not None
+    if not prequantized:
+        quantized_input = torch.empty(
+            (tokens, padded // 32 * 9), dtype=torch.int32, device=input.device
+        )
     _jit_gguf_moe_vec_multi_module(
         input.dtype, int(type), int(routes), int(rows_per_block), bool(prefix)
     ).project(
@@ -105,5 +112,6 @@ def gguf_moe_vec_multi(
         row,
         tokens,
         int(lanes),
+        int(prequantized),
     )
     return output

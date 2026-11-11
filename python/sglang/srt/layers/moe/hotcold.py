@@ -12,6 +12,14 @@ own entry:
 * ``cold_ids = remap_cold[ids + 1]``: the cold slot, or -1 for a hot or padded
   route; the GGUF kernels write 0 for a negative id without reading weights.
 
+On CUDA both gathers are one kernel (``SGLANG_HOTCOLD_SPLIT_KERNEL``); on a decode
+batch that kernel also groups the cold routes per cold expert for the cold tier's
+multi-route kernel (``SGLANG_HOTCOLD_DECODE_ALIGN``). When nothing reads the cold
+tier's own output the cold tier adds its sum into the hot tier's output itself:
+on a decode batch the kernel that applies the route weights and sums over top-k
+does it (``SGLANG_HOTCOLD_DECODE_SUM_FOLD``), else ``add_``. The same output bits
+either way.
+
 Both tiers take the full [T, top_k] tensor with sentinels, so neither is padded
 or counted per tier, both sit in the same CUDA graph, and the output is
 ``hot(x) + cold(x)`` with the router weights (the routed scaling factor fused in
@@ -60,6 +68,28 @@ def set_dump_sink(sink) -> None:
     """``sink(layer_id, **tensors)`` copies what it keeps; None to stop."""
     global _DUMP_SINK
     _DUMP_SINK = sink
+
+
+# Kernel seams: the CPU tests replace them to drive split_routes' CUDA branch.
+def _split_kernel_serves(topk_ids) -> bool:
+    """Whether the one-launch route split takes these ids (the engine's: contiguous int32 on CUDA)."""
+    return (
+        topk_ids.is_cuda and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
+    )
+
+
+def _split_kernel(topk_ids, remap_hot, remap_cold):
+    from sglang.kernels.ops.moe.gguf_moe_split import gguf_moe_split
+
+    return gguf_moe_split(topk_ids, remap_hot, remap_cold)
+
+
+def _split_align_kernel(topk_ids, remap_hot, remap_cold, num_cold, block):
+    """(hot_ids, cold_ids, sorted_ids, expert_ids, num_post_padded): the split and the
+    cold routes grouped per cold expert in blocks, one launch."""
+    from sglang.kernels.ops.moe.gguf_moe_split import gguf_moe_split_align
+
+    return gguf_moe_split_align(topk_ids, remap_hot, remap_cold, num_cold, block)
 
 
 _DIGEST_CHUNK = 1 << 24
@@ -196,6 +226,9 @@ class HotColdFusedMoE(nn.Module):
 
     def split_routes(self, topk_ids: torch.Tensor):
         """(hot_ids, cold_ids), each [T, top_k] in topk_ids' dtype (cold int32)."""
+        if _split_kernel_serves(topk_ids) and envs.SGLANG_HOTCOLD_SPLIT_KERNEL.get():
+            # the add and the two gathers below in one launch: the same integers
+            return _split_kernel(topk_ids, self.remap_hot, self.remap_cold)
         index = (topk_ids + 1).reshape(-1)
         hot_ids = self.remap_hot.index_select(0, index).view(topk_ids.shape)
         cold_ids = self.remap_cold.index_select(0, index).view(topk_ids.shape)
@@ -248,7 +281,27 @@ class HotColdFusedMoE(nn.Module):
                 f"HotColdFusedMoE needs standard top-k output, got {topk_output.format!r}"
             )
         topk_weights = topk_output.topk_weights
-        hot_ids, cold_ids = self.split_routes(topk_output.topk_ids)
+        topk_ids = topk_output.topk_ids
+        # On a decode batch the split's launch also groups the cold routes for the
+        # cold tier's multi-route kernel (SGLANG_HOTCOLD_DECODE_ALIGN); else the cold
+        # tier aligns them itself. The same routes in every block's expert either way.
+        aligned = None
+        block = 0
+        if (
+            not self.zero_cold
+            and _split_kernel_serves(topk_ids)
+            and envs.SGLANG_HOTCOLD_SPLIT_KERNEL.get()
+        ):
+            block = self.cold.decode_align_block(hidden_states.shape[0])
+        if block:
+            hot_ids, cold_ids, sorted_ids, expert_ids, post_padded = (
+                _split_align_kernel(
+                    topk_ids, self.remap_hot, self.remap_cold, self.num_cold, block
+                )
+            )
+            aligned = (block, sorted_ids, expert_ids, post_padded)
+        else:
+            hot_ids, cold_ids = self.split_routes(topk_ids)
         # The packed-id field (FlashInfer routed MoE) encodes logical ids: dropped.
         hot_topk = StandardTopKOutput(topk_weights, hot_ids, topk_output.router_logits)
         if pre_quant_input is None:
@@ -260,7 +313,24 @@ class HotColdFusedMoE(nn.Module):
             if sink is not None:
                 sink(self.layer_id, hot_ids=hot_ids, cold_ids=cold_ids, hot_out=hot_out)
             return hot_out
-        cold_out = self.cold(hidden_states, topk_weights, cold_ids)
+        stats = (
+            self._stats_left > 0
+            and _REAL_FORWARD
+            and hidden_states.shape[0] > 0
+            and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+        )
+        if sink is None and not stats:
+            # Nothing reads the cold tier's own output: the cold tier adds its sum into
+            # the hot tier's output itself (add_, or on a decode batch the kernel that
+            # makes the sum; the same bits: quantization/hotcold.py).
+            return self.cold(
+                hidden_states,
+                topk_weights,
+                cold_ids,
+                fold_into=hot_out,
+                aligned=aligned,
+            )
+        cold_out = self.cold(hidden_states, topk_weights, cold_ids, aligned=aligned)
         if sink is not None:
             # Before the in-place sum below: the sink copies both tiers.
             sink(
@@ -270,12 +340,7 @@ class HotColdFusedMoE(nn.Module):
                 hot_out=hot_out,
                 cold_out=cold_out,
             )
-        if (
-            self._stats_left > 0
-            and _REAL_FORWARD
-            and hidden_states.shape[0] > 0
-            and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
-        ):
+        if stats:
             self._stats_left -= 1
             self._log_stats(
                 hidden_states,
