@@ -22,7 +22,11 @@ tier's output; ``SGLANG_DSV41_HOTCOLD_VERIFY_LOAD`` arms ``arm_recheck`` after t
 loader's shard check, and the first eager forward of the layer (then every
 ``SGLANG_DSV41_HOTCOLD_RECHECK_EVERY`` eager forwards) compares a checksum of the
 cold rows and of the hot weights (not the scales, which the SM120 post-load
-interleaves) with the one taken at load.
+interleaves) with the one taken at load. ``SGLANG_DSV41_HOTCOLD_STATS`` logs the
+first real forwards: the model sets ``set_real_forward`` around each forward
+(deepseek_v4.py, the filter the per-layer dump uses too), and while a dump forward
+runs it sets ``_DUMP_SINK``, which receives each layer's route split and tier
+outputs before they are summed.
 """
 
 from __future__ import annotations
@@ -41,6 +45,23 @@ from sglang.srt.model_loader.hotcold_manifest import HotColdManifest
 logger = logging.getLogger(__name__)
 
 _ZERO_COLD_LOGGED = False
+# Set by the model around each forward (deepseek_v4.py _Dsv41Diag): whether it is a
+# real extend forward, and the dump sink while one is dumped. Unset: stats never log.
+_REAL_FORWARD = False
+_DUMP_SINK = None
+
+
+def set_real_forward(real: bool) -> None:
+    global _REAL_FORWARD
+    _REAL_FORWARD = bool(real)
+
+
+def set_dump_sink(sink) -> None:
+    """``sink(layer_id, **tensors)`` copies what it keeps; None to stop."""
+    global _DUMP_SINK
+    _DUMP_SINK = sink
+
+
 _DIGEST_CHUNK = 1 << 24
 
 
@@ -228,11 +249,24 @@ class HotColdFusedMoE(nn.Module):
             hot_out = self.hot(hidden_states, hot_topk)
         else:
             hot_out = self.hot(hidden_states, hot_topk, pre_quant_input=pre_quant_input)
+        sink = _DUMP_SINK
         if self.zero_cold:
+            if sink is not None:
+                sink(self.layer_id, hot_ids=hot_ids, cold_ids=cold_ids, hot_out=hot_out)
             return hot_out
         cold_out = self.cold(hidden_states, topk_weights, cold_ids)
+        if sink is not None:
+            # Before the in-place sum below: the sink copies both tiers.
+            sink(
+                self.layer_id,
+                hot_ids=hot_ids,
+                cold_ids=cold_ids,
+                hot_out=hot_out,
+                cold_out=cold_out,
+            )
         if (
             self._stats_left > 0
+            and _REAL_FORWARD
             and hidden_states.shape[0] > 0
             and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
         ):

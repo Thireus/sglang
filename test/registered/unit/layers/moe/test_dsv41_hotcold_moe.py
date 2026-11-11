@@ -472,8 +472,15 @@ class TestStats(_Base):
             dtype=torch.int32,
         )
         weights = torch.rand(6, 3, generator=self.gen) + 0.1
+        from sglang.srt.layers.moe import hotcold as hc_moe
+
         plain = self.run_layer(x, ids, weights)
         self.experts._stats_left = 2
+        self.addCleanup(hc_moe.set_real_forward, False)
+        with self.assertNoLogs("sglang.srt.layers.moe.hotcold", level="INFO"):
+            self.run_layer(x, ids, weights)  # not a real forward: no line, budget kept
+        self.assertEqual(self.experts._stats_left, 2)
+        hc_moe.set_real_forward(True)
         with self.assertLogs("sglang.srt.layers.moe.hotcold", level="INFO") as logs:
             for _ in range(3):
                 out = self.run_layer(x, ids, weights)
@@ -487,6 +494,293 @@ class TestStats(_Base):
             "nonfinite hot/cold 0/0; recompute on a copy: hot max|diff| 0.00e+00, cold kernel",
             line,
         )
+
+
+class _FakeAttn(nn.Module):
+    def forward(self, x, positions, forward_batch):
+        return torch.tanh(x) * 0.5
+
+
+class _PlainExperts(nn.Module):
+    def forward(self, hidden_states, topk_output):
+        return hidden_states * topk_output.topk_weights.sum(dim=1, keepdim=True)
+
+
+class _FakeMlp(nn.Module):
+    """DeepseekV2MoE's calling shape: experts(x, topk) and a (routed, shared) pair."""
+
+    def __init__(self, experts, pool):
+        super().__init__()
+        self.experts = experts
+        self.pool = pool
+
+    def forward(self, hidden_states, forward_batch):
+        t = hidden_states.shape[0]
+        pool = torch.tensor(self.pool, dtype=torch.int32)
+        ids = pool[(torch.arange(t)[:, None] + torch.arange(3)[None]) % len(pool)]
+        weights = torch.linspace(0.2, 1.0, t * 3).view(t, 3)
+        topk = StandardTopKOutput(weights, ids, torch.zeros(t, 8))
+        routed = self.experts(hidden_states, topk)
+        return SimpleNamespace(routed=routed, shared=hidden_states * 0.25)
+
+
+class _FakeDecoderLayer(nn.Module):
+    """The mHC layer's shape: residual streams [T, 4, H] written before each
+    sublayer, which reads their combination."""
+
+    def __init__(self, experts, pool):
+        super().__init__()
+        self.self_attn = _FakeAttn()
+        self.mlp = _FakeMlp(experts, pool)
+
+    def forward(
+        self, positions, hidden_states, input_ids, forward_batch, input_ids_global
+    ):
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+        from sglang.srt.models.deepseek_v4_boundary import ReadState
+
+        streams = hidden_states
+        residual_batch.set_written(ReadState(streams), forward_batch)
+        a = self.self_attn(
+            x=streams.mean(1), positions=positions, forward_batch=forward_batch
+        )
+        streams = streams + a[:, None]
+        residual_batch.set_written(ReadState(streams), forward_batch)
+        m = self.mlp(streams.mean(1), forward_batch)
+        return streams + (m.routed + m.shared)[:, None]
+
+
+def _fake_batch(mode_name, tokens, lens=None):
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    lens = [tokens] if lens is None else lens
+    return SimpleNamespace(
+        forward_mode=getattr(ForwardMode, mode_name),
+        batch_size=len(lens),
+        extend_seq_lens_cpu=lens,
+        extend_prefix_lens_cpu=[0] * len(lens),
+        seq_lens_cpu=torch.tensor(lens),
+        residual_stream=None,
+    )
+
+
+class TestDump(_Base):
+    """SGLANG_DSV41_DUMP_DIR through DeepseekV4Model.forward on a two-layer stage
+    (layer 0 hot/cold, layer 1 plain experts), and the real-forward filter."""
+
+    def _model(self, env):
+        from sglang.srt.models import deepseek_v4 as v4
+
+        with patch.dict(os.environ, env):
+            diag = v4._Dsv41Diag.from_env()
+        model = v4.DeepseekV4Model.__new__(v4.DeepseekV4Model)
+        nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(
+            rank_in_group=0, is_first_rank=True, is_last_rank=False
+        )
+        model.start_layer, model.end_layer = 0, 2
+        model.layers = nn.ModuleList(
+            [
+                _FakeDecoderLayer(self.experts, HOT0 + COLD0),
+                _FakeDecoderLayer(_PlainExperts(), list(range(8))),
+            ]
+        )
+        model.dsv41_diag = diag
+
+        def entry(
+            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors=None
+        ):
+            h = torch.cos(
+                input_ids.float()[:, None, None]
+                * torch.arange(1, 4 * HID + 1).view(1, 4, HID)
+                / 97
+            )
+            for layer in model.layers:
+                h = layer(
+                    positions=positions,
+                    hidden_states=h,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids,
+                )
+            return SimpleNamespace(tensors={"hidden_states": h.flatten(1)})
+
+        model._forward_entry = entry
+        return model
+
+    def _forward(self, model, mode, tokens, lens=None, autotune=False):
+        from sglang.srt.layers import logits_processor
+        from sglang.srt.models import deepseek_v4 as v4
+
+        ids = (torch.arange(tokens) * 7 + 3) % 1000
+        pos = torch.arange(tokens)
+        with patch.object(
+            logits_processor, "_autotune_run_lm_head", True if autotune else None
+        ):
+            with torch.no_grad():
+                return v4.DeepseekV4Model.forward(
+                    model, ids, pos, _fake_batch(mode, tokens, lens), None
+                )
+
+    def test_dumps_real_forwards_only_and_changes_nothing(self):
+        d = os.path.join(self.tmp.name, "dump")
+        env = {"SGLANG_DSV41_DUMP_DIR": d, "SGLANG_DSV41_DUMP_FORWARDS": "2"}
+        model, plain = self._model(env), self._model({})
+        self.assertIsNone(plain.dsv41_diag)
+        sequence = [
+            ("DECODE", 27, None, True),  # the autotune warm-ups
+            ("DECODE", 9, None, True),
+            ("EXTEND", 96, [1] * 96, True),  # the autotune EXTEND pass
+            ("EXTEND", 70, None, False),  # real: fwd0
+            ("DECODE", 1, None, False),
+            ("EXTEND", 30, None, False),  # under DUMP_MIN_TOKENS
+            ("EXTEND", 80, [1] * 80, False),  # 1-token requests (a warm-up shape)
+            ("TARGET_VERIFY", 80, None, False),
+            ("IDLE", 0, [], False),
+            ("EXTEND", 100, [60, 40], False),  # real but no request reaches 64: skipped
+            ("MIXED", 120, [100, 20], False),  # real: fwd1
+            ("EXTEND", 100, None, False),  # real, beyond DUMP_FORWARDS
+        ]
+        for mode, tokens, lens, autotune in sequence:
+            a = self._forward(model, mode, tokens, lens, autotune)
+            b = self._forward(plain, mode, tokens, lens, autotune)
+            self.assertTrue(
+                torch.equal(a.tensors["hidden_states"], b.tensors["hidden_states"]),
+                mode,
+            )
+        self.assertEqual(model.dsv41_diag.real_forwards, 3)
+        files = sorted(os.listdir(os.path.join(d, "pp0")))
+        self.assertEqual(
+            files,
+            sorted(
+                f"fwd{n}_{s}"
+                for n in (0, 1)
+                for s in ("meta.json", "layer0.pt", "layer1.pt", "out.pt")
+            ),
+        )
+        import json
+
+        meta = json.load(open(os.path.join(d, "pp0", "fwd1_meta.json")))
+        self.assertTrue(meta["complete"])
+        self.assertEqual(
+            (meta["forward_mode"], meta["num_tokens"], meta["extend_seq_lens"]),
+            ("MIXED", 120, [100, 20]),
+        )
+        self.assertEqual(meta["input_ids"][:3], [3, 10, 17])
+        self.assertEqual(meta["positions"], list(range(120)))
+        self.assertEqual(meta["dumped_layers"], [0, 1])
+        self.assertEqual(
+            set(meta["files"]), {"fwd1_layer0.pt", "fwd1_layer1.pt", "fwd1_out.pt"}
+        )
+        for layer in model.layers:  # the hooks live for a dumped forward only
+            for m in (layer, layer.self_attn, layer.mlp, layer.mlp.experts):
+                self.assertFalse(m._forward_hooks or m._forward_pre_hooks)
+        from sglang.srt.layers.moe import hotcold as hc_moe
+
+        self.assertIsNone(hc_moe._DUMP_SINK)
+        self.assertFalse(hc_moe._REAL_FORWARD)
+
+        r0 = torch.load(os.path.join(d, "pp0", "fwd0_layer0.pt"))
+        self.assertTrue(r0["hotcold"])
+        self.assertEqual((r0["layer"], r0["forward"], r0["pp_rank"]), (0, 0, 0))
+        self.assertEqual(r0["residual"].shape, (70, 4, HID))
+        self.assertTrue(torch.equal(r0["attn_in"], r0["residual"].mean(1)))
+        self.assertTrue(torch.equal(r0["moe_in"], r0["ffn_residual"].mean(1)))
+        self.assertEqual(r0["experts_in_same_as"], "moe_in")
+        self.assertNotIn("experts_in", r0)
+        self.assertEqual(r0["moe_routed_same_as"], "routed_out")
+        self.assertTrue(torch.equal(r0["moe_shared"], r0["moe_in"] * 0.25))
+        hot_ids, cold_ids = self.experts.split_routes(r0["topk_ids"])
+        self.assertTrue(torch.equal(r0["hot_ids"], hot_ids))
+        self.assertTrue(torch.equal(r0["cold_ids"], cold_ids))
+        self.assertTrue(torch.equal(r0["hot_out"] + r0["cold_out"], r0["routed_out"]))
+        self.assertGreater(float(r0["cold_out"].abs().max()), 0)
+        recomputed = self.run_layer(r0["moe_in"], r0["topk_ids"], r0["topk_weights"])
+        self.assertTrue(torch.equal(recomputed, r0["routed_out"]))
+        r1 = torch.load(os.path.join(d, "pp0", "fwd0_layer1.pt"))
+        self.assertFalse(r1["hotcold"])
+        self.assertNotIn("hot_out", r1)
+        self.assertTrue(
+            torch.equal(
+                r1["routed_out"], r1["moe_in"] * r1["topk_weights"].sum(1, keepdim=True)
+            )
+        )
+        # the next layer reads what this one wrote
+        out0 = torch.load(os.path.join(d, "pp0", "fwd0_out.pt"))
+        self.assertEqual(out0["out_hidden_states"].shape, (70, 4 * HID))
+        self.assertTrue(torch.equal(r1["positions"], torch.arange(70)))
+
+    def test_layer_subset_and_off_by_default(self):
+        from sglang.srt.models import deepseek_v4 as v4
+
+        self.assertIsNone(self._model({}).dsv41_diag)
+        d = os.path.join(self.tmp.name, "dump")
+        model = self._model(
+            {"SGLANG_DSV41_DUMP_DIR": d, "SGLANG_DSV41_DUMP_LAYERS": "1"}
+        )
+        self._forward(model, "EXTEND", 64)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(d, "pp0"))),
+            ["fwd0_layer1.pt", "fwd0_meta.json", "fwd0_out.pt"],
+        )
+        self.assertEqual(v4._parse_layer_set("0-2, 20,26-27"), {0, 1, 2, 20, 26, 27})
+        self.assertIsNone(v4._parse_layer_set(""))
+
+    def test_stats_only_sets_the_flag_for_real_forwards(self):
+        model = self._model({"SGLANG_DSV41_HOTCOLD_STATS": "1"})
+        self.assertIsNotNone(model.dsv41_diag)
+        self.experts._stats_left = 1
+        with self.assertNoLogs("sglang.srt.layers.moe.hotcold", level="INFO"):
+            self._forward(model, "DECODE", 27, autotune=True)
+            self._forward(model, "EXTEND", 9)
+        with self.assertLogs("sglang.srt.layers.moe.hotcold", level="INFO") as logs:
+            self._forward(model, "EXTEND", 64)
+            self._forward(model, "EXTEND", 64)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("hot/cold stats layer 0: 64 tokens", logs.output[0])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "dump")))
+
+    def test_skip_reasons(self):
+        from sglang.srt.models import deepseek_v4 as v4
+
+        fb = _fake_batch("EXTEND", 100)
+        self.assertIsNone(v4.dsv41_forward_skip_reason(fb, 100, 64))
+        with patch.object(v4, "get_is_capture_mode", lambda: True):
+            self.assertEqual(v4.dsv41_forward_skip_reason(fb, 100, 64), "capture mode")
+        with (
+            patch.object(torch.cuda, "is_available", lambda: True),
+            patch.object(torch.cuda, "is_current_stream_capturing", lambda: True),
+        ):
+            self.assertEqual(
+                v4.dsv41_forward_skip_reason(fb, 100, 64), "stream capture"
+            )
+        self.assertEqual(
+            v4.dsv41_forward_skip_reason(_fake_batch("DECODE", 27), 27, 64),
+            "mode DECODE",
+        )
+        self.assertEqual(
+            v4.dsv41_forward_skip_reason(_fake_batch("EXTEND", 27), 27, 64), "27 tokens"
+        )
+
+    def test_a_failing_piece_never_breaks_the_forward(self):
+        d = os.path.join(self.tmp.name, "dump")
+        model = self._model({"SGLANG_DSV41_DUMP_DIR": d})
+        plain = self._model({})
+        with (
+            patch(
+                "sglang.srt.layers.layer_boundary.residual.batch.written_residual",
+                side_effect=RuntimeError("boom"),
+            ),
+            self.assertLogs("sglang.srt.models.deepseek_v4", level="WARNING"),
+        ):
+            a = self._forward(model, "EXTEND", 64)
+        b = self._forward(plain, "EXTEND", 64)
+        self.assertTrue(
+            torch.equal(a.tensors["hidden_states"], b.tensors["hidden_states"])
+        )
+        r0 = torch.load(os.path.join(d, "pp0", "fwd0_layer0.pt"))
+        self.assertNotIn("residual", r0)
+        self.assertIn("hot_out", r0)
 
 
 def build_model(ckpt_path, layer_range=(0, 2)):
