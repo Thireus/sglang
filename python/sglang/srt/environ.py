@@ -2074,6 +2074,36 @@ class Envs:
     SGLANG_DSV41_DUMP_FORWARDS = EnvInt(4)
     SGLANG_DSV41_DUMP_MIN_TOKENS = EnvInt(64)
     SGLANG_DSV41_DUMP_LAYERS = EnvStr("")
+    # DeepSeek-V4 importance matrix of every routed expert on the plain MXFP4
+    # path (layers/moe/expert_imatrix.py; empty DIR = off, nothing installed):
+    # per layer and expert the sum of x^2 over the routed tokens (the experts'
+    # input), the route count and, unless X_ONLY, the sum of a^2 (the clamped
+    # SwiGLU output, recomputed eagerly from the expert's MXFP4 weights in
+    # chunks of CHUNK_MIB). WEIGHTING: "count" (each route once, as
+    # llama-imatrix), "weight" (each route times its router weight) or "both".
+    # Real extend forwards of MIN_TOKENS or more only; a dump every SAVE_EVERY
+    # forwards, at each EXPECT_FORWARDS count ("406,812": also kept as a
+    # snapshot file per count), on SIGUSR1 and at exit;
+    # CORPUS_SHA256 is written into the dump's meta block. CHECK_TOKENS tokens
+    # of a layer's first forward are recomputed whole and compared with the
+    # fused kernel's output (0 = no self-check).
+    SGLANG_DSV41_EXPERT_IMATRIX_DIR = EnvStr("")
+    SGLANG_DSV41_EXPERT_IMATRIX_CORPUS_SHA256 = EnvStr("")
+    SGLANG_DSV41_EXPERT_IMATRIX_WEIGHTING = EnvStr("count")
+    SGLANG_DSV41_EXPERT_IMATRIX_X_ONLY = EnvBool(False)
+    SGLANG_DSV41_EXPERT_IMATRIX_CHUNK_MIB = EnvInt(2048)
+    SGLANG_DSV41_EXPERT_IMATRIX_MIN_TOKENS = EnvInt(64)
+    SGLANG_DSV41_EXPERT_IMATRIX_SAVE_EVERY = EnvInt(50)
+    SGLANG_DSV41_EXPERT_IMATRIX_EXPECT_FORWARDS = EnvStr("")
+    SGLANG_DSV41_EXPERT_IMATRIX_CHECK_TOKENS = EnvInt(64)
+    # Tokens of routed inputs kept per layer before the a^2 recompute runs (its
+    # cost is the dequant of the layer's experts, paid once per flush; 0 = every
+    # forward); flushed before every dump but a SIGUSR1 one.
+    SGLANG_DSV41_EXPERT_IMATRIX_A2_FLUSH_TOKENS = EnvInt(8192)
+    # Comma-separated corpus window files (JSON lines with "ids"): when set, a
+    # forward counts only if each of its requests is one of those windows, seen
+    # for the first time (smoke loads, probes and repeats are skipped).
+    SGLANG_DSV41_EXPERT_IMATRIX_WINDOWS = EnvStr("")
     # DeepSeek-V4 default when a request carries no reasoning_effort: a
     # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
