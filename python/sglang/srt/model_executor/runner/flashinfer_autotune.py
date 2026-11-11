@@ -168,6 +168,26 @@ def should_run_flashinfer_autotune(
     return True
 
 
+def flashinfer_environment_key() -> str:
+    """Short digest of the environment stamp FlashInfer writes into a tactic cache.
+
+    FlashInfer neither reads nor overwrites a cache file whose stamp names
+    another environment, and since 0.7.3 the stamp fingerprints the installed
+    packages, so two builds with the same FlashInfer version no longer share
+    one. Without this key they share one path: the first writer owns it and
+    every other build profiles again at every start.
+    """
+    try:
+        from flashinfer.autotuner import _collect_metadata
+
+        stamp = _collect_metadata()
+    except Exception:  # noqa: BLE001 - a FlashInfer without the stamp
+        return "nostamp"
+    return hashlib.sha256(
+        json.dumps(stamp, sort_keys=True, default=str).encode()
+    ).hexdigest()[:12]
+
+
 def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     import flashinfer
 
@@ -189,6 +209,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     ]
     # Retune caches created before FlashInfer's default tactic joined the race.
     model_key_parts.append("candidate_selection=v2_default")
+    # One file per environment: FlashInfer ignores, and never overwrites, a
+    # cache written under another environment stamp.
+    model_key_parts.append("env=" + flashinfer_environment_key())
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
