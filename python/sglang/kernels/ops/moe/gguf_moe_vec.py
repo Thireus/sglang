@@ -38,6 +38,8 @@ def _jit_gguf_moe_vec_module(dtype: torch.dtype, quant_type: int) -> Module:
         22,
         23,
         29,
+        144,  # IQ4_KS (ik_llama.cpp), 4-byte row header
+        145,  # IQ2_KS (ik_llama.cpp), 2-byte row header
     ):
         raise ValueError(f"Unsupported GGUF vector quantization type: {quant_type}")
     args = make_cpp_args(dtype, quant_type)
@@ -65,7 +67,8 @@ def gguf_moe_a8_vec(
 ) -> torch.Tensor:
     """Project packed GGUF experts, writing zero for every negative route.
 
-    Inputs and uint8 packed weights are contiguous. IDs are contiguous int32
+    Inputs and uint8 packed weights [E, row, row_bytes] are contiguous; row_bytes
+    is ggml_row_size (IQ4_KS and IQ2_KS rows carry a 4- / 2-byte header). IDs are contiguous int32
     local expert indices or negative sentinels; their total size is tokens * top_k.
     The down projection retains the original route shape with top_k=1.
     Quantization, vector reduction and output rounding match the AOT operation.
