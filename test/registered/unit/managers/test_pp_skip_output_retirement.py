@@ -95,6 +95,8 @@ def _forward_result(unified_forward_done=None):
     return SimpleNamespace(
         can_run_cuda_graph=False,
         spec_verify_out_cache_loc=None,
+        # The ids a PP DSpark stage verified (the fork's relay, record 046).
+        spec_verify_ids=None,
         fpm_timing=None,
         forward_launch=None,
         unified_forward_done=unified_forward_done,
