@@ -506,20 +506,29 @@ class _PlainExperts(nn.Module):
         return hidden_states * topk_output.topk_weights.sum(dim=1, keepdim=True)
 
 
-class _FakeMlp(nn.Module):
-    """DeepseekV2MoE's calling shape: experts(x, topk) and a (routed, shared) pair."""
-
-    def __init__(self, experts, pool):
+class _FakeTopK(nn.Module):
+    def __init__(self, pool):
         super().__init__()
-        self.experts = experts
         self.pool = pool
 
-    def forward(self, hidden_states, forward_batch):
+    def forward(self, hidden_states):
         t = hidden_states.shape[0]
         pool = torch.tensor(self.pool, dtype=torch.int32)
         ids = pool[(torch.arange(t)[:, None] + torch.arange(3)[None]) % len(pool)]
         weights = torch.linspace(0.2, 1.0, t * 3).view(t, 3)
-        topk = StandardTopKOutput(weights, ids, torch.zeros(t, 8))
+        return StandardTopKOutput(weights, ids, torch.zeros(t, 8))
+
+
+class _FakeMlp(nn.Module):
+    """DeepseekV2MoE's calling shape: topk(x), experts(x, topk) and a (routed, shared) pair."""
+
+    def __init__(self, experts, pool):
+        super().__init__()
+        self.experts = experts
+        self.topk = _FakeTopK(pool)
+
+    def forward(self, hidden_states, forward_batch):
+        topk = self.topk(hidden_states)
         routed = self.experts(hidden_states, topk)
         return SimpleNamespace(routed=routed, shared=hidden_states * 0.25)
 
@@ -673,7 +682,13 @@ class TestDump(_Base):
             set(meta["files"]), {"fwd1_layer0.pt", "fwd1_layer1.pt", "fwd1_out.pt"}
         )
         for layer in model.layers:  # the hooks live for a dumped forward only
-            for m in (layer, layer.self_attn, layer.mlp, layer.mlp.experts):
+            for m in (
+                layer,
+                layer.self_attn,
+                layer.mlp,
+                layer.mlp.topk,
+                layer.mlp.experts,
+            ):
                 self.assertFalse(m._forward_hooks or m._forward_pre_hooks)
         from sglang.srt.layers.moe import hotcold as hc_moe
 
@@ -687,6 +702,8 @@ class TestDump(_Base):
         self.assertTrue(torch.equal(r0["attn_in"], r0["residual"].mean(1)))
         self.assertTrue(torch.equal(r0["moe_in"], r0["ffn_residual"].mean(1)))
         self.assertEqual(r0["experts_in_same_as"], "moe_in")
+        self.assertEqual(r0["topk_from"], "experts")
+        self.assertEqual(r0["topk_ids"].shape, (70, 3))
         self.assertNotIn("experts_in", r0)
         self.assertEqual(r0["moe_routed_same_as"], "routed_out")
         self.assertTrue(torch.equal(r0["moe_shared"], r0["moe_in"] * 0.25))

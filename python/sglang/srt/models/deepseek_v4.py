@@ -4018,9 +4018,9 @@ class _Dsv41Diag:
     the hot/cold stats flag and, among the first DUMP_FORWARDS real ones, is
     dumped: module hooks registered for that forward only (removed after it)
     copy, per layer, the residual streams the attention reads and the attention
-    input, the residual streams the FFN reads and the MoE input, what the routed
-    experts receive (input, top-k ids and weights, router logits) and return, the
-    MoE pieces (routed, shared), and in a hot/cold layer the route split and both
+    input, the residual streams the FFN reads and the MoE input, the router's
+    top-k, what the routed experts receive (input, top-k ids and weights, router
+    logits) and return, the MoE pieces (routed, shared), and in a hot/cold layer the route split and both
     tiers' outputs (hotcold._DUMP_SINK). At the layer's end the copies are
     synchronised, moved to the CPU and saved as
     DIR/pp{rank}/fwd{n}_layer{L}.pt; DIR/pp{rank}/fwd{n}_meta.json holds the
@@ -4272,6 +4272,7 @@ class _Dsv41Diag:
             self._put(layer_id, "experts_in", x, same_as=("moe_in",))
             rec = self._records.get(layer_id)
             if topk is not None and rec is not None:
+                rec["topk_from"] = "experts"
                 rec["topk_format"] = str(getattr(topk, "format", type(topk).__name__))
                 if TopKOutputChecker.format_is_standard(topk):
                     self._put(layer_id, "topk_ids", topk.topk_ids)
@@ -4279,6 +4280,15 @@ class _Dsv41Diag:
                 self._put(
                     layer_id, "router_logits", getattr(topk, "router_logits", None)
                 )
+
+        def topk_post(module, args, kwargs, output):
+            # The router's output; the experts' pre-hook replaces it with what the
+            # experts receive (the same tensors on the paths that call them).
+            rec = self._records.get(layer_id)
+            if rec is not None and TopKOutputChecker.format_is_standard(output):
+                rec["topk_from"] = "topk"
+                self._put(layer_id, "topk_ids", output.topk_ids)
+                self._put(layer_id, "topk_weights", output.topk_weights)
 
         def experts_post(module, args, kwargs, output):
             if isinstance(output, torch.Tensor):
@@ -4328,6 +4338,13 @@ class _Dsv41Diag:
                     guarded("mlp out", mlp_post), with_kwargs=True
                 )
             )
+            topk = getattr(mlp, "topk", None)
+            if isinstance(topk, nn.Module):
+                reg(
+                    topk.register_forward_hook(
+                        guarded("topk", topk_post), with_kwargs=True
+                    )
+                )
             experts = getattr(mlp, "experts", None)
             if isinstance(experts, nn.Module):
                 reg(
