@@ -199,6 +199,8 @@ class TestEveryOtherLaunchKeepsItsRefusal(CustomTestCase):
             pp_size=3,
             disaggregation_mode=mode,
             speculative_draft_model_path=None,
+            # The draft lm_head's quantised dtype (upstream #49595): None, the default.
+            speculative_dspark_lm_head_dtype=None,
         )
         args = object()
         rules = []
