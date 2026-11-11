@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_pp_relay import (
     DSparkPPRelayInput,
     prepare_plain_round,

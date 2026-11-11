@@ -21,9 +21,7 @@ def _req(rid):
         is_retracted=False,
         grammar=None,
         finished=lambda: False,
-        kv=SimpleNamespace(
-            kv_committed_len=10, commit_decode=lambda n, s=None: None
-        ),
+        kv=SimpleNamespace(kv_committed_len=10, commit_decode=lambda n, s=None: None),
         spec_verify_ct=0,
         spec_num_correct_drafts=0,
         hist=[],
@@ -37,7 +35,9 @@ def _settle(reqs, tokens, accept, stride):
         r.kv = SimpleNamespace(commit_decode=commits[r.rid].append)
         r.update_spec_correct_drafts_histogram = r.hist.append
     processor = SimpleNamespace(
-        metrics_reporter=SimpleNamespace(snapshot_spec_decode_metrics=lambda b, r: None),
+        metrics_reporter=SimpleNamespace(
+            snapshot_spec_decode_metrics=lambda b, r: None
+        ),
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         advance_grammar_fsm=lambda r, b: None,
     )

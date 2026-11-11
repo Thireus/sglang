@@ -46,7 +46,9 @@ TRITON_OK = _triton_runs()
 
 
 def _block(seed=0, bs=BS):
-    return torch.randn((bs, GAMMA, VOCAB), generator=torch.Generator().manual_seed(seed))
+    return torch.randn(
+        (bs, GAMMA, VOCAB), generator=torch.Generator().manual_seed(seed)
+    )
 
 
 def _tokens(bs=BS):
@@ -86,7 +88,9 @@ class TestStash(CustomTestCase):
     def test_composition_change_reads_by_rid(self):
         stash = DsparkPPStash(capacity=9)
         logits = _block(2, bs=3)
-        stash.put(rids=["a", "b", "c"], seq_lens=[1, 2, 3], logits=logits, borrowed=False)
+        stash.put(
+            rids=["a", "b", "c"], seq_lens=[1, 2, 3], logits=logits, borrowed=False
+        )
         got = stash.take(
             rids=["c", "a"], seq_lens=[3, 1], draft_tokens=_tokens(), vocab=VOCAB
         )
@@ -99,7 +103,9 @@ class TestStash(CustomTestCase):
         stash = DsparkPPStash(capacity=9)
         stash.put(rids=["a"], seq_lens=[5], logits=_block(bs=1), borrowed=False)
         tokens = _tokens()
-        got = stash.take(rids=["a", "b"], seq_lens=[6, 7], draft_tokens=tokens, vocab=VOCAB)
+        got = stash.take(
+            rids=["a", "b"], seq_lens=[6, 7], draft_tokens=tokens, vocab=VOCAB
+        )
         self.assertEqual(stash.num_missed_rows, 2)
         probs = dspark_verify._draft_probs(
             DraftBlockResult(
@@ -119,7 +125,9 @@ class TestStash(CustomTestCase):
         stash = DsparkPPStash(capacity=9)
         logits = _block(3, bs=1)
         stash.put(rids=["a"], seq_lens=[5], logits=logits, borrowed=False)
-        got = stash.take(rids=["a", "b"], seq_lens=[5, 7], draft_tokens=_tokens(), vocab=VOCAB)
+        got = stash.take(
+            rids=["a", "b"], seq_lens=[5, 7], draft_tokens=_tokens(), vocab=VOCAB
+        )
         self.assertTrue(torch.equal(got[0], logits[0]))
         self.assertEqual(stash.num_missed_rows, 1)
         self.assertEqual(got[1].argmax(dim=-1).tolist(), _tokens()[1].tolist())
@@ -159,7 +167,17 @@ class _Proposer:
         self.tokens = torch.zeros((BS, GAMMA), dtype=torch.int64)
         self.drafts = 0
 
-    def propose(self, *, batch, draft_input, verify_window, bs, device, target_model, sampling_info):
+    def propose(
+        self,
+        *,
+        batch,
+        draft_input,
+        verify_window,
+        bs,
+        device,
+        target_model,
+        sampling_info,
+    ):
         self.drafts += 1
         self.static.fill_(float(self.drafts))
         return DraftProposal(
@@ -207,12 +225,22 @@ class TestLastStageKeepsTheLogitsOfEachChain(CustomTestCase):
             can_run_graph=True,
             stride=1,
         )
-        batch = SimpleNamespace(seq_lens=None, seq_lens_cpu=None, seq_lens_sum=None, input_ids=None, spec_info=None)
-        return stage._tail_draft(batch, outcome, rids, SimpleNamespace(is_all_greedy=False))
+        batch = SimpleNamespace(
+            seq_lens=None,
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+            input_ids=None,
+            spec_info=None,
+        )
+        return stage._tail_draft(
+            batch, outcome, rids, SimpleNamespace(is_all_greedy=False)
+        )
 
     def _read(self, stage, rids, seq_lens):
         params = SimpleNamespace(greedy_mask=None, temperatures=None)
-        with mock.patch.object(round_module, "resolve_draft_params", return_value=params):
+        with mock.patch.object(
+            round_module, "resolve_draft_params", return_value=params
+        ):
             return stage._draft_block(
                 rids,
                 torch.tensor(seq_lens, dtype=torch.int64),
@@ -265,7 +293,9 @@ class TestLastStageKeepsTheLogitsOfEachChain(CustomTestCase):
         stage.switch.note_verify(["a"], [3])
         stage.note_request_finished("a")
         self.assertEqual(len(stage.stash), 1)
-        self.assertEqual(stage.switch.tokens_per_verify(["a"]), NEW_REQUEST_TOKENS_PER_VERIFY)
+        self.assertEqual(
+            stage.switch.tokens_per_verify(["a"]), NEW_REQUEST_TOKENS_PER_VERIFY
+        )
         stage.note_request_finished("b")
         self.assertEqual(len(stage.stash), 0)
         self._tail(stage, ["a", "b"], [5, 9])
@@ -286,9 +316,7 @@ class TestSampledAcceptLaw(CustomTestCase):
         torch.manual_seed(1234)
         target_row = torch.tensor([2.0, 1.0, 0.5, 0.0, -0.5, -1.0, 1.5])
         target_logits = target_row.repeat(n * (gamma + 1), 1)
-        candidates = torch.cat(
-            [torch.zeros(n, 1, dtype=torch.int64), drafts], dim=1
-        )
+        candidates = torch.cat([torch.zeros(n, 1, dtype=torch.int64), drafts], dim=1)
         block = DraftBlockResult(
             draft_tokens=drafts,
             corrected_logits=draft_logits_of_row,

@@ -80,12 +80,9 @@ class DsparkPPStash:
             hits.append(entry if entry and entry.seq_len == int(seq_len) else None)
         bs, gamma = draft_tokens.shape
         first = hits[0]
-        if (
-            first is not None
-            and all(
-                h is not None and h.logits is first.logits and h.row == i
-                for i, h in enumerate(hits)
-            )
+        if first is not None and all(
+            h is not None and h.logits is first.logits and h.row == i
+            for i, h in enumerate(hits)
         ):
             return first.logits[:bs]
         out = self._one_hot(draft_tokens, vocab, like=_first_tensor(hits))

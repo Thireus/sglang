@@ -34,16 +34,16 @@ from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
 from sglang.srt.entrypoints.openai.serving_deepseek_recipe import (
     DeepSeekRecipeChatEncodingAdapter,
 )
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.managers.req_types import MultimodalInputs
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.multimodal.processors.deepseek_v41 import DeepseekV41ImageProcessor
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase

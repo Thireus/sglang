@@ -3,9 +3,9 @@
 import random
 import unittest
 
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.parser.reasoning_parser import DeepSeekV4Detector
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

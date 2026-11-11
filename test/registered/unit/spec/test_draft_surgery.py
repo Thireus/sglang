@@ -70,7 +70,9 @@ class _Param:
 
 def _load(names, experts, fused):
     """DeepseekV4ForCausalLMDSpark.load_weights over meta tensors of these names."""
-    draft = dspark.DeepseekV4ForCausalLMDSpark.__new__(dspark.DeepseekV4ForCausalLMDSpark)
+    draft = dspark.DeepseekV4ForCausalLMDSpark.__new__(
+        dspark.DeepseekV4ForCausalLMDSpark
+    )
     torch.nn.Module.__init__(draft)
     draft.config = SimpleNamespace(
         dspark_n_routed_experts=experts,
@@ -172,7 +174,9 @@ class TestDraftSurgeryLoads(CustomTestCase):
         self._check(names, experts, 0)
         self._check(names, experts, 1)
         parsed = parse_dspark_draft_config(
-            draft_hf_config=SimpleNamespace(**text, architectures=["DeepseekV41ForCausalLM"])
+            draft_hf_config=SimpleNamespace(
+                **text, architectures=["DeepseekV41ForCausalLM"]
+            )
         )
         self.assertEqual(int(parsed.markov_rank), 256)
         self.assertEqual(int(parsed.resolve_gamma(default=None)), 5)

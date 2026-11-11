@@ -11,10 +11,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_planner import (
@@ -57,9 +54,7 @@ class DSparkPPRelayInput(PPSpecRelayInput):
         )
 
     def __repr__(self) -> str:
-        return (
-            f"DSparkPPRelayInput(bs={len(self.rids)}, chains={sum(self.has_chain)})"
-        )
+        return f"DSparkPPRelayInput(bs={len(self.rids)}, chains={sum(self.has_chain)})"
 
     def prepare_for_decode(self, batch: ScheduleBatch) -> None:
         self.alloc_state.prepare_for_decode(batch)

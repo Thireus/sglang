@@ -177,7 +177,9 @@ class TestRelayWindow(CustomTestCase):
                 self.assertTrue(
                     torch.equal(planned[0].verify_cache_loc, other.verify_cache_loc)
                 )
-                self.assertTrue(torch.equal(planned[0].positions_2d, other.positions_2d))
+                self.assertTrue(
+                    torch.equal(planned[0].positions_2d, other.positions_2d)
+                )
             yield stages, batches, reqs, ids, planned, rng.randrange(1, WIDTH + 1)
             for batch, req in zip(batches, reqs):
                 batch.seq_lens = batch.seq_lens + self._k
@@ -192,12 +194,14 @@ class TestRelayWindow(CustomTestCase):
                 self._k = k
                 req, batch = reqs[0], batches[0]
                 p = int(batch.seq_lens[0])
-                self.assertEqual(planned[0].positions_2d[0].tolist(), list(range(p, p + WIDTH)))
+                self.assertEqual(
+                    planned[0].positions_2d[0].tolist(), list(range(p, p + WIDTH))
+                )
                 self.assertEqual(
                     planned[0].verify_cache_loc.tolist(),
-                    stages[0].engine.pool.req_to_token[
-                        req.kv.req_pool_idx, p : p + WIDTH
-                    ].tolist(),
+                    stages[0]
+                    .engine.pool.req_to_token[req.kv.req_pool_idx, p : p + WIDTH]
+                    .tolist(),
                 )
                 # The tail draft's window after this accept, before the next prepare:
                 # all of it allocated, whatever the accept length was.
@@ -206,7 +210,9 @@ class TestRelayWindow(CustomTestCase):
                     batch_after = stages[0].batch([req])
                     batch_after.seq_lens = torch.tensor([p + accept], dtype=torch.int64)
                     tail = _window(
-                        batch_after, ids[0], torch.tensor([p + accept], dtype=torch.int64)
+                        batch_after,
+                        ids[0],
+                        torch.tensor([p + accept], dtype=torch.int64),
                     )
                     self.assertTrue((tail.verify_cache_loc >= 0).all())
                     self.assertEqual(
@@ -234,7 +240,9 @@ class TestRelayWindow(CustomTestCase):
         self.assertIsNone(relay.alloc_state.nxt_kv_lens_cpu)
         self.assertEqual(relay.rids, ["b"])
         c = stage.admit("c")
-        relay.merge_batch(DSparkPPRelayInput.degenerate(["c"], torch.tensor([3]), WIDTH))
+        relay.merge_batch(
+            DSparkPPRelayInput.degenerate(["c"], torch.tensor([3]), WIDTH)
+        )
         batch2 = stage.batch([b, c])
         relay.prepare_for_decode(batch2)
         self.assertEqual(batch2.seq_lens_cpu.tolist(), [100, 100])

@@ -239,9 +239,7 @@ class TestReplayedSourceModule(CustomTestCase):
         for name in checkpoint:
             name = remap(name, num_hidden_layers=40)
             layer_id = int(name.split(".")[2])
-            routed.add(
-                self.m._replayed_source_param_name(name, layer_id, sources)
-            )
+            routed.add(self.m._replayed_source_param_name(name, layer_id, sources))
         # A ratio-2 compressor either keeps wkv and wgate (this CPU build) or
         # fuses them into wkv_gate at load, which the loader handles by name.
         params = {p for p in params if not p.endswith(".wkv_gate.weight")}

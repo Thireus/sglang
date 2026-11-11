@@ -24,7 +24,8 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_extend,
     retire_window,
@@ -36,7 +37,7 @@ from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -201,7 +202,8 @@ class _Engine:
             self.full_total,
         )
         test.assertEqual(
-            self.alloc.swa_available_size() + self.cache.window_evictable_size(self.cache.window_sub_pools()[0][0]),
+            self.alloc.swa_available_size()
+            + self.cache.window_evictable_size(self.cache.window_sub_pools()[0][0]),
             self.swa_total,
         )
         self.cache.sanity_check()

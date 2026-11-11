@@ -19,7 +19,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockResult,
@@ -276,7 +276,9 @@ class DSparkPPLastStage:
             greedy_draft=worker._greedy_draft,
         )
 
-    def _run_plain(self, batch, relay: DSparkPPRelayInput, pp_proxy_tensors) -> _RoundOutcome:
+    def _run_plain(
+        self, batch, relay: DSparkPPRelayInput, pp_proxy_tensors
+    ) -> _RoundOutcome:
         worker = self.worker
         bs = len(batch.seq_lens)
         prefix_lens = batch.seq_lens

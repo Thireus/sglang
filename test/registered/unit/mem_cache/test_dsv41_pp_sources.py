@@ -6,14 +6,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    collect_sources_by_ratio,
+)
 from sglang.srt.mem_cache.deepseek_v41_pp_sources import (
     pipeline_stages,
     replayed_sources_of,
     stage_sources,
-)
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-    DeepSeekV4TokenToKVPool,
-    collect_sources_by_ratio,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -92,9 +92,7 @@ class TestStageSources(CustomTestCase):
 class TestReplayedPoolStorage(CustomTestCase):
     def test_replayed_kv_sources_own_storage(self):
         stage = range(27, 40)
-        self.assertEqual(
-            collect_sources_by_ratio(RATIOS, [2, 8, 14, 20], stage), {}
-        )
+        self.assertEqual(collect_sources_by_ratio(RATIOS, [2, 8, 14, 20], stage), {})
         self.assertEqual(
             collect_sources_by_ratio(RATIOS, [2, 8, 14, 20], stage, (20, 24)),
             {1: [20]},
@@ -111,8 +109,8 @@ class TestReplayedPoolStorage(CustomTestCase):
         pool.sources_by_ratio = collect_sources_by_ratio(
             RATIOS, [2, 8, 14, 20], range(27, 40), pool.replayed_layers
         )
-        pool.source_layer_of = (
-            lambda layer_id: DeepSeekV4TokenToKVPool.source_layer_of(pool, layer_id)
+        pool.source_layer_of = lambda layer_id: DeepSeekV4TokenToKVPool.source_layer_of(
+            pool, layer_id
         )
         pool._mapped_layers = lambda: DeepSeekV4TokenToKVPool._mapped_layers(pool)
         DeepSeekV4TokenToKVPool._init_compressed_layer_mapping(pool)

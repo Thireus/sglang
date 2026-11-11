@@ -5,6 +5,7 @@
 # (the note on where get_ptr_as_int64 comes from). Everything else is FlashInfer's, under the notice below.
 # fp8_utils._install_b12x_refill_fence() loads it in place of FlashInfer's module when the installed module
 # is that exact file. Retire it with 028b once FlashInfer fences the refill.
+# isort: skip_file (FlashInfer's file below is kept byte for byte, its import order included)
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 

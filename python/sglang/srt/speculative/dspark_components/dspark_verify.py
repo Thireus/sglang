@@ -381,7 +381,11 @@ class TargetVerifyExecutor:
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
-            **({} if pp_proxy_tensors is None else {"pp_proxy_tensors": pp_proxy_tensors}),
+            **(
+                {}
+                if pp_proxy_tensors is None
+                else {"pp_proxy_tensors": pp_proxy_tensors}
+            ),
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,

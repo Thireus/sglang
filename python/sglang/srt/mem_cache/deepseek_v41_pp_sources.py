@@ -65,7 +65,9 @@ def replayed_sources(
     return tuple(sorted(replayed))
 
 
-def _config_sources(config: Any) -> Tuple[Sequence[int], Sequence[int], Sequence[int], int]:
+def _config_sources(
+    config: Any,
+) -> Tuple[Sequence[int], Sequence[int], Sequence[int], int]:
     return (
         list(getattr(config, "compress_ratios", None) or ()),
         list(getattr(config, "kv_source_layer_ids", None) or ()),
@@ -87,12 +89,8 @@ def stage_sources(config: Any, stages: Sequence[range], rank: int) -> StageSourc
     """The replay plan of stage ``rank`` given every stage's layer range."""
     replays = [replayed_sources_of(config, stage) for stage in stages]
     start, end = stages[rank].start, stages[rank].stop
-    received = sorted(
-        {p for later in replays[rank:] for p in later if p < start}
-    )
-    sent = sorted(
-        {p for later in replays[rank + 1 :] for p in later if p < end}
-    )
+    received = sorted({p for later in replays[rank:] for p in later if p < start})
+    sent = sorted({p for later in replays[rank + 1 :] for p in later if p < end})
     captured = [p for p in sent if start <= p < end]
     return StageSources(
         tuple(replays[rank]), tuple(received), tuple(sent), tuple(captured)

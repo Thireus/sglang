@@ -19,7 +19,9 @@ DUMP_MAX_BYTES = 40 << 30
 
 
 class DraftHiddenDump:
-    def __init__(self, folder: str, layer_ids: List[int], max_bytes: int = DUMP_MAX_BYTES):
+    def __init__(
+        self, folder: str, layer_ids: List[int], max_bytes: int = DUMP_MAX_BYTES
+    ):
         os.makedirs(folder, exist_ok=True)
         self.folder = folder
         self.layer_ids = list(layer_ids)
@@ -74,6 +76,8 @@ def install_draft_dump(causal_lm, folder: str, layer_ids: List[int]) -> DraftHid
 
     inner.forward = forward_and_dump
     logger.info(
-        "Draft hidden dump on: layers %s of each prefill row, under %s.", layer_ids, folder
+        "Draft hidden dump on: layers %s of each prefill row, under %s.",
+        layer_ids,
+        folder,
     )
     return dump

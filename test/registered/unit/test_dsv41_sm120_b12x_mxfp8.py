@@ -38,7 +38,9 @@ V41_LINEARS = {
 }
 B12X_LOG = "Use FlashInfer b12x for block-fp8-as-MXFP8 linears"
 FENCE_LOG = "FlashInfer b12x slot refill fenced after the MMA warps' reads"
-ACQUIRE = "                    mainloop_pipeline.producer_acquire(mainloop_producer_state)\n"
+ACQUIRE = (
+    "                    mainloop_pipeline.producer_acquire(mainloop_producer_state)\n"
+)
 FENCE = '                    cute.arch.fence_proxy("async.shared", space="cta")\n'
 
 
@@ -194,15 +196,21 @@ class TestDsv41Sm120B12xMxfp8(CustomTestCase):
     def test_fence_detection(self):
         fenced = "x = 1\n" + ACQUIRE + FENCE + "y = 2\n"
         self.assertTrue(fp8_utils._b12x_refill_is_fenced(fenced))
-        self.assertFalse(fp8_utils._b12x_refill_is_fenced("x = 1\n" + ACQUIRE + "y = 2\n"))
+        self.assertFalse(
+            fp8_utils._b12x_refill_is_fenced("x = 1\n" + ACQUIRE + "y = 2\n")
+        )
         # the fence must follow the producer's empty-slot wait directly, and there is one wait
         self.assertFalse(fp8_utils._b12x_refill_is_fenced(ACQUIRE + "y = 2\n" + FENCE))
-        self.assertFalse(fp8_utils._b12x_refill_is_fenced(ACQUIRE + FENCE + ACQUIRE + FENCE))
+        self.assertFalse(
+            fp8_utils._b12x_refill_is_fenced(ACQUIRE + FENCE + ACQUIRE + FENCE)
+        )
         self.assertFalse(fp8_utils._b12x_refill_is_fenced(FENCE))
 
     def test_fenced_copy_is_flashinfer_072_plus_the_fence(self):
         here = os.path.dirname(os.path.abspath(fp8_utils.__file__))
-        with open(os.path.join(here, fp8_utils._B12X_FENCED_COPY), encoding="utf-8") as f:
+        with open(
+            os.path.join(here, fp8_utils._B12X_FENCED_COPY), encoding="utf-8"
+        ) as f:
             copy = f.read()
         self.assertTrue(fp8_utils._b12x_refill_is_fenced(copy))
         spec = importlib.util.find_spec("flashinfer")
@@ -225,13 +233,17 @@ class TestDsv41Sm120B12xMxfp8(CustomTestCase):
         # The copy is a comment header, then FlashInfer's file with the fence after the
         # producer's empty-slot wait; one comment line of it is reworded, nothing else.
         start = copy.index(stock.split("\n", 1)[0] + "\n")
-        self.assertTrue(all(line.startswith("# ") for line in copy[:start].splitlines()))
+        self.assertTrue(
+            all(line.startswith("# ") for line in copy[:start].splitlines())
+        )
         got = copy[start:].split("\n")
         want = stock.replace(ACQUIRE, ACQUIRE + FENCE).split("\n")
         self.assertEqual(len(got), len(want))
         changed = [(a, b) for a, b in zip(got, want) if a != b]
         self.assertEqual(len(changed), 1, changed)
-        self.assertTrue(changed[0][0].startswith("# ") and changed[0][1].startswith("# "))
+        self.assertTrue(
+            changed[0][0].startswith("# ") and changed[0][1].startswith("# ")
+        )
 
 
 class TestInstallB12xRefillFence(CustomTestCase):
@@ -287,7 +299,9 @@ class TestInstallB12xRefillFence(CustomTestCase):
 
     def test_flashinfer_fence_is_used_as_is(self):
         stock, _ = self._stock(ACQUIRE + FENCE)
-        self.assertEqual(self._install("0" * 64, self._copy("raise SystemExit\n")), "flashinfer")
+        self.assertEqual(
+            self._install("0" * 64, self._copy("raise SystemExit\n")), "flashinfer"
+        )
         self.assertIs(sys.modules[self.NAME], stock)
 
     def test_unknown_unfenced_file_is_refused(self):
@@ -297,7 +311,9 @@ class TestInstallB12xRefillFence(CustomTestCase):
 
     def test_a_copy_that_fails_to_load_leaves_flashinfer_in_place(self):
         stock, sha = self._stock(ACQUIRE)
-        copy = self._copy("def _load_loop():\n" + ACQUIRE + FENCE + "\n\nraise ImportError('no')\n")
+        copy = self._copy(
+            "def _load_loop():\n" + ACQUIRE + FENCE + "\n\nraise ImportError('no')\n"
+        )
         self.assertEqual(self._install(sha, copy), "")
         self.assertIs(sys.modules[self.NAME], stock)
 

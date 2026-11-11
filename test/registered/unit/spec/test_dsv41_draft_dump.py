@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.dspark_components.dspark_pp_dump import (
     DraftHiddenDump,
     install_draft_dump,
@@ -23,7 +23,9 @@ WIDE = 15
 class _Inner:
     def forward(self, input_ids, positions, forward_batch, *_):
         rows = input_ids.numel()
-        return (torch.zeros(rows, 4), torch.zeros(rows, 4)), positions.float().repeat(WIDE, 1).t()
+        return (torch.zeros(rows, 4), torch.zeros(rows, 4)), positions.float().repeat(
+            WIDE, 1
+        ).t()
 
 
 class _CausalLM:
@@ -36,7 +38,11 @@ class _CausalLM:
 
 
 def _batch(mode, lens):
-    return SimpleNamespace(forward_mode=mode, rids=[f"r{i}" for i in range(len(lens))], extend_seq_lens_cpu=lens)
+    return SimpleNamespace(
+        forward_mode=mode,
+        rids=[f"r{i}" for i in range(len(lens))],
+        extend_seq_lens_cpu=lens,
+    )
 
 
 class TestDraftHiddenDump(CustomTestCase):
@@ -58,7 +64,10 @@ class TestDraftHiddenDump(CustomTestCase):
             self.assertEqual(saved["positions"].tolist(), list(range(100, 105)))
             self.assertEqual(saved["layer_ids"], [37, 38, 39])
             self.assertEqual(saved["hidden"].dtype, torch.bfloat16)
-            self.assertEqual(saved["hidden"][:, 0].float().tolist(), [100.0, 101.0, 102.0, 103.0, 104.0])
+            self.assertEqual(
+                saved["hidden"][:, 0].float().tolist(),
+                [100.0, 101.0, 102.0, 103.0, 104.0],
+            )
 
     def test_the_cap_stops_it_and_the_forward_still_answers(self):
         with tempfile.TemporaryDirectory() as folder:

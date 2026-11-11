@@ -33,14 +33,14 @@ def _cfg(**overrides):
 def _hf(**text):
     fields = dict(dspark_target_layer_ids=[37, 38, 39], num_hidden_layers=40)
     fields.update(text)
-    return SimpleNamespace(model_type="deepseek_v41", text_config=SimpleNamespace(**fields))
+    return SimpleNamespace(
+        model_type="deepseek_v41", text_config=SimpleNamespace(**fields)
+    )
 
 
 class TestRefusals(CustomTestCase):
     def setUp(self):
-        for field, value in (
-            (envs.SGLANG_ENABLE_PP_SPEC, True),
-        ):
+        for field, value in ((envs.SGLANG_ENABLE_PP_SPEC, True),):
             scope = field.override(value)
             scope.__enter__()
             self.addCleanup(scope.__exit__, None, None, None)
@@ -96,13 +96,18 @@ class TestRefusals(CustomTestCase):
     def test_validate_raises_with_the_name(self):
         server_args = object()
         with (
-            patch("sglang.srt.arg_groups.overrides.resolving_view", lambda s: _cfg(attn_dp_size=2)),
             patch(
-                "sglang.srt.arg_groups.overrides.model_config_of",
+                "sglang.srt.arg_groups.model_override_base.resolving_view",
+                lambda s: _cfg(attn_dp_size=2),
+            ),
+            patch(
+                "sglang.srt.arg_groups.model_override_base.model_config_of",
                 lambda s: SimpleNamespace(hf_config=_hf()),
             ),
         ):
-            with self.assertRaisesRegex(ValueError, "SGLANG_ENABLE_PP_SPEC.*attention DP"):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_ENABLE_PP_SPEC.*attention DP"
+            ):
                 launch.validate_pp_dspark_launch(server_args)
 
 
@@ -182,7 +187,9 @@ class TestEveryOtherLaunchKeepsItsRefusal(CustomTestCase):
             self.assertFalse(
                 launch.pp_dspark_relay_enabled(pp_size=3, spec_algorithm="EAGLE")
             )
-            self.assertFalse(launch.pp_dspark_relay_enabled(pp_size=3, spec_algorithm=None))
+            self.assertFalse(
+                launch.pp_dspark_relay_enabled(pp_size=3, spec_algorithm=None)
+            )
 
     def _handle(self, *, flag, mode):
         """_handle_dspark up to its PP block; past it a sentinel stops the stub's walk."""
@@ -210,7 +217,9 @@ class TestEveryOtherLaunchKeepsItsRefusal(CustomTestCase):
             patch.object(
                 launch, "validate_pp_dspark_launch", lambda a: rules.append(a)
             ),
-            patch.object(speculative_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=flag),
+            patch.object(
+                speculative_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=flag
+            ),
         ):
             try:
                 speculative_hook._handle_dspark(args)

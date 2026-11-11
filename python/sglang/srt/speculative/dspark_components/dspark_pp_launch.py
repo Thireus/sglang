@@ -108,7 +108,10 @@ def resolve_single_stage_folds_off() -> list[str]:
 
 def validate_pp_dspark_launch(server_args: ServerArgs) -> None:
     """Refuse an unsupported relayed launch by name, and resolve what it cannot use."""
-    from sglang.srt.arg_groups.overrides import model_config_of, resolving_view
+    from sglang.srt.arg_groups.model_override_base import (
+        model_config_of,
+        resolving_view,
+    )
 
     cfg = resolving_view(server_args)
     refusal = pp_dspark_refusal(cfg, model_config_of(server_args).hf_config)
