@@ -12,7 +12,11 @@
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
 #define CUDA_QUANTIZE_BLOCK_SIZE 256
 #define GGML_CUDA_DMMV_X 32
+// Rows of N (one warp each) per CTA of the vector kernels. A JIT build may set it on the
+// command line (gguf_moe_vec.py); the result of a row does not depend on it.
+#ifndef GGML_CUDA_MMV_Y
 #define GGML_CUDA_MMV_Y 1
+#endif
 
 // Data Structures
 // QK = number of values after dequantization
