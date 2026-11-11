@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
     get_spec,
 )
 
