@@ -1072,6 +1072,7 @@ class MqaAttentionBase(nn.Module):
     # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
     wo_a_fp8_block128: bool = False
+    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -1439,7 +1440,6 @@ class MqaAttentionBase(nn.Module):
 
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
-    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -1735,6 +1735,7 @@ class MQALayer(MqaAttentionBase):
         out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
+        mhc.run_deferred_attn_stats_fork()
         data, scale = attn_backend.forward(
             q=q,
             k=q,

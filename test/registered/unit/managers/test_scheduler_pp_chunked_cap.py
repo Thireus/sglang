@@ -44,6 +44,8 @@ class _Req:
     """The fields the scheduler and the real PrefillAdder read from a request."""
 
     extend_len = Req.extend_len
+    # The request list that holds it (upstream #49623): none until one adopts it.
+    owner_list = None
 
     def __init__(self, rid, prompt_len=1028, prefix_len=0, holds_row=True):
         self.rid = rid
@@ -85,6 +87,9 @@ def _allocator():
     allocator.available_size.return_value = 1 << 22
     allocator.full_available_size.return_value = 1 << 22
     allocator.request_slot_reserve.return_value = 0
+    # Pools of their own, so the budget is the PrefillBudget below (upstream #49300
+    # picks the budget by whether the pools share one memory).
+    allocator.pools_share_memory = False
     allocator.create_prefill_budget.side_effect = lambda tree_cache, **kw: (
         PrefillBudget(allocator, tree_cache, **kw)
     )
@@ -173,7 +178,11 @@ class TestScheduler(CustomTestCase):
         s.waiting_queue.join(waiting)
         # The chunked slot is a request list since upstream #43910.
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=lambda *a, **k: None)
-        s.chunked_req = chunked_req
+        # chunked_req reads the list (its setter went in upstream #49623).
+        if chunked_req is not None:
+            s.chunked_reqs.join([chunked_req])
+        # A last chunk in the batch moves its request here (upstream #49496).
+        s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         s.min_free_slots_delayer = None
         s.request_retirer = Mock()
         s.invariant_checker = Mock()
