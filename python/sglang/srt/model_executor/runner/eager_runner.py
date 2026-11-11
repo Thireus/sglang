@@ -70,6 +70,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def eager_token_capacity(
+    *, max_total_num_tokens: int, prefill_buffer_tokens: int, decode_tokens: int
+) -> int:
+    """Token rows of the eager input buffers.
+
+    With chunked prefill a prefill batch holds at most the scheduler's prefill
+    ceiling (a mixed batch adds the decode rows), so the buffers need that
+    many rows, not one per KV pool token: at 48 bytes a row (input_ids,
+    positions, out_cache_loc and mrope_positions, int64) the pool-sized
+    buffers took 0.21 GiB on every rank at 4.6M pool tokens and 0.36 GiB at 8M.
+    Without chunked prefill one request can fill the pool and the size stays.
+    A batch that does not fit runs on its own tensors (``load_batch``).
+    """
+    pool_sized = max(max_total_num_tokens, prefill_buffer_tokens, decode_tokens)
+    if prefill_buffer_tokens <= 0:
+        return pool_sized
+    return min(pool_sized, prefill_buffer_tokens + decode_tokens)
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
@@ -111,14 +130,18 @@ class EagerRunner(BaseRunner):
             max_bs *= get_spec().speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         max_bs = get_eager_max_batch_size(max_bs)
-        prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())
-        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
+        max_num_token = eager_token_capacity(
+            max_total_num_tokens=mr.max_total_num_tokens,
+            prefill_buffer_tokens=max_prefill_buffer_tokens(),
+            decode_tokens=max_bs * num_tokens_per_req,
+        )
         if require_mlp_sync():
             from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
+        self._eager_max_num_token = max_num_token
         self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
@@ -184,6 +207,9 @@ class EagerRunner(BaseRunner):
             raw_num_tokens = forward_batch.input_embeds.shape[0]
         else:
             raw_num_tokens = 0
+        if raw_num_tokens > self._eager_max_num_token:
+            # Larger than the static buffers: run on the batch's own tensors.
+            return replace(forward_batch)
         registry = self._eager_registry
         registry.fill_from(
             forward_batch,
