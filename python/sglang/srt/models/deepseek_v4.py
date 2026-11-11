@@ -5753,6 +5753,27 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not (self.wo_a_fp8 or self.use_npu_arch35_mxfp8_wo_a):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
+        # A hot/cold checkpoint (hotcold.json manifest): hot experts load into the hot tier
+        # by slot, the cold tier's packed rows into its own parameters; both are
+        # taken below, after the stage filter, before the stock mappings.
+        hotcold_map = None
+        if not is_nextn:
+            from sglang.srt.model_loader.hotcold_manifest import (
+                HotColdWeightMap,
+                manifest_of_config,
+            )
+
+            hotcold_manifest = manifest_of_config(self.config)
+            if hotcold_manifest is not None:
+                hotcold_map = HotColdWeightMap(
+                    hotcold_manifest,
+                    (
+                        (self.model.start_layer, self.model.end_layer)
+                        if hasattr(self.model, "start_layer")
+                        else None
+                    ),
+                )
+
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
@@ -5864,6 +5885,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                             "mlp.shared_experts",
                             f"mlp.experts.{self.config.n_routed_experts}",
                         )
+
+                    if hotcold_map is not None:
+                        taken = hotcold_map.take(name, loaded_weight, params_dict)
+                        if taken is not None:
+                            loaded_params.add(taken)
+                            continue
 
                     weight_names.append(name)
 
@@ -6086,6 +6113,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
+        if hotcold_map is not None:
+            hotcold_map.check_complete()
         if skipped_by_group:
             log_info_on_rank0(
                 logger,

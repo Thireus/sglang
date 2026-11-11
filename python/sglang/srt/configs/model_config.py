@@ -741,6 +741,14 @@ class ModelConfig:
             self.model_path, self.revision = base
             revision = self.revision
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if getattr(self.hf_config, "hotcold", None) is not None:
+            # A DeepSeek-V4 hot/cold checkpoint: refuse a bad manifest or index here,
+            # before any weight is read, and record the manifest's resolved path.
+            from sglang.srt.model_loader.hotcold_manifest import attach_hotcold_manifest
+
+            attach_hotcold_manifest(
+                (self.hf_config, self.hf_text_config), self.model_path
+            )
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
             self.decision_config = load_decision_config(self.model_path, revision)
