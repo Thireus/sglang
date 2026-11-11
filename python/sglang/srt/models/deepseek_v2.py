@@ -763,7 +763,8 @@ class DeepseekV2MoE(nn.Module):
         )
         if hotcold_manifest is not None:
             # A hot/cold checkpoint: the hot tier is production's MXFP4 FusedMoE
-            # over H slots, the cold tier packed ggml rows (layers/moe/hotcold.py).
+            # over this layer's H slots, the cold tier packed ggml rows
+            # (layers/moe/hotcold.py). H may differ between layers.
             from sglang.srt.layers.moe.hotcold import HotColdFusedMoE
 
             if self.num_fused_shared_experts or num_redundant_experts:
@@ -775,7 +776,7 @@ class DeepseekV2MoE(nn.Module):
                 manifest=hotcold_manifest,
                 layer_id=self.layer_id,
                 hot=get_moe_impl_class(quant_config)(
-                    num_experts=hotcold_manifest.num_hot,
+                    num_experts=hotcold_manifest.num_hot_of(self.layer_id),
                     num_fused_shared_experts=0,
                     top_k=top_k_for_moe,
                     hidden_size=config.hidden_size,

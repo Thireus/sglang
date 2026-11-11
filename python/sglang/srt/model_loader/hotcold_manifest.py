@@ -15,6 +15,13 @@ A hot/cold checkpoint keeps every routed expert of a layer, split in two tiers:
 ``config.json`` names the manifest (``"hotcold": {"manifest": "hotcold.json"}``)
 and keeps ``n_routed_experts`` at the full count, so the router is unchanged.
 The slot of an expert is its position in its tier's list.
+
+The hot count may differ between layers (more hot experts on a pipeline stage
+with room): each layer's count is the length of its lists. ``num_hot`` /
+``num_cold`` are then None and ``num_hot_of(layer)`` / ``num_cold_of(layer)``
+give a layer's counts; a manifest with one (H, C) reads as before. Optional
+top-level ``"H"`` / ``"C"`` are checked against the lists: an integer for every
+layer, or ``"per-layer"`` with ``"H_by_layer"`` / ``"C_by_layer"``.
 """
 
 from __future__ import annotations
@@ -90,8 +97,9 @@ class HotColdLayer:
 class HotColdManifest:
     path: str
     n_routed_experts: int
-    num_hot: int
-    num_cold: int
+    # The one (H, C) of a uniform manifest; None when the counts differ between layers.
+    num_hot: Optional[int]
+    num_cold: Optional[int]
     ggml_type: Dict[str, int]
     row_bytes: Dict[str, int]
     layers: Dict[int, HotColdLayer]
@@ -108,6 +116,36 @@ class HotColdManifest:
     def layer(self, layer_id: int) -> Optional[HotColdLayer]:
         return self.layers.get(int(layer_id))
 
+    def num_hot_of(self, layer_id: int) -> int:
+        """The hot slots of one layer (the hot FusedMoE's expert count there)."""
+        return len(self.layers[int(layer_id)].hot)
+
+    def num_cold_of(self, layer_id: int) -> int:
+        """The cold slots of one layer (the leading dim of its cold tensors)."""
+        return len(self.layers[int(layer_id)].cold)
+
+    @property
+    def uniform(self) -> bool:
+        return self.num_hot is not None
+
+    def counts_text(self, layer_ids: Optional[Iterable[int]] = None) -> str:
+        """ "222 hot + 162 cold" for one size, else each size with its layer ranges."""
+        ids = sorted(
+            self.layers
+            if layer_ids is None
+            else (int(x) for x in layer_ids if int(x) in self.layers)
+        )
+        runs: List[Tuple[int, int, int, int]] = []  # (H, C, first, last)
+        for i in ids:
+            h, c = self.num_hot_of(i), self.num_cold_of(i)
+            if runs and runs[-1][:2] == (h, c) and runs[-1][3] == i - 1:
+                runs[-1] = (h, c, runs[-1][2], i)
+            else:
+                runs.append((h, c, i, i))
+        if len({r[:2] for r in runs}) <= 1 and runs:
+            return f"{runs[0][0]} hot + {runs[0][1]} cold"
+        return ", ".join(f"layers {a}-{b}: {h} hot + {c} cold" for h, c, a, b in runs)
+
     def remap_tables(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(remap_hot, remap_cold)``: int32 [n_routed_experts + 1], indexed by
         ``topk_ids + 1``. Entry 0 is the padded route (-1): hot -> H, cold -> -1.
@@ -115,7 +153,7 @@ class HotColdManifest:
         expert to -1 in the cold table."""
         entry = self.layers[int(layer_id)]
         n = self.n_routed_experts
-        remap_hot = torch.full((n + 1,), self.num_hot, dtype=torch.int32)
+        remap_hot = torch.full((n + 1,), len(entry.hot), dtype=torch.int32)
         remap_cold = torch.full((n + 1,), -1, dtype=torch.int32)
         for expert, slot in entry.hot_slot.items():
             remap_hot[expert + 1] = slot
@@ -235,12 +273,11 @@ def parse_manifest(
             hot_slot={e: s for s, e in enumerate(hot)},
             cold_slot={e: s for s, e in enumerate(cold)},
         )
-    if len(sizes) > 1:
-        errors.append(f"every layer needs the same (H, C); found {sorted(sizes)}")
+    _check_declared_counts(raw, layers, errors)
     if errors:
         details = "\n".join(f"- {e}" for e in errors)
         raise HotColdManifestError(f"Invalid hot/cold manifest {path}:\n{details}")
-    ((num_hot, num_cold),) = sizes
+    (num_hot, num_cold) = next(iter(sizes)) if len(sizes) == 1 else (None, None)
     return HotColdManifest(
         path=path,
         n_routed_experts=n_routed_experts,
@@ -251,6 +288,41 @@ def parse_manifest(
         layers=layers,
         raw=raw,
     )
+
+
+def _check_declared_counts(
+    raw: dict, layers: Dict[int, HotColdLayer], errors: List[str]
+) -> None:
+    """Top-level "H" / "C" (optional, as the builder writes them) must agree with
+    the layers' lists: an integer for every layer, or "per-layer" with
+    "H_by_layer" / "C_by_layer" giving each layer's count."""
+    for key, by_key, tier in (("H", "H_by_layer", "hot"), ("C", "C_by_layer", "cold")):
+        declared = raw.get(key)
+        if declared is None:
+            continue
+        if declared == "per-layer":
+            by_layer = raw.get(by_key)
+            if not isinstance(by_layer, dict):
+                errors.append(f'{key} is "per-layer" but {by_key} is missing')
+                continue
+            for layer_id, entry in layers.items():
+                want = by_layer.get(str(layer_id))
+                if want != len(getattr(entry, tier)):
+                    errors.append(
+                        f"layers[{layer_id}]: {len(getattr(entry, tier))} {tier} experts, "
+                        f"{by_key} says {want!r}"
+                    )
+        elif isinstance(declared, int) and not isinstance(declared, bool):
+            bad = sorted(
+                i for i, e in layers.items() if len(getattr(e, tier)) != declared
+            )
+            if bad:
+                errors.append(
+                    f"{key} is {declared} but layers {bad[:8]} hold "
+                    f"{sorted({len(getattr(layers[i], tier)) for i in bad})} {tier} experts"
+                )
+        else:
+            errors.append(f'{key} must be an integer or "per-layer", got {declared!r}')
 
 
 def _read_safetensors_header(path: str) -> dict:
@@ -306,13 +378,14 @@ def check_checkpoint_index(model_dir: str, manifest: HotColdManifest) -> None:
             shape = meta.get("shape")
             if isinstance(shape, list) and len(shape) == 3:
                 rows = shape[2]
+            num_cold = manifest.num_cold_of(layer_id)
             if (
                 shape is None
-                or shape[0] != manifest.num_cold
+                or shape[0] != num_cold
                 or rows != manifest.row_bytes[proj]
             ):
                 errors.append(
-                    f"{name}: shape {shape} needs [{manifest.num_cold}, *, "
+                    f"{name}: shape {shape} needs [{num_cold}, *, "
                     f"{manifest.row_bytes[proj]}]"
                 )
     if errors:
@@ -416,14 +489,13 @@ def attach_hotcold_manifest(
     for c in configs:
         c.hotcold_manifest_path = path
     logger.info(
-        "hot/cold manifest %s: format %s, %d layers, %d hot + %d cold of %d routed "
+        "hot/cold manifest %s: format %s, %d layers, %s of %d routed "
         "experts a layer, cold ggml types w1 %d w3 %d w2 %d, row bytes %d / %d / %d, "
         "index %s",
         path,
         MANIFEST_FORMAT,
         len(manifest.layers),
-        manifest.num_hot,
-        manifest.num_cold,
+        manifest.counts_text(),
         manifest.n_routed_experts,
         manifest.ggml_type["w1"],
         manifest.ggml_type["w3"],
@@ -446,8 +518,8 @@ class HotColdWeightMap:
     native tensor of a cold expert is refused; the cold tensors
     ``model.layers.L.mlp.experts_cold.{gate,up,down}_proj.qweight`` load into
     ``mlp.experts.cold.{w13,w2}_qweight``. Anything else is not taken.
-    ``check_complete`` proves the count: 6·H distinct hot tensors and 3 cold
-    ones per layer of this stage.
+    ``check_complete`` proves the count: 6·H distinct hot tensors (H of that
+    layer) and 3 cold ones per layer of this stage.
     """
 
     _COLD_SHARD = {
@@ -536,12 +608,12 @@ class HotColdWeightMap:
         return None
 
     def check_complete(self) -> None:
-        expect_hot = 6 * self.manifest.num_hot
         errors = []
         stage, hot_total, cold_total = [], 0, 0
         for layer_id in sorted(self.manifest.layers):
             if not self._on_stage(layer_id):
                 continue
+            expect_hot = 6 * self.manifest.num_hot_of(layer_id)
             hot = len(self.hot_seen.get(layer_id, ()))
             cold = len(self.cold_loaded.get(layer_id, ()))
             stage.append(layer_id)
@@ -555,18 +627,32 @@ class HotColdWeightMap:
         if errors:
             details = "\n".join(f"- {e}" for e in errors)
             raise HotColdManifestError(f"Hot/cold load incomplete:\n{details}")
-        logger.info(
-            "hot/cold load: layers %s..%s (%d), %d hot tensors (%d a layer, %d slots), "
-            "%d cold tensors (3 a layer, %d slots)",
-            stage[0] if stage else "none",
-            stage[-1] if stage else "none",
-            len(stage),
-            hot_total,
-            expect_hot,
-            self.manifest.num_hot,
-            cold_total,
-            self.manifest.num_cold,
-        )
+        if not stage or len({self.manifest.num_hot_of(i) for i in stage}) == 1:
+            # one size on this stage: the line the boot proof reads, unchanged
+            h = self.manifest.num_hot_of(stage[0]) if stage else 0
+            c = self.manifest.num_cold_of(stage[0]) if stage else 0
+            logger.info(
+                "hot/cold load: layers %s..%s (%d), %d hot tensors (%d a layer, %d slots), "
+                "%d cold tensors (3 a layer, %d slots)",
+                stage[0] if stage else "none",
+                stage[-1] if stage else "none",
+                len(stage),
+                hot_total,
+                6 * h,
+                h,
+                cold_total,
+                c,
+            )
+        else:
+            logger.info(
+                "hot/cold load: layers %s..%s (%d), %d hot tensors, %d cold tensors (3 a layer); %s",
+                stage[0],
+                stage[-1],
+                len(stage),
+                hot_total,
+                cold_total,
+                self.manifest.counts_text(stage),
+            )
 
     def _loaded_slice(self, params_dict: dict, name: str) -> Optional[torch.Tensor]:
         """The parameter slice a raw checkpoint tensor was loaded into: hot
