@@ -19,6 +19,7 @@ import functools
 import hashlib
 import json
 import logging
+import sys
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -316,6 +317,13 @@ def _drop_diverged_autotune_cache(
     cache_path.unlink(missing_ok=True)
 
 
+def _moe_profile_count(tuner) -> int:
+    """MoE buckets the tuner has profiled so far (a cache hit does not count)."""
+    stats = getattr(tuner, "stats", None)
+    tuned = getattr(stats, "tuned_op_successful_configs", None) or {}
+    return sum(count for op, count in tuned.items() if "fused_moe" in op)
+
+
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     from flashinfer import autotune_v2
@@ -381,6 +389,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 ),
                 prefill_num_tokens=prefill_num_tokens,
             )
+        profiled_before = _moe_profile_count(tuner)
         with (
             _autotune_process_group(sync_group),
             autotune(
@@ -395,6 +404,21 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             yield
         if reuse_cache:
             tuner.save_configs(str(autotune_cache))
+        # Profiling leaves its workspace on the MoE runner; a pass that found
+        # every MoE tactic in the cache has none. The CUTLASS MoE module is
+        # loaded by the first model that uses it: without it no call was noted.
+        cutlass_moe = sys.modules.get(
+            "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass"
+        )
+        if cutlass_moe is not None:
+            released = cutlass_moe.release_flashinfer_cutlass_profile_workspace(
+                profiled=_moe_profile_count(tuner) != profiled_before
+            )
+            if released:
+                logger.info(
+                    "FlashInfer MoE profiler workspace released (%d runner).",
+                    released,
+                )
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 

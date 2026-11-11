@@ -8,6 +8,8 @@ small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
+import inspect
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -36,6 +38,8 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.device import is_sm120
 from sglang.srt.utils.triton_utils import next_power_of_2
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -293,6 +297,142 @@ def _flashinfer_autotune_active() -> bool:
     from flashinfer.autotuner import AutoTuner
 
     return AutoTuner.get().is_tuning_mode
+
+
+# FlashInfer caches one CUTLASS MoE runner per (dtypes, flags), and that runner
+# keeps the workspace of the last bucket its profiler prepared: the weight scale
+# factors of every expert plus the activations of the largest token bucket
+# (0.49 GiB at 320 experts and 2,048 tokens). Nothing reads it once the tactics
+# are chosen. Calls made while the tuner is on are noted here, by runner, so
+# that the tuning pass can hand the workspace back when it ends.
+_profiled_cutlass_calls: dict = {}
+
+# Experts in the workspace that is left behind (the profiler routes top-k of them).
+_PROFILE_WORKSPACE_KEEP_EXPERTS = 8
+
+# The stream the workspace that is left behind is allocated on, one per device.
+_profile_workspace_streams: dict = {}
+
+
+def _note_profiled_cutlass_call(
+    x: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    top_k: int,
+    moe_flags: dict,
+) -> None:
+    key = (
+        x.dtype,
+        fc1_expert_weights.dtype,
+        fc1_expert_weights.device,
+        tuple(sorted((k, str(v)) for k, v in moe_flags.items())),
+    )
+    _profiled_cutlass_calls[key] = (
+        x.dtype,
+        x.shape[-1],
+        fc1_expert_weights,
+        fc2_expert_weights,
+        top_k,
+        dict(moe_flags),
+    )
+
+
+def _profile_workspace_stream(device: torch.device) -> torch.cuda.Stream:
+    stream = _profile_workspace_streams.get(device)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _profile_workspace_streams[device] = stream
+    return stream
+
+
+def release_flashinfer_cutlass_profile_workspace(profiled: bool = True) -> int:
+    """Shrink the profiler workspace of the CUTLASS MoE runners a tuning pass used.
+
+    One more preparation of the profiler, the call the tuner itself makes
+    before it times a bucket, at one token and with a handful of experts: the
+    runner then holds a few megabytes and drops the workspace of the last
+    bucket. The small workspace is allocated on a stream of its own: the
+    caching allocator hands a free block only to the stream that allocated it,
+    so the new workspace cannot be carved out of the segment the old one
+    leaves, and that segment goes back to the device. The runner and the
+    tactics tuned for it stay. With ``profiled`` false (every tactic came from
+    the cache: no workspace exists) the notes are dropped and nothing runs.
+    Returns the number of runners handled; a FlashInfer without these entry
+    points is left alone.
+    """
+    calls = list(_profiled_cutlass_calls.values())
+    _profiled_cutlass_calls.clear()
+    if not profiled or not calls:
+        return 0
+    try:
+        from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
+    except Exception:  # noqa: BLE001
+        return 0
+    try:
+        from flashinfer.utils import device_support_pdl
+    except Exception:  # noqa: BLE001
+        device_support_pdl = None
+
+    handled = 0
+    for x_dtype, hidden, fc1, fc2, top_k, flags in calls:
+        try:
+            device = fc1.device
+            major, minor = torch.cuda.get_device_capability(device)
+            runner_cls = get_cutlass_fused_moe_module(f"{major * 10 + minor}").MoERunner
+            known = dict(
+                x_dtype=x_dtype,
+                weight_dtype=fc1.dtype,
+                output_dtype=torch.bfloat16,
+                top_k=top_k,
+                tp_size=1,
+                tp_rank=0,
+                ep_size=1,
+                ep_rank=0,
+                cluster_size=1,
+                cluster_rank=0,
+                enable_alltoall=False,
+                use_deepseek_fp8_block_scale=False,
+                use_w4_group_scaling=False,
+                use_mxfp8_act_scaling=False,
+                min_latency_mode=False,
+                enable_pdl=(
+                    bool(device_support_pdl(device)) if device_support_pdl else False
+                ),
+                use_packed_weights=False,
+                use_fused_finalize=True,
+                use_wfp4afp8_humming=False,
+            )
+            known.update(flags)
+            accepted = inspect.signature(runner_cls.__init__).parameters
+            runners_before = dict(runner_cls.runner_dict)
+            runner = runner_cls(**{k: v for k, v in known.items() if k in accepted})
+            if len(runner_cls.runner_dict) != len(runners_before):
+                # Not the runner the tuner profiled: leave FlashInfer as it was.
+                runner_cls.runner_dict.clear()
+                runner_cls.runner_dict.update(runners_before)
+                continue
+            few = min(fc2.shape[0], max(top_k, _PROFILE_WORKSPACE_KEEP_EXPERTS))
+            torch.cuda.synchronize(device)
+            with torch.cuda.stream(_profile_workspace_stream(device)):
+                one_token = torch.zeros((1, hidden), dtype=x_dtype, device=device)
+                runner.forward(
+                    [one_token, fc1[:few], None, fc2[:few], None],
+                    tactic=-1,
+                    do_preparation=True,
+                    gemm_idx=2,
+                )
+                del one_token
+            torch.cuda.synchronize(device)
+            # The workspace of the last bucket is free now; its segment can go back.
+            torch.cuda.empty_cache()
+            handled += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "FlashInfer MoE profiler workspace not released (%s: %s)",
+                type(e).__name__,
+                e,
+            )
+    return handled
 
 
 def _run_flashinfer_cutlass(
@@ -583,6 +723,22 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     ):
         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 
+    # The flags that pick FlashInfer's runner, kept together for the note below.
+    moe_flags = dict(
+        tp_size=runner_config.moe_tp_size,
+        tp_rank=runner_config.moe_tp_rank,
+        ep_size=runner_config.moe_ep_size,
+        ep_rank=runner_config.moe_ep_rank,
+        use_w4_group_scaling=not use_mxfp8_act_scaling,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        activation_type=(
+            ActivationType.SwigluStep
+            if quant_info.use_swiglu_step
+            else ActivationType.Swiglu
+        ),
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        **humming_kwargs,
+    )
     flashinfer_cutlass_fused_moe(
         input=x,
         token_selected_experts=topk_ids.to(torch.int32),
@@ -597,22 +753,14 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
-        tp_size=runner_config.moe_tp_size,
-        tp_rank=runner_config.moe_tp_rank,
-        ep_size=runner_config.moe_ep_size,
-        ep_rank=runner_config.moe_ep_rank,
-        use_w4_group_scaling=not use_mxfp8_act_scaling,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=(
-            ActivationType.SwigluStep
-            if quant_info.use_swiglu_step
-            else ActivationType.Swiglu
-        ),
         tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         output=out,
-        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
-        **humming_kwargs,
+        **moe_flags,
     )
+    if _flashinfer_autotune_active():
+        _note_profiled_cutlass_call(
+            x, fc1_expert_weights, fc2_expert_weights, topk_ids.shape[1], moe_flags
+        )
 
     if do_pad:
         out = out[:, :origin_hidden].contiguous()
