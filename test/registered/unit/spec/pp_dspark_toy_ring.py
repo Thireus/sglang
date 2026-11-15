@@ -750,6 +750,11 @@ class ToyRing:
             )
 
         fake_spec = SimpleNamespace(speculative_num_draft_tokens=WIDTH)
+        # The output skip asks whether routed experts ride the output message
+        # (upstream #48412): not on the toy ring.
+        fake_exec = SimpleNamespace(
+            features=SimpleNamespace(enable_return_routed_experts=False)
+        )
 
         def stage_main(stage: ToyStage):
             ctx.rank = stage.rank
@@ -787,6 +792,7 @@ class ToyRing:
         patches = [
             mock.patch.object(scheduler_pp_mixin, "get_parallel", fake_parallel),
             mock.patch.object(scheduler_pp_mixin, "get_spec", lambda: fake_spec),
+            mock.patch.object(scheduler_pp_mixin, "get_exec", lambda: fake_exec),
             mock.patch.object(scheduler_pp_dspark, "get_spec", lambda: fake_spec),
             mock.patch.object(
                 scheduler_pp_mixin, "set_time_batch", lambda *a, **k: None

@@ -19,7 +19,7 @@ import torch
 
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
-from sglang.srt.managers import scheduler_pp_dspark
+from sglang.srt.managers import scheduler_pp_dspark, scheduler_pp_mixin
 from sglang.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
     _pp_can_skip_output_comm,
@@ -316,18 +316,31 @@ class TestSwitchPredicates(CustomTestCase):
                 return_logprob=logprob,
             )
 
+        def routed_experts(capturing):
+            # The output message carries a chunk's routed experts to the first
+            # stage (upstream #48412); no launch of the fork returns them.
+            features = SimpleNamespace(enable_return_routed_experts=capturing)
+            return mock.patch.object(
+                scheduler_pp_mixin,
+                "get_exec",
+                return_value=SimpleNamespace(features=features),
+            )
+
         with envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.override(True):
-            self.assertTrue(_pp_can_skip_output_comm(b(ForwardMode.EXTEND)))
-            for x in (
-                b(ForwardMode.EXTEND, n=2),
-                b(ForwardMode.EXTEND, last=True),
-                b(ForwardMode.EXTEND, logprob=True),
-                b(ForwardMode.DECODE),
-                b(ForwardMode.TARGET_VERIFY),
-                b(ForwardMode.MIXED),
-                None,
-            ):
-                self.assertFalse(_pp_can_skip_output_comm(x), x)
+            with routed_experts(False):
+                self.assertTrue(_pp_can_skip_output_comm(b(ForwardMode.EXTEND)))
+                for x in (
+                    b(ForwardMode.EXTEND, n=2),
+                    b(ForwardMode.EXTEND, last=True),
+                    b(ForwardMode.EXTEND, logprob=True),
+                    b(ForwardMode.DECODE),
+                    b(ForwardMode.TARGET_VERIFY),
+                    b(ForwardMode.MIXED),
+                    None,
+                ):
+                    self.assertFalse(_pp_can_skip_output_comm(x), x)
+            with routed_experts(True):
+                self.assertFalse(_pp_can_skip_output_comm(b(ForwardMode.EXTEND)))
         with envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.override(False):
             self.assertFalse(_pp_can_skip_output_comm(b(ForwardMode.EXTEND)))
 
