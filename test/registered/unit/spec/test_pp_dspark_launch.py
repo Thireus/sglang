@@ -153,6 +153,8 @@ class TestEveryOtherLaunchKeepsItsRefusal(CustomTestCase):
             enable_multi_layer_eagle=False,
             disaggregation_mode="null",
             min_free_slots_delay=None,
+            # Read by every pipeline launch since upstream #49756.
+            scheduler_recv_interval=1,
         )
         fields.update(overrides)
         return SimpleNamespace(**fields)
@@ -172,6 +174,9 @@ class TestEveryOtherLaunchKeepsItsRefusal(CustomTestCase):
                 check_pipeline_parallel_compat(self._pp(disaggregation_mode="decode"))
             with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
                 check_pipeline_parallel_compat(self._pp(disaggregation_mode="prefill"))
+            # Upstream's refusal for every pipeline launch stands under the flag.
+            with self.assertRaisesRegex(AssertionError, "scheduler-recv-interval"):
+                check_pipeline_parallel_compat(self._pp(scheduler_recv_interval=2))
 
     def test_relay_enabled_is_only_this_launch(self):
         self.assertFalse(
