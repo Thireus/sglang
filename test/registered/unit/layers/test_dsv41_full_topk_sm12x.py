@@ -31,7 +31,10 @@ class TestFullTopKRouting(CustomTestCase):
                 patch.object(v41_indexer, "has_dense_fp4_indexer", return_value=True),
             ):
                 return v41_indexer.make_full_topk_indexer(
-                    token_to_kv_pool=None, req_to_token=None
+                    token_to_kv_pool=None,
+                    req_to_token=None,
+                    index_heads=64,
+                    index_topk=512,
                 )
         finally:
             v41_indexer.is_sm100_or_newer.cache_clear()
