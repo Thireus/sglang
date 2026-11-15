@@ -7,6 +7,8 @@ OpenAIServingChat for processing, and converts responses back to Anthropic forma
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import uuid
@@ -82,6 +84,20 @@ ERROR_TYPE_MAP = {
     502: "api_error",
     503: "overloaded_error",
     504: "api_error",
+}
+
+# Besides ``text/*``, the media types whose base64 ``document`` data is
+# decoded and passed on as text.
+DOCUMENT_TEXT_MEDIA_TYPES = {
+    "application/csv",
+    "application/javascript",
+    "application/json",
+    "application/sql",
+    "application/toml",
+    "application/x-sh",
+    "application/x-yaml",
+    "application/xml",
+    "application/yaml",
 }
 
 
@@ -284,6 +300,93 @@ class AnthropicServing:
 
             return "\n".join(search_parts)
 
+        def _convert_document_to_openai_parts(item: dict[str, Any]) -> list[dict]:
+            """Turn a ``document`` block into text and image parts.
+
+            Text, inline content, base64 text and base64 images are passed
+            on. Anything else (a PDF or another binary format, a ``url`` or
+            ``file`` source) becomes one short note so the request does not
+            fail. Documents are never parsed or fetched here.
+            """
+            lead = "\n".join(
+                f"Document {key}: {item[key].strip()}"
+                for key in ("title", "context")
+                if isinstance(item.get(key), str) and item[key].strip()
+            )
+
+            def _text_parts(text: str) -> list[dict]:
+                return [{"type": "text", "text": f"{lead}\n{text}" if lead else text}]
+
+            source = item.get("source")
+            if not isinstance(source, dict):
+                source = {}
+            source_type = source.get("type")
+            media_type = source.get("media_type")
+            media_type = (
+                media_type.split(";")[0].strip().lower()
+                if isinstance(media_type, str)
+                else ""
+            )
+            data = source.get("data")
+
+            if source_type == "text" and isinstance(data, str):
+                return _text_parts(data)
+
+            if source_type == "content":
+                inner = source.get("content")
+                if isinstance(inner, str):
+                    return _text_parts(inner)
+                parts = []
+                for raw_block in inner if isinstance(inner, list) else []:
+                    if isinstance(raw_block, BaseModel):
+                        raw_block = raw_block.model_dump(exclude_none=True)
+                    if not isinstance(raw_block, dict):
+                        continue
+                    text = raw_block.get("text")
+                    if raw_block.get("type") == "text":
+                        if isinstance(text, str) and text:
+                            parts.append({"type": "text", "text": text})
+                    elif raw_block.get("type") == "image":
+                        image_part = _convert_anthropic_image_source_to_openai_part(
+                            raw_block.get("source")
+                        )
+                        if image_part is not None:
+                            parts.append(image_part)
+                if parts:
+                    return ([{"type": "text", "text": lead}] if lead else []) + parts
+                return _text_parts("[An empty document was attached here.]")
+
+            if source_type == "base64" and isinstance(data, str) and data:
+                if media_type.startswith("image/"):
+                    image_part = _convert_anthropic_image_source_to_openai_part(
+                        {"type": "base64", "media_type": media_type, "data": data}
+                    )
+                    return ([{"type": "text", "text": lead}] if lead else []) + [
+                        image_part
+                    ]
+                if (
+                    media_type.startswith("text/")
+                    or media_type in DOCUMENT_TEXT_MEDIA_TYPES
+                ):
+                    try:
+                        decoded = base64.b64decode("".join(data.split()), validate=True)
+                    except (binascii.Error, ValueError):
+                        decoded = b""
+                    # Data that does not decode, or decodes to nothing, gets
+                    # the note below rather than an empty text part.
+                    if decoded:
+                        return _text_parts(decoded.decode("utf-8", errors="replace"))
+
+            kind = media_type or "unknown type"
+            reason = "this server cannot read it"
+            if source_type in ("url", "file"):
+                kind = f"{source_type} source"
+                reason = "this server does not fetch documents"
+            return _text_parts(
+                f"[A document ({kind}) was attached here. Its content is not "
+                f"included because {reason}.]"
+            )
+
         def _convert_tool_result_content(
             content: Any,
         ) -> tuple[list[Union[str, list[dict]]], str]:
@@ -329,6 +432,11 @@ class AnthropicServing:
                             tool_content_parts.append(
                                 {"type": "text", "text": search_text}
                             )
+                    elif item_type == "document":
+                        for part in _convert_document_to_openai_parts(item):
+                            if part["type"] == "text":
+                                tool_text_parts.append(part["text"])
+                            tool_content_parts.append(part)
 
                 tool_text = "\n".join(tool_text_parts)
                 # GLM templates expand references only at the start of a tool
@@ -407,6 +515,16 @@ class AnthropicServing:
                 for block in anthropic_request.system:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
+                    elif block.type == "document":
+                        # The system prompt is text only, so the image parts
+                        # of a document here are left out.
+                        system_parts.extend(
+                            part["text"]
+                            for part in _convert_document_to_openai_parts(
+                                block.model_dump(exclude_none=True)
+                            )
+                            if part["type"] == "text" and part["text"]
+                        )
 
         if self._merge_inline_system:
             for msg in anthropic_request.messages:
@@ -484,6 +602,13 @@ class AnthropicServing:
                     search_text = _text_from_search_result(block.model_dump())
                     if search_text:
                         content_parts.append({"type": "text", "text": search_text})
+
+                elif block.type == "document":
+                    content_parts.extend(
+                        _convert_document_to_openai_parts(
+                            block.model_dump(exclude_none=True)
+                        )
+                    )
 
                 elif block.type == "tool_use":
                     tool_call = {

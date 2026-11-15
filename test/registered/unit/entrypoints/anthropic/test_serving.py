@@ -1,8 +1,11 @@
 import asyncio
+import base64
 import json
+import socket
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -510,6 +513,427 @@ class TestAnthropicServing(unittest.TestCase):
             [
                 {"type": "tool_reference", "name": "Bash"},
                 {"type": "tool_reference", "name": "Read"},
+            ],
+        )
+
+    PDF_DATA = base64.b64encode(b"%PDF-1.7\n" + b"x" * 64).decode()
+    PNG_DATA = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\0" * 16).decode()
+    PNG_PART = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{PNG_DATA}", "detail": "auto"},
+        "modalities": "image",
+    }
+    PDF_NOTE = (
+        "[A document (application/pdf) was attached here. Its content is not "
+        "included because this server cannot read it.]"
+    )
+
+    def _document_messages(self, *blocks, role="user"):
+        request = self._anthropic_request(
+            stream=False, messages=[{"role": role, "content": list(blocks)}]
+        )
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        return chat_request.model_dump(exclude_none=True)["messages"]
+
+    def test_document_text_source_becomes_text(self):
+        messages = self._document_messages(
+            {
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "abc"},
+            }
+        )
+        self.assertEqual(messages, [{"role": "user", "content": "abc"}])
+
+    def test_document_title_and_context_lead_the_text(self):
+        messages = self._document_messages(
+            {
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "abc"},
+                "title": "Notes",
+                "context": "From the wiki",
+                "citations": {"enabled": True},
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+        self.assertEqual(
+            messages[0]["content"],
+            "Document title: Notes\nDocument context: From the wiki\nabc",
+        )
+
+    def test_document_content_source_is_put_in_place(self):
+        messages = self._document_messages(
+            {"type": "text", "text": "before"},
+            {
+                "type": "document",
+                "source": {
+                    "type": "content",
+                    "content": [
+                        {"type": "text", "text": "page one"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": self.PNG_DATA,
+                            },
+                        },
+                    ],
+                },
+            },
+            {"type": "text", "text": "after"},
+        )
+        self.assertEqual(
+            messages[0]["content"],
+            [
+                {"type": "text", "text": "before"},
+                {"type": "text", "text": "page one"},
+                self.PNG_PART,
+                {"type": "text", "text": "after"},
+            ],
+        )
+        messages = self._document_messages(
+            {"type": "document", "source": {"type": "content", "content": "plain"}}
+        )
+        self.assertEqual(messages[0]["content"], "plain")
+
+    def test_document_base64_text_is_decoded(self):
+        for media_type in (
+            "text/plain",
+            "text/markdown; charset=utf-8",
+            "application/json",
+        ):
+            with self.subTest(media_type=media_type):
+                messages = self._document_messages(
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": base64.b64encode(b'{"a": 1}').decode(),
+                        },
+                    }
+                )
+                self.assertEqual(messages[0]["content"], '{"a": 1}')
+
+    def test_document_base64_image_becomes_image_part(self):
+        messages = self._document_messages(
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": self.PNG_DATA,
+                },
+            }
+        )
+        self.assertEqual(
+            messages[0]["content"],
+            [self.PNG_PART],
+        )
+
+    def test_unreadable_documents_become_a_note(self):
+        cases = {
+            "application/pdf": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": self.PDF_DATA,
+            },
+            "application/zip": {
+                "type": "base64",
+                "media_type": "application/zip",
+                "data": "UEsDBA==",
+            },
+            "file source": {"type": "file", "file_id": "file_123"},
+        }
+        for kind, source in cases.items():
+            with self.subTest(kind=kind):
+                messages = self._document_messages(
+                    {"type": "document", "source": source}
+                )
+                self.assertEqual(len(messages), 1)
+                self.assertIn(
+                    f"[A document ({kind}) was attached", messages[0]["content"]
+                )
+                self.assertIn("not included", messages[0]["content"])
+
+    def test_document_url_source_is_not_fetched(self):
+        url = "https://example.com/report.pdf"
+        with (
+            mock.patch.object(
+                socket.socket, "connect", side_effect=AssertionError("fetched")
+            ),
+            mock.patch.object(
+                socket, "create_connection", side_effect=AssertionError("fetched")
+            ),
+        ):
+            messages = self._document_messages(
+                {"type": "document", "source": {"type": "url", "url": url}}
+            )
+        self.assertEqual(
+            messages[0]["content"],
+            "[A document (url source) was attached here. Its content is not "
+            "included because this server does not fetch documents.]",
+        )
+
+    def test_document_in_assistant_message_becomes_text(self):
+        messages = self._document_messages(
+            {
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "abc"},
+            },
+            role="assistant",
+        )
+        self.assertEqual(messages, [{"role": "assistant", "content": "abc"}])
+
+    def test_pdf_tool_result_late_in_history_becomes_a_note(self):
+        # The coding CLI's Read of a PDF: a tool_result whose content is one
+        # base64 PDF document, here at message 34 of the history.
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(33)
+        ]
+        history.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"file_path": "report.pdf"},
+                    }
+                ],
+            }
+        )
+        history.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": self.PDF_DATA,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        request = self._anthropic_request(stream=False, messages=history)
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+        self.assertEqual(
+            messages[-1],
+            {"role": "tool", "tool_call_id": "toolu_1", "content": self.PDF_NOTE},
+        )
+
+        rendered = []
+
+        class _CountingOpenAI(_FakeOpenAIServingChat):
+            def __init__(self):
+                super().__init__()
+                self.tokenizer_manager.model_config = SimpleNamespace(
+                    is_multimodal=False
+                )
+
+            def _process_messages(self, chat_request, is_multimodal):
+                rendered.append(chat_request)
+                return SimpleNamespace(prompt_ids=[1, 2])
+
+        response = asyncio.run(
+            AnthropicServing(_CountingOpenAI()).handle_count_tokens(
+                AnthropicCountTokensRequest(model="test-model", messages=history),
+                object(),
+            )
+        )
+        self.assertEqual(json.loads(response.body), {"input_tokens": 2})
+        self.assertEqual(rendered[0].messages[-1].content, self.PDF_NOTE)
+
+    def test_tool_result_with_documents_keeps_block_order(self):
+        request = self._tool_result_request(
+            [
+                {"type": "text", "text": "first"},
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": "doc",
+                    },
+                    "title": "T",
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": self.PNG_DATA,
+                    },
+                },
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": self.PDF_DATA,
+                    },
+                },
+            ]
+        )
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(
+            messages[0]["content"],
+            [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "Document title: T\ndoc"},
+                self.PNG_PART,
+                {"type": "text", "text": self.PDF_NOTE},
+            ],
+        )
+
+    def test_document_content_source_skips_non_string_text(self):
+        document = {
+            "type": "document",
+            "source": {
+                "type": "content",
+                "content": [
+                    {"type": "text", "text": 123},
+                    {"type": "text", "text": {"a": 1}},
+                    {"type": "text", "text": "kept"},
+                ],
+            },
+        }
+        request = self._tool_result_request([document])
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+        self.assertEqual(
+            messages, [{"role": "tool", "tool_call_id": "call_1", "content": "kept"}]
+        )
+        self.assertEqual(
+            self._document_messages(document), [{"role": "user", "content": "kept"}]
+        )
+        document["source"]["content"] = [{"type": "text", "text": 123}]
+        self.assertEqual(
+            self._document_messages(document),
+            [{"role": "user", "content": "[An empty document was attached here.]"}],
+        )
+
+    def test_document_base64_text_that_does_not_decode_becomes_a_note(self):
+        for data in ("!!!@@@", "   ", "abc"):
+            with self.subTest(data=data):
+                messages = self._document_messages(
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "text/plain",
+                            "data": data,
+                        },
+                    }
+                )
+                self.assertEqual(
+                    messages[0]["content"],
+                    "[A document (text/plain) was attached here. Its content is "
+                    "not included because this server cannot read it.]",
+                )
+
+    def test_document_base64_script_and_config_types_are_decoded(self):
+        for media_type in (
+            "application/javascript",
+            "application/toml",
+            "application/x-sh",
+            "application/sql",
+        ):
+            with self.subTest(media_type=media_type):
+                messages = self._document_messages(
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": base64.b64encode(b"x = 1\n").decode(),
+                        },
+                    }
+                )
+                self.assertEqual(messages[0]["content"], "x = 1\n")
+
+    def test_document_in_system_list_is_appended_to_system_text(self):
+        request = self._anthropic_request(
+            stream=False,
+            system=[
+                {"type": "text", "text": "Be brief."},
+                {
+                    "type": "document",
+                    "source": {"type": "text", "data": "Use short lines."},
+                    "title": "Style",
+                },
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "content",
+                        "content": [
+                            {"type": "text", "text": "No tables."},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": self.PNG_DATA,
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+        )
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+        messages = chat_request.model_dump(exclude_none=True)["messages"]
+        self.assertEqual(
+            messages[0],
+            {
+                "role": "system",
+                "content": "Be brief.\nDocument title: Style\nUse short lines.\n"
+                "No tables.",
+            },
+        )
+        self.assertEqual(messages[1], {"role": "user", "content": "hello"})
+
+    def test_existing_block_types_parse_as_before(self):
+        blocks = [
+            {"type": "text", "text": "t"},
+            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+            {"type": "tool_use", "id": "a", "name": "n", "input": {}},
+            {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+            {"type": "tool_reference", "tool_name": "n"},
+            {"type": "search_result", "source": "s", "title": "t", "content": []},
+            {"type": "thinking", "thinking": "hmm", "signature": "s"},
+            {"type": "redacted_thinking", "data": "d"},
+            {"type": "document", "source": {"type": "text", "data": "d"}},
+        ]
+        message = AnthropicMessage.model_validate(
+            {"role": "assistant", "content": blocks}
+        )
+        self.assertEqual(
+            [type(block).__name__ for block in message.content],
+            [
+                "TextBlock",
+                "ImageBlock",
+                "ToolUseBlock",
+                "ToolResultBlock",
+                "ToolReferenceBlock",
+                "SearchResultBlock",
+                "ThinkingBlock",
+                "RedactedThinkingBlock",
+                "DocumentBlock",
             ],
         )
 
