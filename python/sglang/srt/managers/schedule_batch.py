@@ -1021,10 +1021,39 @@ class Req(ReqDllmMixin):
             identities = tuple(
                 item.cache_key for item in self.multimodal_inputs.mm_items
             )
+            if (
+                envs.SGLANG_MM_CACHE_NAMESPACE_SHORT_SPANS_ONLY.get()
+                and self._mm_spans_carry_identities()
+            ):
+                # The prompt ids already hold each item's sentinels across its
+                # whole span, so a different item stops the radix match at its
+                # span start and a request that adds media keeps its prefix.
+                self.cache_salt = self._user_cache_salt
+                return
             self.cache_salt = (
                 "sglang-mm-v1:"
                 + structured_digest((self._user_cache_salt, identities)).hex()
             )
+
+    def _mm_spans_carry_identities(self) -> bool:
+        """Whether every media span in the prompt ids is its item's pad sequence.
+
+        Requires at least all four sentinels per span and checks the ids, not just
+        the offsets, so raw placeholder ids, scalar padding and spans the prompt end
+        cuts below four tokens keep the namespace.
+        """
+        ids = self.origin_input_ids
+        n = len(ids)
+        for item in self.multimodal_inputs.mm_items:
+            if not item.pad_values or not item.offsets:
+                return False
+            for start, end in item.offsets:
+                end = min(end + 1, n)
+                if end - start < len(item.pad_values):
+                    return False
+                if list(ids[start:end]) != item.padding_sequence(end - start):
+                    return False
+        return True
 
     def _extend_session_image_inputs(self, image_inputs):
         """Append media while preserving the saved session and its position history."""

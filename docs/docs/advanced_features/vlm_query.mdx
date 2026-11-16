@@ -55,6 +55,9 @@ that collisions are impossible.
   with identical media can still share prefixes; requests with different media
   do not share even their common text prefix. This can increase prefill cost for
   workloads with long shared instructions and changing images.
+  `SGLANG_MM_CACHE_NAMESPACE_SHORT_SPANS_ONLY=1` drops the namespace when every
+  span in the prompt holds its item's full sentinel sequence, so a request that
+  adds an image keeps the earlier text and media prefix.
 - Pin model revisions when sharing encoder caches. Clear caches or restart when
   replacing weights or processor implementations in place; a configuration
   fingerprint is not a checksum of all model weights.

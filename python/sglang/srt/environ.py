@@ -1887,6 +1887,13 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Keep the request's own cache_salt instead of the per-media KV namespace when
+    # every media span in the prompt ids is the item's full sentinel sequence (at
+    # least the four 62-bit values), so a request that adds an image keeps the
+    # prefix of the one before it. Needs models whose media enter only as
+    # embeddings at their own positions; a match that ends one to three tokens
+    # into another item's span after a sentinel collision is not ruled out.
+    SGLANG_MM_CACHE_NAMESPACE_SHORT_SPANS_ONLY = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
