@@ -947,6 +947,10 @@ class Envs:
     SGLANG_HUGEPAGE_MODE = EnvStr("")
     # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
     SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
+    # DeepSeek-V4.1 HiCache under pipeline parallelism: a stage that keeps copies
+    # of earlier stages' ratio-1/2 producers loads their host copies at its first
+    # transfer step. Off, such a stage refuses --enable-hierarchical-cache.
+    SGLANG_DSV41_PP_HICACHE = EnvBool(False)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE = EnvFloat(None)
 

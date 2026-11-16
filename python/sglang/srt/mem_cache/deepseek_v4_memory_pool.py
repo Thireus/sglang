@@ -2051,7 +2051,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def wait_layer_transfer(self, layer_id: int) -> None:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            # An earlier stage's producer kept here (replayed_layers) loads at
+            # the stage's first step; a negative step would pick an event from
+            # the end of the list.
+            self.layer_transfer_counter.wait_until(max(0, layer_id - self.start_layer))
 
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)

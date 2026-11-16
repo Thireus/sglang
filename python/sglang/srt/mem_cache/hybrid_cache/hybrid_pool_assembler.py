@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
@@ -597,11 +598,51 @@ def _check_dsv4_indexer_page_size(key: DSV4PagedBufferInfo, page_size: int) -> N
         )
 
 
+def _dsv41_replayed_layer_mapping(
+    layer_ids: tuple[int, ...], start_layer: int
+) -> dict[int, int]:
+    """Transfer step -> host layer of a ratio-1/2 region whose layers include
+    producers of earlier pipeline stages.
+
+    Under PP a DeepSeek-V4.1 stage keeps its own copy of the compressed KV and
+    index keys of ratio-1/2 producers that sit on earlier stages
+    (deepseek_v41_pp_sources), so the region lists layers below the stage's
+    first layer. The stage-local mapping gives them negative steps, which the
+    per-layer load (L2TransferEngine.submit_host_to_device) never visits, and
+    a host hit would leave their device rows stale. They load at step 0
+    instead: the stage replays them before its first layer, and every layer
+    that reads them comes after it.
+    """
+    mapping = {}
+    replayed = []
+    for index, layer in enumerate(layer_ids):
+        if layer < start_layer:
+            replayed.append(index)
+        else:
+            mapping[layer - start_layer] = index
+    if not replayed:
+        return mapping
+    if len(replayed) > 1 or 0 in mapping:
+        raise ValueError(
+            "DeepSeek-V4.1 HiCache under pipeline parallelism: a ratio-1/2 "
+            f"region of the stage starting at layer {start_layer} holds layers "
+            f"{tuple(layer_ids)}; only one earlier-stage producer on a free "
+            "first step is supported."
+        )
+    mapping[0] = replayed[0]
+    return mapping
+
+
 def _dsv4_low_ratio_regions(
-    kvcache: Any, infos: dict[PoolName, DevicePoolInfo], page_size: int
+    kvcache: Any,
+    infos: dict[PoolName, DevicePoolInfo],
+    page_size: int,
+    *,
+    replayed_at_first_step: bool = False,
 ) -> list[tuple[PoolName, Any, list, dict[int, int]]]:
     """(name, device_pool, buffers, layer_mapping) per shared source KV and
-    indexer buffer group, in FULL-page units."""
+    indexer buffer group, in FULL-page units. With replayed_at_first_step an
+    earlier stage's producer kept here loads at the stage's first step."""
     import torch
 
     regions = []
@@ -631,7 +672,11 @@ def _dsv4_low_ratio_regions(
         slots_per_page = page_size // ratio
         assert slots_per_page % key.page_slots == 0
         index_pages_per_full_page = slots_per_page // key.page_slots
-        layer_mapping = _dsv4_transfer_layer_mapping(kv.layer_ids, kvcache.start_layer)
+        layer_mapping = (
+            _dsv41_replayed_layer_mapping(kv.layer_ids, kvcache.start_layer)
+            if replayed_at_first_step
+            else _dsv4_transfer_layer_mapping(kv.layer_ids, kvcache.start_layer)
+        )
         regions.append(
             (
                 names[0],
@@ -663,11 +708,13 @@ def _dsv4_low_ratio_entries(
     page_size: int,
     num_host_pages: int,
     transfer_layer_id_max: int,
+    *,
+    replayed_at_first_step: bool = False,
 ):
     """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
     entries = []
     for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
-        kvcache, infos, page_size
+        kvcache, infos, page_size, replayed_at_first_step=replayed_at_first_step
     ):
         entries.append(
             build_pool_entry(
@@ -806,6 +853,29 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = _dsv4_transfer_layer_mapping(
         kvcache.stage_layer_ids, kvcache.start_layer
     )
+    # DeepSeek-V4.1 under PP: producers of earlier stages this stage keeps a
+    # copy of (deepseek_v41_pp_sources). Their host copies load only with
+    # SGLANG_DSV41_PP_HICACHE; without it the stage refuses rather than serve
+    # a host hit over stale rows.
+    replayed_layers = tuple(getattr(kvcache, "replayed_layers", ()) or ())
+    if replayed_layers:
+        stage = (kvcache.stage_layer_ids[0], kvcache.stage_layer_ids[-1] + 1)
+        if not envs.SGLANG_DSV41_PP_HICACHE.get():
+            raise ValueError(
+                "DeepSeek-V4.1 HiCache under pipeline parallelism: the stage "
+                f"of layers [{stage[0]}, {stage[1]}) replays earlier stages' "
+                f"producers {replayed_layers}, and the per-layer load never "
+                "restores the compressed KV and index keys it keeps for them. "
+                "Set SGLANG_DSV41_PP_HICACHE=1 to load them at the stage's "
+                "first step, or launch without --enable-hierarchical-cache."
+            )
+        logger.info(
+            "DeepSeek-V4.1 HiCache, PP stage layers [%d, %d): what earlier "
+            "stages' producers %s write here loads at the stage's first step",
+            stage[0],
+            stage[1],
+            replayed_layers,
+        )
     swa = infos.get(PoolName.SWA)
     swa_info = swa.buffer_info if swa is not None else None
     mtp_swa_device_buffers = []
@@ -1072,7 +1142,12 @@ def build_deepseek_v4_hicache_stack(
 
     entries.extend(
         _dsv4_low_ratio_entries(
-            kvcache, infos, page_size, num_host_pages, transfer_layer_id_max
+            kvcache,
+            infos,
+            page_size,
+            num_host_pages,
+            transfer_layer_id_max,
+            replayed_at_first_step=bool(replayed_layers),
         )
     )
     entries.extend(
