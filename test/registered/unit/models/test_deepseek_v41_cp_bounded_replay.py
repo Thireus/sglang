@@ -91,7 +91,9 @@ class TestCpBoundedReplayOutput(CustomTestCase):
                     body._can_run_tbo = mock.Mock(return_value=False)
                     body.norm = torch.nn.Identity()
 
-                    def layers(*args):
+                    # The layer loop also takes the previous pipeline stage's
+                    # pre-mix, by keyword (None here: no stage plan).
+                    def layers(*args, prev_pre=None):
                         packer = args[-1]
                         if packer is not None:
                             packer.slot(markers).copy_(markers + 5000)
