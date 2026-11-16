@@ -268,6 +268,13 @@ def _build_deepseek_v4_device_pool_group(
 
     if isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
         raise ValueError("The direct external linker does not support HiSparse.")
+    replayed_layers = tuple(getattr(kvcache, "replayed_layers", ()) or ())
+    if replayed_layers:
+        # Their stage-local transfer steps are negative: a load would skip them.
+        raise ValueError(
+            "The direct external linker does not support a DeepSeek-V4.1 "
+            f"pipeline stage that replays earlier stages' producers {replayed_layers}."
+        )
 
     infos = _dsv4_pool_infos(kvcache)
     # Encoder SWA replay keeps the target window per request; the draft SWA is
