@@ -27,6 +27,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.runtime_context import get_context, get_schedule
@@ -175,12 +176,13 @@ class TestScheduler(CustomTestCase):
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
         s.waiting_queue = IndexedReqList(ListKind.WAITING, abort=lambda *a, **k: None)
-        s.waiting_queue.join(waiting)
+        # Requests enter a list through move (upstream #49677).
+        move(waiting, s.waiting_queue)
         # The chunked slot is a request list since upstream #43910.
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=lambda *a, **k: None)
         # chunked_req reads the list (its setter went in upstream #49623).
         if chunked_req is not None:
-            s.chunked_reqs.join([chunked_req])
+            move([chunked_req], s.chunked_reqs)
         # A last chunk in the batch moves its request here (upstream #49496).
         s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         s.min_free_slots_delayer = None
@@ -218,7 +220,12 @@ class TestScheduler(CustomTestCase):
         s.enable_overlap = False
         s.spec_algorithm = None
         s.req_to_token_pool = SimpleNamespace(available_size=lambda: 4)
-        s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        # Rows promised to beam members, of running groups and of leaders
+        # admitted to the prefill being built (upstream #46855): none here.
+        s.beam_coordinator = SimpleNamespace(
+            pending_member_rows=lambda batch: 0,
+            pending_member_rows_of=lambda reqs: 0,
+        )
         s.running_reqs = KeyedReqList(ListKind.DECODING)
         return s
 
@@ -314,8 +321,8 @@ class TestScheduler(CustomTestCase):
         )
         s = self._scheduler(req, waiting=[waiting])
         s.enable_priority_preemption = True
-        s._add_request_to_queue = lambda r, is_retracted=False: s.waiting_queue.join(
-            [r]
+        s._add_request_to_queue = lambda r, is_retracted=False: move(
+            [r], s.waiting_queue
         )
         s.req_to_token_pool = SimpleNamespace(
             available_size=lambda: CAP * NUM_MICRO_BATCHES - CAP - 1
