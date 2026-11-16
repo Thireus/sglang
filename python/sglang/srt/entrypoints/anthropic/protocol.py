@@ -110,6 +110,18 @@ class RedactedThinkingBlock(BaseModel):
     data: Optional[str] = None
 
 
+class DocumentBlock(BaseModel):
+    type: Literal["document"] = "document"
+    # ``source`` is a ``base64``, ``text``, ``content``, ``url`` or ``file``
+    # source. Kept loosely typed like ImageBlock.source; the serving layer
+    # inlines what it can read and puts a short note in place of the rest.
+    source: Optional[Union[dict[str, Any], str]] = None
+    title: Optional[str] = None
+    context: Optional[str] = None
+    citations: Optional[dict[str, Any]] = None
+    cache_control: Optional[dict[str, Any]] = None
+
+
 AnthropicContentBlock = Annotated[
     Union[
         TextBlock,
@@ -120,6 +132,7 @@ AnthropicContentBlock = Annotated[
         SearchResultBlock,
         ThinkingBlock,
         RedactedThinkingBlock,
+        DocumentBlock,
     ],
     Field(discriminator="type"),
 ]
