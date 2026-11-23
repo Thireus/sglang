@@ -57,6 +57,14 @@ if _is_cuda:
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
     from sglang.kernels.ops.moe.gguf_moe_vec import gguf_moe_a8_vec as ggml_moe_a8_vec
     from sglang.kernels.ops.moe.gguf_moe_weights import apply_gguf_moe_weights
+    from sglang.kernels.ops.quantization.gguf_dequantize import (
+        GGUF_DEQUANTIZE_TYPES,
+        gguf_dequantize,
+        gguf_dequantize_columns,
+        gguf_dequantize_matmul,
+        gguf_dequantize_reserve,
+        gguf_dequantize_warmup,
+    )
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -185,6 +193,14 @@ IMATRIX_QUANT_TYPES = {
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# ik_llama.cpp types (ggml ids, gguf-py has no member for them) with no matmul
+# kernel of their own: a JIT kernel dequantises the packed rows into a scratch
+# buffer at every call and a dense matmul follows. The packed weights stay
+# resident, because the dense form of a whole model (2 bytes a weight in bf16)
+# does not fit beside them; an embedding lookup dequantises only the rows it
+# reads. CUDA only. SGLANG_GGUF_DEQUANT_TYPES names which of them the loader
+# lets through (sglang.srt.model_loader.gguf_ik).
+JIT_DEQUANT_TYPES = frozenset(GGUF_DEQUANTIZE_TYPES) if _is_cuda else frozenset()
 
 
 def ggml_moe_get_block_size(qweight_type: int) -> int:
@@ -201,6 +217,8 @@ def dequantize_gguf_weight(
     qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
 ) -> torch.Tensor:
     """Dequantize a packed GGUF matrix using its inferred logical shape."""
+    if qweight_type in JIT_DEQUANT_TYPES:
+        return gguf_dequantize(qweight, qweight_type, dtype)
     block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
     shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
     return ggml_dequantize(qweight, qweight_type, *shape, dtype)
@@ -230,6 +248,9 @@ def fused_mul_mat_gguf(
     elif qweight_type in DEQUANT_TYPES:
         weight = dequantize_gguf_weight(qweight, qweight_type, x.dtype)
         y = x @ weight.T
+    # ik types without a matmul kernel: dequantize into the shared scratch
+    elif qweight_type in JIT_DEQUANT_TYPES:
+        y = gguf_dequantize_matmul(x, qweight, qweight_type)
     else:
         # Raise an error if the quantization type is not supported.
         # Might be useful if llama.cpp adds a new quantization type.
@@ -393,6 +414,13 @@ def apply_gguf_embedding(
             quant, qweight_type, hidden_size, x_flat.shape[0], dtype
         )
         return dequant.view(*x.shape, hidden_size)
+    elif qweight_type in JIT_DEQUANT_TYPES:
+        # only the looked-up rows are dequantized, into a tensor of their own
+        x_flat = x.flatten()
+        assert hidden_size == gguf_dequantize_columns(qweight_type, qweight.shape[1])
+        quant = torch.index_select(qweight, dim=0, index=x_flat)
+        dequant = gguf_dequantize(quant, qweight_type, dtype or torch.float16)
+        return dequant.view(*x.shape, hidden_size)
     else:
         qweight_type = WeightType(qweight_type)
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
@@ -456,7 +484,11 @@ class GGUFLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         qweight_type = layer.qweight_type.weight_type
-        if not (qweight_type in UNQUANTIZED_TYPES or qweight_type in DEQUANT_TYPES):
+        if not (
+            qweight_type in UNQUANTIZED_TYPES
+            or qweight_type in DEQUANT_TYPES
+            or qweight_type in JIT_DEQUANT_TYPES
+        ):
             qweight_type = WeightType(qweight_type)
             raise ValueError(
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
@@ -464,6 +496,38 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+        self._prepare_jit_dequant(layer)
+
+    def _prepare_jit_dequant(self, layer: torch.nn.Module):
+        """Build the dequantize kernels of this layer's ik types and size the
+        scratch buffer for its weights, before any forward or graph capture."""
+        qweight = layer.qweight
+        if isinstance(qweight, UninitializedParameter):
+            return
+        shard_types = getattr(layer.qweight_type, "shard_weight_type", {})
+        offsets = getattr(qweight, "shard_offset_map", None)
+        if shard_types and offsets:
+            tensors = [
+                (shard_types[idx], end - start, size)
+                for idx, (start, end, size) in offsets.items()
+            ]
+        else:
+            tensors = [
+                (layer.qweight_type.weight_type, qweight.shape[0], qweight.shape[-1])
+            ]
+        tensors = [t for t in tensors if t[0] in JIT_DEQUANT_TYPES]
+        if not tensors:
+            return
+        dtype = getattr(self, "params_dtype", None) or torch.get_default_dtype()
+        gguf_dequantize_warmup(dtype, [t[0] for t in tensors])
+        # An embedding table is sized too: a tied output head multiplies with it.
+        for qweight_type, rows, row_bytes in tensors:
+            gguf_dequantize_reserve(
+                qweight.device,
+                dtype,
+                rows,
+                gguf_dequantize_columns(qweight_type, row_bytes),
+            )
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""

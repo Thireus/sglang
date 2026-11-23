@@ -177,16 +177,20 @@ REPACKS: Dict[str, Tuple[str, int]] = {
 }
 
 # Types that look like repacks by name but are not a byte-exact regrouping of
-# a base type, with the reason a loader gives when it meets one.
+# a base type: what each one is instead. They have dequantisers of their own.
 NOT_REPACKS: Dict[str, str] = {
     "IQ1_S_R4": "is a quantiser of its own (block of 32, an fp16 scale a row), "
-    "not IQ1_S regrouped by rows, so it needs kernels of its own",
+    "not IQ1_S regrouped by rows",
     "IQ1_M_R4": "is a quantiser of its own (block of 32, an fp16 scale a row), "
-    "not IQ1_M regrouped by rows, so it needs kernels of its own",
+    "not IQ1_M regrouped by rows",
     "Q8_K_R8": "stores each block scale as fp16 where Q8_K has fp32 and drops "
-    "the block sums, so no Q8_K bytes can be restored from it; it needs a "
-    "dequantiser of its own",
+    "the block sums, so no Q8_K bytes can be restored from it",
 }
+
+# The rows these three types store together, interleaved (name -> rows a
+# group). rowgroups.py regroups them at load into one row after the other, of
+# the same ``row_size``, so that a row is self-contained like any other type's.
+ROW_GROUPS: Dict[str, int] = {"IQ1_S_R4": 4, "IQ1_M_R4": 4, "Q8_K_R8": 8}
 
 # Ids a reader cannot size without knowing which ik_llama.cpp a file came from.
 AMBIGUOUS_IDS: Dict[int, str] = {
@@ -209,6 +213,16 @@ GGUF_SERVED_IDS = frozenset(
 
 # Types the hot/cold cold tier serves (hotcold_manifest.COLD_GGML_TYPES).
 HOTCOLD_COLD_IDS = frozenset({22, 144, 145})
+
+# Types with no matmul kernel of their own that the GGUF model path serves by
+# dequantising on the GPU at every call and multiplying dense
+# (kernels/ops/quantization/gguf_dequantize.py GGUF_DEQUANTIZE_TYPES; a test
+# keeps the two equal). SGLANG_GGUF_DEQUANT_TYPES names the ones in use.
+GGUF_DEQUANT_IDS = frozenset(
+    {133, 134, 135, 137, 138, 139, 140, 141, 144, 145, 146, 151, 152}
+    | {153, 154, 155, 156, 157, 158, 219, 229, 399}
+)
+DEQUANT_SWITCH = "SGLANG_GGUF_DEQUANT_TYPES"
 
 _KT_TAIL = {"IQ1_KT", "IQ2_KT", "IQ3_KT", "IQ4_KT"}
 
@@ -328,24 +342,52 @@ def row_size(t, ne0: int) -> int:
     return t.row_meta + t.type_size * ne0 // t.blck_size
 
 
+def dequant_served_ids() -> frozenset:
+    """The ids of ``GGUF_DEQUANT_IDS`` that SGLANG_GGUF_DEQUANT_TYPES lets through.
+
+    "all" (the default) is every one, "none" is none, anything else is a comma
+    separated list of type names; a name that is not such a type is an error.
+    """
+    from sglang.srt.environ import envs
+
+    value = (envs.SGLANG_GGUF_DEQUANT_TYPES.get() or "").strip()
+    if value.lower() == "all":
+        return GGUF_DEQUANT_IDS
+    if value.lower() in ("", "none"):
+        return frozenset()
+    ids = set()
+    for name in value.split(","):
+        t = BY_NAME.get(name.strip().upper())
+        if t is None or int(t) not in GGUF_DEQUANT_IDS:
+            known = ", ".join(sorted(BY_ID[i].name for i in GGUF_DEQUANT_IDS))
+            raise GGMLTypeError(
+                f"{DEQUANT_SWITCH}={value!r}: {name.strip()!r} is not a type "
+                f"served by dequantising; the types are {known}"
+            )
+        ids.add(int(t))
+    return frozenset(ids)
+
+
 def served_today(t) -> bool:
-    """Whether SGLang's GGUF model path has kernels for this (base) type."""
-    return int(t) in GGUF_SERVED_IDS
+    """Whether SGLang's GGUF model path serves this (base) type: with kernels
+    of its own, or by dequantising when the switch names it."""
+    return int(t) in GGUF_SERVED_IDS or int(t) in dequant_served_ids()
 
 
 def why_not_served(t) -> str:
-    """The reason the GGUF model path cannot serve type ``t`` yet."""
+    """The reason the GGUF model path cannot serve type ``t``."""
     if not isinstance(t, GGMLType):
         t = by_id(int(t))
-    if t.name in NOT_REPACKS:
-        return f"{t.name} {NOT_REPACKS[t.name]}"
     if t.name in REPACKS:
         base = BY_NAME[REPACKS[t.name][0]]
         return f"{t.name} is {base.name} regrouped by rows, and " + why_not_served(base)
-    if int(t) in HOTCOLD_COLD_IDS:
+    if int(t) in GGUF_DEQUANT_IDS:
+        from sglang.srt.environ import envs
+
         return (
-            f"{t.name} has no dense GGUF kernel yet: SGLang serves it only as "
-            f"the cold tier of a hot/cold checkpoint"
+            f"{t.name} has no matmul kernel of its own; SGLang serves it by "
+            f"dequantising on the GPU at every call, and {DEQUANT_SWITCH}="
+            f"{envs.SGLANG_GGUF_DEQUANT_TYPES.get()!r} leaves it out"
         )
     return (
         f"{t.name} can be read, but SGLang has no dequantise or matmul kernel "

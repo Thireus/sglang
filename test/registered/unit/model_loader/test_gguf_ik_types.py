@@ -169,11 +169,17 @@ class TestTypeTable(CustomTestCase):
             T.by_id(142)
         with self.assertRaisesRegex(T.GGMLTypeError, "ggml type id 4000 is unknown"):
             T.by_id(4000)
-        self.assertIn("own", T.why_not_served(T.BY_NAME["IQ1_S_R4"]))
-        self.assertIn("cold tier", T.why_not_served(T.BY_NAME["IQ4_KS"]))
+        # types SGLang can read and has no kernel for at all
+        msg = T.why_not_served(T.BY_NAME["Q8_KV_R8"])
+        self.assertIn("no dequantise or matmul kernel", msg)
+        self.assertIn("no dequantise or matmul kernel", T.why_not_served(136))
+        # a type served by dequantising is refused only when the switch leaves it out
+        for name in ("IQ1_S_R4", "IQ4_KS", "IQ3_KS", "Q8_K_R8"):
+            self.assertTrue(T.served_today(T.BY_NAME[name]), name)
+            self.assertIn("dequantising on the GPU", T.why_not_served(T.BY_NAME[name]))
         msg = T.why_not_served(T.BY_NAME["IQ2_K_R4"])
         self.assertIn("IQ2_K regrouped by rows", msg)
-        self.assertIn("no dequantise or matmul kernel", msg)
+        self.assertIn("SGLANG_GGUF_DEQUANT_TYPES", msg)
 
     def test_ggml_type_behaves_like_an_int(self):
         import pickle

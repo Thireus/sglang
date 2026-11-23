@@ -15,6 +15,7 @@ import gguf
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.gguf_ik import (
     GGMLTypeError,
     GGUFFile,
@@ -29,6 +30,7 @@ from sglang.srt.model_loader.gguf_ik import (
     served_type,
 )
 from sglang.srt.model_loader.gguf_ik import types as T
+from sglang.srt.model_loader.gguf_ik.rowgroups import split_row_groups
 from sglang.srt.model_loader.weight_utils import (
     get_gguf_extra_tensor_names,
     gguf_quant_weights_iterator,
@@ -249,13 +251,24 @@ class TestIkTypes(_Tmp):
         st, data = served_tensor(up)
         self.assertIs(st, gguf.GGMLQuantizationType.Q4_K)
         np.testing.assert_array_equal(data, base_rows)
-        with self.assertRaisesRegex(
-            GGMLTypeError,
-            r"blk.0.ffn_gate.weight: type IQ4_KS \(ggml id 144.*cold tier",
-        ):
-            served_type(gate)
-        with self.assertRaisesRegex(GGMLTypeError, "IQ1_S_R4 .*quantiser of its own"):
-            served_type(q)
+        # ik types served by dequantising: IQ4_KS rows pass as they are, IQ1_S_R4
+        # groups come out as self-contained rows of the same size
+        self.assertIs(served_type(gate), T.BY_NAME["IQ4_KS"])
+        st, data = served_tensor(gate)
+        self.assertIs(st, T.BY_NAME["IQ4_KS"])
+        np.testing.assert_array_equal(data, gate.data)
+        self.assertIs(served_type(q), T.BY_NAME["IQ1_S_R4"])
+        st, data = served_tensor(q)
+        self.assertEqual(data.shape, q.data.shape)
+        np.testing.assert_array_equal(data, split_row_groups(st, q.data))
+        self.assertFalse(np.array_equal(data, q.data))
+        with envs.SGLANG_GGUF_DEQUANT_TYPES.override("IQ1_S_R4"):
+            self.assertIs(served_type(q), T.BY_NAME["IQ1_S_R4"])
+            with self.assertRaisesRegex(
+                GGMLTypeError,
+                r"blk.0.ffn_gate.weight: type IQ4_KS \(ggml id 144.*leaves it out",
+            ):
+                served_type(gate)
         name_map = {"blk.0.ffn_up.weight": "model.layers.0.mlp.up_proj.weight"}
         got = dict(gguf_quant_weights_iterator(self.p("r4.gguf"), name_map))
         self.assertEqual(
@@ -266,8 +279,35 @@ class TestIkTypes(_Tmp):
             got["model.layers.0.mlp.up_proj.qweight"].numpy(), base_rows
         )
         name_map["blk.0.ffn_gate.weight"] = "model.layers.0.mlp.gate_proj.weight"
-        with self.assertRaisesRegex(GGMLTypeError, "IQ4_KS"):
-            list(gguf_quant_weights_iterator(self.p("r4.gguf"), name_map))
+        got = dict(gguf_quant_weights_iterator(self.p("r4.gguf"), name_map))
+        self.assertEqual(int(got["model.layers.0.mlp.gate_proj.qweight_type"]), 144)
+        np.testing.assert_array_equal(
+            got["model.layers.0.mlp.gate_proj.qweight"].numpy(), gate.data
+        )
+        with envs.SGLANG_GGUF_DEQUANT_TYPES.override("none"):
+            with self.assertRaisesRegex(GGMLTypeError, "IQ4_KS"):
+                list(gguf_quant_weights_iterator(self.p("r4.gguf"), name_map))
+
+    def test_types_still_refused(self):
+        kt = T.BY_NAME["IQ2_KT"]
+        write_gguf(
+            self.p("x.gguf"),
+            [
+                ("a.weight", (256, 4), 398, rand_bytes(4 * T.row_size(398, 256))),
+                ("b.weight", (288, 2), int(kt), rand_bytes(2 * T.row_size(kt, 288))),
+                ("c.weight", (512, 2), int(kt), rand_bytes(2 * T.row_size(kt, 512))),
+            ],
+        )
+        a, b, c = IkGGUFReader(self.p("x.gguf")).tensors
+        with self.assertRaisesRegex(
+            GGMLTypeError, "a.weight: type Q8_KV_R8 .*no dequantise or matmul kernel"
+        ):
+            served_type(a)
+        with self.assertRaisesRegex(
+            GGMLTypeError, "b.weight: type IQ2_KT .*a row of 288 values .*tail"
+        ):
+            served_type(b)
+        self.assertIs(served_type(c), kt)
 
     def test_moe_experts_of_a_repack(self):
         r4 = T.BY_NAME["IQ4_NL_R4"]
@@ -411,12 +451,20 @@ class TestSplitSets(_Tmp):
             )
         )
         self.assertEqual(got["model.norm.weight"].numpy().tobytes(), tens[2][3])
-        with self.assertRaisesRegex(GGMLTypeError, "IQ4_KS"):
-            dict(
-                gguf_quant_weights_iterator(
-                    self.p(names[0]), {"blk.0.ffn_up.weight": "x.weight"}
-                )
+        got = dict(
+            gguf_quant_weights_iterator(
+                self.p(names[0]), {"blk.0.ffn_up.weight": "x.weight"}
             )
+        )
+        self.assertEqual(int(got["x.qweight_type"]), 144)
+        self.assertEqual(tuple(got["x.qweight"].shape), (4, 276))
+        with envs.SGLANG_GGUF_DEQUANT_TYPES.override("none"):
+            with self.assertRaisesRegex(GGMLTypeError, "IQ4_KS"):
+                dict(
+                    gguf_quant_weights_iterator(
+                        self.p(names[0]), {"blk.0.ffn_up.weight": "x.weight"}
+                    )
+                )
 
 
 if __name__ == "__main__":

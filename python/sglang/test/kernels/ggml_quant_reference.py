@@ -10,8 +10,9 @@ order, so that each product rounds exactly where the C code rounds.
 
 Covered: every base type of the ik_llama.cpp quant collection (legacy Q4_0 to
 Q8_0 and Q6_0, Q8_KV, the K-quants, the IQ codebook types, ik's K / KS / KL /
-KSS non-linear types, the KT trellis types, the BN ternary types) and the two
-row-interleaved types that are quantisers of their own, IQ1_S_R4 and IQ1_M_R4.
+KSS non-linear types, the KT trellis types, the BN ternary types) and the three
+row-interleaved types that are not a base type regrouped: IQ1_S_R4 and IQ1_M_R4
+(quantisers of their own) and Q8_K_R8 (half scales where Q8_K has floats).
 The other _R4 / _R8 types are repacks of a base type and are not covered here.
 
 Three facts a reader of the C code needs:
@@ -24,7 +25,8 @@ Three facts a reader of the C code needs:
   of a half scale and a small integer is exact, so both give the same bits.
 * Row headers. Several ik types start each row with a float or half scale
   (``TYPES[t].header`` bytes); IQ1_S_R4 / IQ1_M_R4 store four rows as one
-  group, four half scales first, then the interleaved blocks.
+  group, four half scales first, then the interleaved blocks; Q8_K_R8 stores
+  eight rows as one group of blocks, each with its eight half scales first.
 * BN ternary types. libggml's CPU ``dequantize_row_iq1_bn / _iq2_bn`` take a
   pointer to the blocks and return the ternary codes without the row scale
   (the scale is applied in the dot product; ik's CUDA dequantiser applies it).
@@ -57,9 +59,9 @@ class QType:
     type_id: int
     name: str
     block: int  # values per block
-    block_bytes: int  # bytes per block (for the R4 types: per block of ONE row)
+    block_bytes: int  # bytes per block (row-group types: per block of ONE row)
     header: int = 0  # bytes before the first block of a row (per row)
-    rows: int = 1  # rows stored together as one group (IQ1_S_R4 / IQ1_M_R4: 4)
+    rows: int = 1  # rows stored together as one group (IQ1_*_R4: 4, Q8_K_R8: 8)
     fused: bool = False  # has a multiply-add whose rounding depends on FMA contraction
 
     def row_bytes(self, k: int) -> int:
@@ -109,6 +111,7 @@ _TYPE_LIST = (
     QType(158, "IQ1_KT", QK_K, 56, header=4),
     QType(219, "IQ1_S_R4", 32, 6, header=2, rows=4),
     QType(229, "IQ1_M_R4", 32, 7, header=2, rows=4),
+    QType(399, "Q8_K_R8", QK_K, 258, rows=8),
 )
 TYPES: Dict[int, QType] = {t.type_id: t for t in _TYPE_LIST}
 TYPE_IDS: Dict[str, int] = {t.name: t.type_id for t in _TYPE_LIST}
@@ -869,6 +872,19 @@ def _iq1_m_r4(g, k):
     return np.moveaxis(v.reshape(lead, nb, 4, 32), 2, 1).reshape(lead, 4, k)
 
 
+def _q8_k_r8(g, k):
+    """g: uint8 [G, nb * (16 + 8 * 256)] (eight rows) -> float32 [G, 8, k]."""
+    lead = g.shape[0]
+    nb = k // QK_K
+    blk = g.reshape(lead, nb, 16 + 8 * QK_K)
+    d = _f16(blk[..., 0:16].reshape(lead, nb, 8, 2))  # [G, nb, row]
+    qs = _i8(blk[..., 16:]).reshape(lead, nb, QK_K // 4, 8, 4)  # [G, nb, ib, row, i]
+    v = d[:, :, None, :, None] * _fl(qs)
+    return np.moveaxis(v.astype(F32), 3, 1).reshape(lead, 8, k)
+
+
+_GROUP_FN: Dict[int, Callable] = {219: _iq1_s_r4, 229: _iq1_m_r4, 399: _q8_k_r8}
+
 # --------------------------------------------------------------------------- dispatch
 _BLOCK_FN: Dict[int, Callable] = {
     2: _q4_0, 3: _q4_1, 6: _q5_0, 7: _q5_1, 8: _q8_0, 133: _q6_0,
@@ -910,10 +926,9 @@ def dequantize(
     rows = _as_rows(t, data, k, nrows)
     n = rows.shape[0]
     fused = t.fused if fused is None else fused
-    if t.rows == 4:
-        groups = rows.reshape(n // 4, 4 * rows.shape[1])
-        fn = _iq1_s_r4 if t.type_id == 219 else _iq1_m_r4
-        return fn(groups, k).reshape(n, k)
+    if t.rows > 1:
+        groups = rows.reshape(n // t.rows, t.rows * rows.shape[1])
+        return _GROUP_FN[t.type_id](groups, k).reshape(n, k)
     nb = k // t.block
     hdr = rows[:, : t.header]
     blk = rows[:, t.header :].reshape(n, nb, t.block_bytes)
@@ -968,6 +983,12 @@ def random_rows(
         raise ValueError(f"{t.name}: rows come in groups of {t.rows}")
     a = rng.integers(0, 256, size=(nrows, rb), dtype=np.uint8)
     nb = k // t.block
+    if t.type_id == 399:  # eight half scales at the start of every group block
+        g = a.reshape(nrows // 8, nb, 16 + 8 * QK_K)
+        d = _scales(rng, (nrows // 8, nb, 8), 1e-3, 1e-2)
+        for i in range(8):
+            _put_f16(g[:, :, 2 * i : 2 * i + 2], d[:, :, i])
+        return a
     if t.rows == 4:
         g = a.reshape(nrows // 4, 4 * rb)
         d = _scales(rng, (nrows // 4, 4), 1e-3, 1e-2)
@@ -1012,7 +1033,7 @@ class LibGGML:
     """The libggml calls the tests compare against, through ctypes.
 
     ``dequant`` calls the type's CPU ``dequantize_row_<name>`` exactly as ggml
-    does for one row (one group of four rows for the R4 types); for the BN
+    does for one row (one group of four or eight rows for the row-group types); for the BN
     types it is given the pointer past the row header and returns the codes.
     """
 
