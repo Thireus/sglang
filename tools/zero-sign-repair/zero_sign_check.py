@@ -84,7 +84,14 @@ def cmd_demo(a):
         print(f"no repair: {why}")
         return 0 if before["verdict"] == "PASS" else 1
     zs.apply_zero_signs(
-        q, t, n, k, pos0 | neg0, zs.target_negative("source", pos0, neg0), rb
+        q,
+        t,
+        n,
+        k,
+        pos0 | neg0,
+        zs.target_negative("source", pos0, neg0),
+        rb,
+        g.row_header(t),
     )
     after = zs.matrix_stats(x, g.dequant(t, q, n, k), pos0, neg0)
     print(

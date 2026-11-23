@@ -19,6 +19,19 @@ from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+# The repository's bit-exact numpy dequantisers (no libggml needed), when the
+# tool runs from a checkout of the repository.
+REF_PATH = os.path.join(
+    HERE,
+    "..",
+    "..",
+    "..",
+    "python",
+    "sglang",
+    "test",
+    "kernels",
+    "ggml_quant_reference.py",
+)
 
 import numpy as np  # noqa: E402
 import zero_sign as zs  # noqa: E402
@@ -179,15 +192,76 @@ class TestNumpyOnly(unittest.TestCase):
             (16, "parity"),
             (17, "parity"),
             (18, "parity"),
-            (154, "trellis"),
             (153, "trellis"),
+            (155, "trellis"),
+            (158, "trellis"),
             (145, "no sign field"),
         ):
             ok, why = zs.repair_support(t)
             self.assertFalse(ok)
             self.assertIn(word, why)
-        self.assertTrue(zs.repair_support(22)[0])
-        self.assertTrue(zs.repair_support(21)[0])
+        for t in (22, 21, 154):
+            self.assertTrue(zs.repair_support(t)[0], zs.type_name(t))
+
+    def test_iq3_kt_sign_bits_are_bit_major(self):
+        # weight w of a block: qh[w % 32] (block byte 68 + w % 32), bit w // 32
+        n, k = 2, 512
+        rb = 4 + k // 256 * 100
+        for w in (0, 1, 31, 32, 100, 255):
+            zero = np.zeros((n, k), bool)
+            zero[1, 256 + w] = True
+            blob = np.zeros(n * rb, np.uint8)
+            self.assertEqual(
+                zs.apply_zero_signs(blob, 154, n, k, zero, zero, rb, 4), (1, 0)
+            )
+            byte = 1 * rb + 4 + 100 + 68 + w % 32
+            self.assertEqual(list(np.nonzero(blob)[0]), [byte])
+            self.assertEqual(int(blob[byte]), 1 << (w // 32))
+            self.assertTrue(
+                np.array_equal(
+                    zs.unpack_sign_bytes(zs.sign_view(blob, 154, n, rb, 4), 154), zero
+                )
+            )
+        outside = ~zs.sign_field_mask(154, n, rb, 4)
+        self.assertEqual(int(outside.sum()), n * (4 + (k // 256) * (100 - 32)))
+
+    def test_pack_and_unpack_are_inverse(self):
+        rng = np.random.default_rng(5)
+        for t in (22, 21, 154):
+            m = rng.random((3, 768)) < 0.5
+            s = zs.pack_sign_mask(m, t, 3, 768)
+            self.assertEqual(s.shape, (3, 3, 32))
+            self.assertTrue(np.array_equal(zs.unpack_sign_bytes(s, t), m))
+
+    @unittest.skipUnless(
+        os.path.isfile(REF_PATH), "no repository checkout around the tool"
+    )
+    def test_iq3_kt_layout_matches_the_reference_dequantiser(self):
+        # ggml_quant_reference.py is bit-exact against libggml's dequantize_row_iq3_kt
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("ggml_quant_reference", REF_PATH)
+        ref = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = ref  # its dataclasses look the module up
+        spec.loader.exec_module(ref)
+        n, k = 4, 512
+        rows = ref.random_rows(154, n, k, np.random.default_rng(1))
+        rb = rows.shape[1]
+        y0 = ref.dequantize(154, rows, k)
+        rng = np.random.default_rng(2)
+        zero = rng.random((n, k)) < 0.15
+        neg = rng.random((n, k)) < 0.5
+        blob = rows.reshape(-1).copy()
+        bits0 = zs.unpack_sign_bytes(zs.sign_view(blob, 154, n, rb, 4), 154)
+        zs.apply_zero_signs(blob, 154, n, k, zero, neg, rb, 4)
+        bits = zs.unpack_sign_bytes(zs.sign_view(blob, 154, n, rb, 4), 154)
+        self.assertTrue(np.array_equal(bits[zero], neg[zero]))  # signs as asked
+        self.assertTrue(np.array_equal(bits[~zero], bits0[~zero]))
+        y = ref.dequantize(154, blob.reshape(n, rb), k)
+        # exactly the weights whose bit changed change sign, nothing else moves
+        flipped = bits != bits0
+        self.assertGreater(int(flipped.sum()), 0)
+        self.assertTrue(np.array_equal(y, np.where(flipped, -y0, y0)))
 
     def test_gguf_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
@@ -219,45 +293,63 @@ class TestWithLibggml(unittest.TestCase):
 
     def test_sign_bit_layout_matches_the_dequantiser(self):
         # flip the sign bit of weight i: exactly y[i] changes sign
-        for t in (22, 21):
+        for t in (22, 21, 154):
             x = signed_zero_matrix(1, 256, zero_share=0.0, seed=t)
             q = self.quant(t, x)
             y0 = self.g.dequant(t, q, 1, 256)
             rb = self.g.row_size(t, 256)
-            for i in (0, 7, 8, 100, 255):
+            hdr = self.g.row_header(t)
+            for i in (0, 7, 8, 31, 32, 100, 255):
                 q2 = q.copy()
-                zs.sign_view(q2, t, 1, rb)[0, 0, i // 8] ^= np.uint8(1 << (i % 8))
+                one = np.zeros((1, 256), bool)
+                one[0, i] = True
+                zs.sign_view(q2, t, 1, rb, hdr)[...] ^= zs.pack_sign_mask(
+                    one, t, 1, 256
+                )
                 y = self.g.dequant(t, q2, 1, 256)
                 diff = np.nonzero(y[0] != y0[0])[0]
                 self.assertEqual(list(diff), [i], zs.type_name(t))
                 self.assertEqual(float(y[0, i]), -float(y0[0, i]))
 
     def test_repair_signed_zeros(self):
-        for t in (22, 21):
+        for t in (22, 21, 154):
             n, k = 128, 1024
             x = signed_zero_matrix(n, k, seed=t)
             pos0, neg0 = zs.zero_masks_from_float(x)
             q = self.quant(t, x)
-            before = zs.matrix_stats(x, self.g.dequant(t, q, n, k), pos0, neg0)
+            y0 = self.g.dequant(t, q, n, k)
+            before = zs.matrix_stats(x, y0, pos0, neg0)
             self.assertEqual(before["verdict"], "OFFSET")
             self.assertGreater(before["offset"], 0.02)
-            self.assertEqual(before["zeros_decoded_positive"], 1.0)
-            rb = self.g.row_size(t, k)
+            # IQ3_KT decodes a few zeros to exactly 0; none comes out negative
+            self.assertEqual(before["zeros_decoded_negative"], 0.0)
+            rb, hdr = self.g.row_size(t, k), self.g.row_header(t)
             q2 = q.copy()
             zs.apply_zero_signs(
-                q2, t, n, k, pos0 | neg0, zs.target_negative("source", pos0, neg0), rb
+                q2,
+                t,
+                n,
+                k,
+                pos0 | neg0,
+                zs.target_negative("source", pos0, neg0),
+                rb,
+                hdr,
             )
-            after = zs.matrix_stats(x, self.g.dequant(t, q2, n, k), pos0, neg0)
-            self.assertEqual(after["verdict"], "PASS")
+            y = self.g.dequant(t, q2, n, k)
+            after = zs.matrix_stats(x, y, pos0, neg0)
+            self.assertEqual(after["verdict"], "PASS", zs.type_name(t))
             self.assertLess(abs(after["offset"]), 0.003)
             self.assertEqual(after["nmse"], before["nmse"])
-            self.assertEqual(after["minus0_decoded_negative"], 1.0)
-            self.assertEqual(after["plus0_decoded_positive"], 1.0)
-            outside = ~zs.sign_field_mask(t, n, rb)
+            z = pos0 | neg0
+            self.assertTrue(np.array_equal(y[~z], y0[~z]))
+            nz = y0 != 0
+            self.assertTrue((y[neg0 & nz] < 0).all())
+            self.assertTrue((y[pos0 & nz] > 0).all())
+            outside = ~zs.sign_field_mask(t, n, rb, hdr)
             self.assertTrue(np.array_equal(q2[outside], q[outside]))
 
     def test_repair_plus_zero_only_with_the_alternating_rule(self):
-        for t in (22, 21):
+        for t in (22, 21, 154):
             n, k = 128, 1024
             x = signed_zero_matrix(n, k, seed=10 + t, plus_only=True)
             pos0, neg0 = zs.zero_masks_from_float(x)
@@ -265,12 +357,20 @@ class TestWithLibggml(unittest.TestCase):
             before = zs.matrix_stats(x, self.g.dequant(t, q, n, k), pos0, neg0)
             rb = self.g.row_size(t, k)
             zs.apply_zero_signs(
-                q, t, n, k, pos0 | neg0, zs.target_negative("alternate", pos0, neg0), rb
+                q,
+                t,
+                n,
+                k,
+                pos0 | neg0,
+                zs.target_negative("alternate", pos0, neg0),
+                rb,
+                self.g.row_header(t),
             )
             after = zs.matrix_stats(x, self.g.dequant(t, q, n, k), pos0, neg0)
             self.assertGreater(before["offset"], 0.02)
             self.assertLess(abs(after["offset"]), 0.003)
-            self.assertLess(abs(after["zeros_decoded_negative"] - 0.5), 0.01)
+            dec = after["zeros_decoded_negative"] + after["zeros_decoded_positive"]
+            self.assertLess(abs(after["zeros_decoded_negative"] / dec - 0.5), 0.01)
             self.assertLess(abs(after["rows_pos"] - 0.5), 0.15)
             self.assertEqual(after["nmse"], before["nmse"])
 
@@ -409,6 +509,25 @@ class TestHotColdCommands(unittest.TestCase):
             )
             self.assertEqual(rc, 0, out)
             self.assertEqual(zs.sha256_file(fp), before)
+
+    def test_check_repair_check_iq3_kt(self):
+        # a cold tier of IQ3_KT (4-byte row header, bit-major signs) end to end
+        g = zs.GGML(LIB)
+        with tempfile.TemporaryDirectory() as d:
+            src, ck = tiny_hotcold(d, g, ctype=154)
+            base = ["--lib", LIB, "--workers", "1"]
+            rc, out = run_cli(zero_sign_check, ["hotcold", "--ckpt", ck] + base)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("IQ3_KT", out)
+            new = os.path.join(d, "fixed")
+            rc, out = run_cli(
+                zero_sign_repair, ["hotcold", "--ckpt", ck, "--out", new] + base
+            )
+            self.assertEqual(rc, 0, out)
+            rc, out = run_cli(
+                zero_sign_check, ["hotcold", "--ckpt", new, "--source", src] + base
+            )
+            self.assertEqual(rc, 0, out)
 
     def test_refuses_parity_signed_cold_type(self):
         g = zs.GGML(LIB)
