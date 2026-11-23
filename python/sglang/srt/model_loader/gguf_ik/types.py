@@ -143,8 +143,13 @@ _ROWS: Tuple[Tuple[int, str, int, int, int], ...] = (
 )
 
 # Row-interleaved types that are a base type's bytes regrouped by ROWS rows:
-# name -> (base name, rows). The pairs and row counts are ik's own run-time
-# repack table (iqk_quantize.cpp get_repack_info); repack.py restores the base.
+# name -> (base name, rows); repack.py restores the base. These are 23 of the
+# 30 pairs of ik's run-time repack table (iqk_quantize.cpp get_repack_info),
+# with ik's row counts: the ones whose inverse is written and proven bit for
+# bit. Of the other seven, Q8_K_R8 is no regrouping (NOT_REPACKS below) and six
+# are left for later: Q2_0_R8, MXFP4_R8, Q8_KV_R8, PQ2_0_R8, Q1_0_G128_R8 and
+# PTQ1_0_R8. Those six are refused like any type without a kernel; none of
+# their bases is served by the GGUF model path yet.
 REPACKS: Dict[str, Tuple[str, int]] = {
     "Q4_0_R8": ("Q4_0", 8),
     "Q5_0_R4": ("Q5_0", 4),

@@ -123,11 +123,16 @@ def row_bytes(type_id: int, k: int) -> int:
 # gguf-py ships for the same types; the tests prove them against libggml.
 KMASK = np.array([1, 2, 4, 8, 16, 32, 64, 128], np.int64)
 KSIGNS = np.array([i | ((bin(i).count("1") & 1) << 7) for i in range(128)], np.int64)
-IQ4NL = np.array(
-    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
-    np.int64,
-)
-IQ2NL = np.array([-31, -13, 1, 17, -26, -8, 6, 22], np.int64)
+# The non-linear value tables shared with gguf_iq_reference.py (which imports
+# them from here, so each has one Python source). iq4k_values: the first 16
+# are IQ4_NL's kvalues_iq4nl, the second 16 the shifted set of the K types.
+IQ4K_VALUES = (
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    -123, -100, -79, -61, -45, -31, -18, -6, 5, 17, 29, 42, 57, 73, 93, 117,
+)  # fmt: skip
+IQ2NL_VALUES = (-31, -13, 1, 17, -26, -8, 6, 22)
+IQ4NL = np.array(IQ4K_VALUES[:16], np.int64)
+IQ2NL = np.array(IQ2NL_VALUES, np.int64)
 IQ2KL = np.array(
     [
         0xE9C1, 0x0DC1, 0xC1D8, 0xF6D8, 0x0DD8, 0x2FD8, 0xD8E9, 0xE9E9,
@@ -140,9 +145,7 @@ IQ2KL = np.array(
 IQ3NL = np.array(
     [-63, -40, -23, -10, 1, 13, 28, 47, -59, -36, -19, -6, 5, 17, 32, 51], np.int64
 )
-IQ4K = np.concatenate(
-    [IQ4NL, [-123, -100, -79, -61, -45, -31, -18, -6, 5, 17, 29, 42, 57, 73, 93, 117]]
-).astype(np.int64)
+IQ4K = np.array(IQ4K_VALUES, np.int64)
 IQ5NL = np.array(
     [
         -126, -114, -103, -92, -83, -74, -65, -57, -50, -43, -36, -30, -24, -18, -12, -6,
