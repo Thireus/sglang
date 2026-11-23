@@ -509,6 +509,12 @@ class GGUFLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        input_index = getattr(layer, "gguf_input_index", None)
+        if input_index is not None:
+            # The packed columns kept the file's order (a quant block spans
+            # several groups the model reorders, see gguf_name_maps.py), so
+            # the input is gathered into that order instead.
+            x = x.index_select(-1, input_index)
         shard_id = layer.qweight.shard_id
 
         if shard_id:

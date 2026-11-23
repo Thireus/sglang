@@ -3149,6 +3149,7 @@ class GGUFModelLoader(BaseModelLoader):
         model_name_or_path: str,
         gguf_to_hf_name_map: Dict[str, str],
         model_config: Optional[ModelConfig] = None,
+        transform=None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         from sglang.srt.model_loader.gguf_name_maps import (
             apply_gguf_weight_transform,
@@ -3159,11 +3160,8 @@ class GGUFModelLoader(BaseModelLoader):
         # Some architectures need the *values* converted, not just renamed:
         # llama.cpp may store a tensor in a different head order or a different
         # value domain from the HF checkpoint it was converted from.
-        transform = (
-            None
-            if model_config is None
-            else get_gguf_weight_transform(model_config.hf_config)
-        )
+        if transform is None and model_config is not None:
+            transform = get_gguf_weight_transform(model_config.hf_config)
         if transform is None:
             return weights
         return apply_gguf_weight_transform(weights, transform)
@@ -3191,11 +3189,21 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
+            from sglang.srt.model_loader.gguf_name_maps import (
+                get_gguf_weight_transform,
+            )
+
+            transform = get_gguf_weight_transform(model_config.hf_config)
             model.load_weights(
                 self._get_weights_iterator(
-                    local_model_path, gguf_weights_map, model_config
+                    local_model_path, gguf_weights_map, model_config, transform
                 )
             )
+            # A transform may leave work for the loaded layers (e.g. an input
+            # gather where packed columns could not be moved).
+            finish_loading = getattr(transform, "finish_loading", None)
+            if finish_loading is not None:
+                finish_loading(model)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
