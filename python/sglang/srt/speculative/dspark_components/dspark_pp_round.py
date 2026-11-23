@@ -36,6 +36,14 @@ from sglang.srt.speculative.dspark_components.dspark_pp_relay import (
     relay_verify_window,
 )
 from sglang.srt.speculative.dspark_components.dspark_pp_stash import DsparkPPStash
+from sglang.srt.speculative.dspark_components.dspark_pp_verify_schedule import (
+    VerifyStats,
+    pack_chain,
+    read_round,
+    relay_row_mask,
+    verify_schedule_enabled,
+    verify_survival_threshold,
+)
 from sglang.srt.speculative.dspark_components.dspark_switch import DsparkPPSwitch
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyResult
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
@@ -78,6 +86,8 @@ class DSparkPPLastStage:
         )
         self.switch = switch if switch is not None else DsparkPPSwitch.from_env(envs)
         self.embedding = embedding
+        # SGLANG_PP_DSPARK_VERIFY_STATS; None when off.
+        self.verify_stats = VerifyStats.from_env(self.width)
 
     @classmethod
     def build(cls, worker: DSparkWorkerV2, folder: str) -> DSparkPPLastStage:
@@ -102,6 +112,19 @@ class DSparkPPLastStage:
             envs.SGLANG_PP_DSPARK_LAUNCH_FIRST.get(),
             envs.SGLANG_PP_DSPARK_EMBED.get(),
         )
+        if verify_schedule_enabled():
+            logger.info(
+                "DSpark on the pipeline, last stage: verify lengths from the "
+                "confidence head, survival >= %g of %d rows.",
+                verify_survival_threshold(),
+                int(worker.verify_num_draft_tokens),
+            )
+        if envs.SGLANG_PP_DSPARK_VERIFY_STATS.get() > 0:
+            logger.info(
+                "DSpark on the pipeline, last stage: verify counters logged every "
+                "%d request-rounds and at each request's end.",
+                envs.SGLANG_PP_DSPARK_VERIFY_STATS.get(),
+            )
         return cls(worker, embedding=embedding)
 
     def forward_round(
@@ -124,7 +147,15 @@ class DSparkPPLastStage:
             else self._run_verify(batch, relay, pp_proxy_tensors, rids)
         )
         if not plain:
-            self.switch.note_verify(rids, outcome.commit_lens.tolist())
+            if self.verify_stats is None:
+                self.switch.note_verify(rids, outcome.commit_lens.tolist())
+            else:
+                commit_lens, verify_lens = read_round(
+                    outcome.commit_lens,
+                    relay.verify_cutoff() if verify_schedule_enabled() else None,
+                )
+                self.switch.note_verify(rids, commit_lens)
+                self.verify_stats.note(commit_lens, verify_lens)
         chain = None
         if self.switch.should_draft(
             mb_id=mb_id,
@@ -188,6 +219,9 @@ class DSparkPPLastStage:
             verify_window=verify_window,
             sampling_info=sampling_info,
             pp_proxy_tensors=pp_proxy_tensors,
+            # A scheduled verify: the rows past a request's length skip the routed
+            # experts on every stage, and the accept below never reads them.
+            moe_row_mask=relay_row_mask(relay, bs, self.width, worker.device),
         )
         logits_output = target_verify.logits_output
         target_logits = logits_output.next_token_logits
@@ -342,8 +376,9 @@ class DSparkPPLastStage:
         self, batch, outcome: _RoundOutcome, rids, sampling_info
     ) -> torch.Tensor:
         """The state the proposer reads at the head of an iteration; the isolation
-        around this round undoes it. Returns the rows [bs, gamma + 1] the ring carries:
-        a new tensor, so a later replay of the draft graph cannot change it in flight."""
+        around this round undoes it. Returns the rows [bs, gamma + 1] the ring carries,
+        followed by the [bs] verify lengths of a scheduled verify: a new tensor, so a
+        later replay of the draft graph cannot change it in flight."""
         worker = self.worker
         bs = len(rids)
         new_seq_lens = outcome.new_seq_lens
@@ -377,16 +412,19 @@ class DSparkPPLastStage:
             logits=None if all_greedy else block.corrected_logits,
             borrowed=proposal.folded,
         )
-        return torch.cat(
+        rows = torch.cat(
             [draft_input.bonus_tokens.view(bs, 1), block.draft_tokens.to(torch.int64)],
             dim=1,
-        ).reshape(-1)
+        )
+        return pack_chain(rows, proposal.verify_lens)
 
     # ---- housekeeping ------------------------------------------------------------
 
     def note_request_finished(self, rid: str) -> None:
         self.stash.drop(rid)
         self.switch.forget(rid)
+        if self.verify_stats is not None:
+            self.verify_stats.flush()
 
     def clear(self) -> None:
         self.stash.clear()

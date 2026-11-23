@@ -13,6 +13,9 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dspark_components.dspark_pp_verify_schedule import (
+    verify_schedule_enabled,
+)
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -39,7 +42,11 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
 def builds_confidence_head(draft_hf_config: Any) -> bool:
     """Whether the draft builds its trained confidence head; ragged verify
     without one takes its confidences from the online acceptance estimator."""
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if (
+        read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        # The relay's scheduled verify reads the head in static mode too.
+        and not verify_schedule_enabled()
+    ):
         return False
     enabled = _cfg_get(draft_hf_config, "enable_confidence_head")
     if enabled is False or envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():

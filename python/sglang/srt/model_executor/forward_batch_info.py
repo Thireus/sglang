@@ -550,6 +550,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
     # Per-request target-verify geometry.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # int32 [tokens], 1 on the rows whose routed experts run, 0 on the rows they
+    # skip (their routes go to the padded route): a scheduled DSpark verify under
+    # pipeline parallelism. None: every row runs.
+    moe_verify_row_mask: Optional[torch.Tensor] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.

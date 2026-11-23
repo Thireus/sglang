@@ -24,6 +24,10 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
+from sglang.srt.speculative.dspark_components.dspark_pp_verify_schedule import (
+    scheduled_verify_lens,
+    verify_survival_threshold,
+)
 from sglang.srt.speculative.online_acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
@@ -39,6 +43,7 @@ class DsparkDraftSampler:
     """The eager path's markov block, run as the draft cuda graph's tail."""
 
     verify_ids = None
+    verify_lens_out = None
 
     def __init__(
         self,
@@ -95,6 +100,20 @@ class DsparkDraftSampler:
                 (self.max_bs, self.gamma),
                 dtype=confidence_head.proj.weight.dtype,
                 device=device,
+            )
+        # [max_bs] rows to verify per request, written by the graph tail: the relay's
+        # scheduled verify (dspark_pp_verify_schedule.py). None with it off.
+        self.verify_lens_out: Optional[torch.Tensor] = None
+        self._verify_survival = verify_survival_threshold()
+        if self._verify_survival > 0.0:
+            # The online estimator's predictions are not the head's: no schedule.
+            if confidence_head is None or acceptance_estimator is not None:
+                raise RuntimeError(
+                    "SGLANG_PP_DSPARK_VERIFY_SURVIVAL schedules verify lengths from "
+                    "the draft's confidence head, which this draft did not build."
+                )
+            self.verify_lens_out = torch.empty(
+                (self.max_bs,), dtype=torch.int64, device=device
             )
         self.greedy_draft = greedy_draft
         self.sharded_accept = sharded_accept
@@ -217,6 +236,10 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
             self.confidence_raw_out[:bs].copy_(confidence_raw)
+            if self.verify_lens_out is not None:
+                self.verify_lens_out[:bs].copy_(
+                    scheduled_verify_lens(confidence, self._verify_survival)
+                )
         if self.verify_ids is not None:
             torch.cat(
                 [anchor.view(bs, 1), self.out[: bs * self.gamma].view(bs, self.gamma)],

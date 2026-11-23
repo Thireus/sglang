@@ -10,6 +10,12 @@ of the history) and the draft (right with a chosen probability).
 
 Being right here means: every request gets the output plain greedy decoding gives it,
 through any accept lengths, merges, finishes and switch decisions.
+
+With SGLANG_PP_DSPARK_VERIFY_SURVIVAL the ring runs the scheduled verify
+(dspark_pp_verify_schedule.py):
+the toy draft gives each block a confidence, the real policy turns it into a verify
+length, and the toy target answers a masked row with the next draft's own token, so
+an accept that read a masked row would commit a wrong draft.
 """
 
 from __future__ import annotations
@@ -44,6 +50,10 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 )
 from sglang.srt.speculative.dspark_components.dspark_pp_round import DSparkPPLastStage
 from sglang.srt.speculative.dspark_components.dspark_pp_stash import DsparkPPStash
+from sglang.srt.speculative.dspark_components.dspark_pp_verify_schedule import (
+    scheduled_verify_lens,
+    verify_survival_threshold,
+)
 from sglang.srt.speculative.dspark_components.dspark_switch import DsparkPPSwitch
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -257,6 +267,8 @@ class ToyInjector:
 
     def __init__(self):
         self.rows: Dict[int, List[int]] = {}
+        # Rows the last verify computed, by request slot (a scheduled verify).
+        self.verified_rows: Dict[int, int] = {}
 
     def ids_for(self, plan, cols=None):
         return plan.write_ids(None)
@@ -278,6 +290,8 @@ class ToyInjector:
         pos = positions.view(bs, width)
         for row in range(bs):
             slot = int(cache_loc_2d[row, 0]) // 100000
+            # A row the verify skipped is never committed.
+            assert int(commit_lens[row]) <= self.verified_rows.get(slot, width)
             for col in range(int(commit_lens[row])):
                 assert int(cache_loc_2d[row, col]) % 100000 == int(pos[row, col])
                 self.rows.setdefault(slot, []).append(int(pos[row, col]))
@@ -292,6 +306,7 @@ class ToyProposer:
         self.rng = random.Random(seed)
         # A static buffer, as the sampler's graph output is.
         self.static_tokens = torch.zeros((32, GAMMA), dtype=torch.int64)
+        self.static_lens = torch.zeros((32,), dtype=torch.int64)
         self.num_proposals = 0
 
     def propose(
@@ -320,6 +335,17 @@ class ToyProposer:
                 chain.append(tok)
             self.static_tokens[row] = torch.tensor(chain, dtype=torch.int64)
         tokens = self.static_tokens[:bs]
+        confidence = verify_lens = None
+        if self.ring.survival > 0.0:
+            # A head that knows nothing: any length may meet any draft.
+            confidence = torch.tensor(
+                [[self.rng.uniform(0.3, 1.0) for _ in range(GAMMA)] for _ in range(bs)]
+            )
+            # A static buffer too: the relayed lengths must be a copy.
+            self.static_lens[:bs] = scheduled_verify_lens(
+                confidence, self.ring.survival
+            )
+            verify_lens = self.static_lens[:bs]
         block = DraftBlockResult(
             draft_tokens=tokens,
             corrected_logits=None,
@@ -330,7 +356,9 @@ class ToyProposer:
         return DraftProposal(
             draft_block_ids=torch.zeros((bs, GAMMA), dtype=torch.int64),
             draft_block=block,
+            confidence=confidence,
             folded=True,
+            verify_lens=verify_lens,
         )
 
 
@@ -424,6 +452,7 @@ class ToyStage(SchedulerPPMixin):
         self.iterations = 0
         self.verify_log: List[tuple] = []
         self.round_log: List[tuple] = []
+        self.mask_log: List[Optional[tuple]] = []
         self.draft_rows: Dict[int, List[int]] = {}
         self.finished_rids: Dict[str, List[int]] = {}
         self.finished_commits: Dict[str, List[int]] = {}
@@ -456,6 +485,7 @@ class ToyStage(SchedulerPPMixin):
 
     def _send_tensor_dict(self, tensor_dict, all_gather_group=None, async_send=True):
         channel = self.ring.channels[(self.rank + 1) % PP]
+        self.ring.note_sent(self.rank, tensor_dict)
         done = channel.put(dict(tensor_dict))
         return [_Work(done, self.ring.stop)]
 
@@ -556,6 +586,20 @@ class ToyStage(SchedulerPPMixin):
         assert width == (WIDTH if verify else 1), (verify, width)
         rows_2d = ids.view(bs, width)
         pos_2d = positions.view(bs, width)
+        mask = getattr(forward_batch, "moe_verify_row_mask", None)
+        if mask is not None:
+            assert verify and self.ring.survival > 0.0
+            assert mask.dtype == torch.int32 and mask.numel() == ids.numel()
+            mask_2d = mask.view(bs, width)
+            kept = mask_2d.sum(dim=1)
+            # The anchor row always runs, and the kept rows are a prefix.
+            assert bool((mask_2d[:, 0] == 1).all())
+            assert torch.equal(
+                mask_2d, (torch.arange(width) < kept.view(bs, 1)).to(torch.int32)
+            )
+        else:
+            assert not (verify and self.ring.survival > 0.0)
+            mask_2d = torch.ones((bs, width), dtype=torch.int32)
         self.round_log.append(
             (
                 "verify" if verify else "plain",
@@ -564,6 +608,7 @@ class ToyStage(SchedulerPPMixin):
                 tuple(pos_2d.reshape(-1).tolist()),
             )
         )
+        self.mask_log.append(tuple(mask_2d.reshape(-1).tolist()) if verify else None)
         if pp_proxy_tensors is not None:
             # The previous stage's hand-off is this round's rows, in this order.
             received = pp_proxy_tensors["hidden_states"]
@@ -575,6 +620,8 @@ class ToyStage(SchedulerPPMixin):
         if self.rank < PP - 1:
             hidden = torch.zeros((ids.numel(), HIDDEN))
             hidden[:, 0] = ids.reshape(-1).float()
+            # What a skipped row hands on is nobody's input.
+            hidden[mask_2d.reshape(-1) == 0, 1:] = float("nan")
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=PPProxyTensors(
                     {"hidden_states": hidden}
@@ -586,8 +633,17 @@ class ToyStage(SchedulerPPMixin):
             history = req.tokens[:first]
             for col in range(width):
                 history = history + [int(rows_2d[row, col])]
-                logits[row * width + col, toy_next(history)] = 10.0
+                if mask_2d[row, col]:
+                    logits[row * width + col, toy_next(history)] = 10.0
+                else:
+                    # A skipped row's logits: they call the next draft right, so an
+                    # accept that read them would commit it.
+                    nxt = int(rows_2d[row, col + 1]) if col + 1 < width else 0
+                    logits[row * width + col, nxt] = 10.0
+                    self.ring.masked_rows += 1
             self.ring.last_rows[req.rid] = history
+            if verify:
+                self.ring.injector.verified_rows[req.slot] = int(mask_2d[row].sum())
         hidden = torch.ones((ids.numel(), HIDDEN))
         output = SimpleNamespace(
             next_token_logits=logits,
@@ -659,6 +715,10 @@ class ToyRing:
         breakeven=(),
         max_position: int = 1 << 20,
     ):
+        # The scheduled verify's threshold; 0.0 with the switch off.
+        self.survival = verify_survival_threshold()
+        self.masked_rows = 0
+        self.sent: List[tuple] = []
         self.stop = threading.Event()
         self.channels = [ToyChannel(self.stop) for _ in range(PP)]
         self.chunk = chunk
@@ -730,6 +790,20 @@ class ToyRing:
         with self._lock:
             self._last_progress = time.monotonic()
 
+    def note_sent(self, rank: int, tensor_dict) -> None:
+        """Every ring message, as (stage, {key: (dtype, shape)})."""
+        with self._lock:
+            self.sent.append(
+                (
+                    rank,
+                    {
+                        k: (str(v.dtype), tuple(v.shape))
+                        for k, v in tensor_dict.items()
+                        if isinstance(v, torch.Tensor)
+                    },
+                )
+            )
+
     def note_finished(self, rank: int):
         with self._lock:
             self._finished[rank] += 1
@@ -777,6 +851,7 @@ class ToyRing:
                 reqs=batch.reqs,
                 out_cache_loc=batch.out_cache_loc,
                 capture_hidden_mode=verify_input.capture_hidden_mode,
+                moe_verify_row_mask=verify_input.moe_row_mask,
             )
             assert verify_input.capture_hidden_mode == CaptureHiddenMode.FULL
             return forward_batch, False

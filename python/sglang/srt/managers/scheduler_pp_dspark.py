@@ -22,6 +22,10 @@ from sglang.srt.speculative.dspark_components.dspark_pp_relay import (
     relay_verify_input,
     relay_verify_window,
 )
+from sglang.srt.speculative.dspark_components.dspark_pp_verify_schedule import (
+    relay_row_mask,
+    unpack_chain,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -94,7 +98,13 @@ def _forward_verify_on_earlier_stage(
         block_pos_offsets=_block_pos_offsets(self, width),
         model_runner=model_runner,
     )
-    verify_input = relay_verify_input(batch, verify_ids_2d, window, width)
+    verify_input = relay_verify_input(
+        batch,
+        verify_ids_2d,
+        window,
+        width,
+        row_mask=relay_row_mask(relay, bs, width, self.device),
+    )
     forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
         batch, self.tp_worker
     )
@@ -187,9 +197,12 @@ def adopt_relayed_chain(
             num_draft_tokens=width,
         )
     else:
+        # The rows, and after them the verify lengths of a scheduled verify.
+        tokens, verify_lens = unpack_chain(chain, len(fwd_rids), width)
         relayed = DSparkPPRelayInput(
             rids=fwd_rids,
-            tokens=chain.to(torch.int64).reshape(len(fwd_rids), width),
+            tokens=tokens,
             has_chain=[True] * len(fwd_rids),
+            verify_lens=verify_lens,
         )
     self._pp_spec_set_relay(batch, relayed)

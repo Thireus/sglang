@@ -50,6 +50,9 @@ class ForwardContext:
     tbo_parent_token_range: Optional[tuple[int, int]] = None
     # This DP rank's first parent row when the child's MoE sees gathered rows.
     tbo_parent_dp_offset: Optional[int] = None
+    # The forward batch's moe_verify_row_mask: 1 on the rows whose routed experts
+    # run. A captured call keeps the graph's static buffer. None: every row runs.
+    moe_row_mask: Optional[torch.Tensor] = None
 
 
 _current: Optional[ForwardContext] = None
@@ -75,6 +78,11 @@ def get_forward_context() -> ForwardContext:
     return _current
 
 
+def current_moe_row_mask() -> Optional[torch.Tensor]:
+    """The active forward's routed-experts row mask, or None (every row runs)."""
+    return None if _current is None else _current.moe_row_mask
+
+
 def get_attn_backend() -> AttentionBackend:
     return get_forward_context().attn_backend
 
@@ -98,10 +106,16 @@ def forward_context(
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            moe_row_mask=getattr(forward_batch, "moe_verify_row_mask", None),
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
-        ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)
+        ctx = replace(
+            ctx,
+            moe_num_token_non_padded=_current.moe_num_token_non_padded,
+            moe_row_mask=_current.moe_row_mask,
+        )
     prev = set_forward_context(ctx)
     try:
         yield

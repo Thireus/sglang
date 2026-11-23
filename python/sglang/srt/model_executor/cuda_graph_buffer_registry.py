@@ -883,6 +883,33 @@ def build_decode_registry(
     return reg
 
 
+def moe_verify_row_mask_slot() -> GraphSlot:
+    """``ForwardBatch.moe_verify_row_mask`` for the verify graphs of a scheduled
+    DSpark verify: int32 per token row, 1 where the routed experts run. Computed
+    rather than copied: a batch that carries no mask runs every row whatever the
+    last replay left here, and the rows a replay pads with are masked."""
+
+    def _fill(buf, fb, ctx):
+        raw, padded = ctx.raw_num_tokens, ctx.padded_num_tokens
+        mask = getattr(fb, "moe_verify_row_mask", None)
+        if mask is None:
+            buf[:raw].fill_(1)
+        else:
+            buf[:raw].copy_(mask)
+        if raw < padded:
+            buf[raw:padded].zero_()
+
+    return GraphSlot(
+        "moe_verify_row_mask",
+        lambda _bs, max_tokens: (max_tokens,),
+        torch.int32,
+        axis="tokens",
+        padding_policy=PaddingPolicy.KEEP_PAD,
+        copy_from_fb=False,
+        post_fill=_fill,
+    )
+
+
 def build_prefill_registry(
     *,
     device: torch.device,

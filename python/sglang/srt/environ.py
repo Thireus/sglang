@@ -1770,6 +1770,15 @@ class Envs:
     # Largest micro-batch the verify graphs serve; 0 keeps the decode list. A
     # micro-batch above it runs plain.
     SGLANG_PP_DSPARK_VERIFY_MAX_BS = EnvInt(0)
+    # Verify length per request from the draft's confidence head: a request keeps
+    # the drafts whose survival (the running product of the head's outputs along
+    # the block) is at least this threshold, and the routed experts skip its other
+    # rows (speculative/dspark_components/dspark_pp_verify_schedule.py). Unset or
+    # 0: every verify row runs, as before.
+    SGLANG_PP_DSPARK_VERIFY_SURVIVAL = EnvFloat(0.0)
+    # Measurement only: the last stage logs its verify counters (request-rounds,
+    # rows verified, tokens kept) every this many verify request-rounds; 0 = off.
+    SGLANG_PP_DSPARK_VERIFY_STATS = EnvInt(0)
     SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
