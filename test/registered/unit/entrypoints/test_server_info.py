@@ -17,7 +17,10 @@ Current coverage:
 * `TestServerInfoExistingFieldsPreserved` — regression guard that no
   field existing consumers depend on is silently dropped: every
   `ServerArgs` dataclass field, `internal_states`, `version`, and the
-  pre-existing flat `kv_events_config` string all remain visible.
+  pre-existing flat `kv_events_config` string all remain visible. Also
+  pins the `glp_alpha` capability block (the per-request steering field,
+  its route, ceiling and step), which a proxy reads to publish the
+  accepted set.
 """
 
 import asyncio
@@ -852,6 +855,40 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
         self.assertEqual(info["frontend"], "python")
+
+    def test_glp_alpha_block_advertises_the_request_field(self):
+        # A proxy (the Messages door) publishes the strength set it accepts by
+        # reading this block; its shape is the contract, not an implementation
+        # detail, so the keys are pinned here: 0 to 4.00 in steps of 0.01, as
+        # the glp_alpha field of /v1/messages only.
+        info = _call_server_info_with(ServerArgs(model_path="dummy"))
+        self.assertEqual(
+            info["glp_alpha"],
+            {
+                "per_request": False,
+                "max_alpha": 4.0,
+                "step": 0.01,
+                "field": "glp_alpha",
+                "route": "/v1/messages",
+            },
+        )
+
+    def test_glp_alpha_per_request_needs_the_flag_and_an_armed_engine(self):
+        # per_request says steered requests are served: the flag alone is not
+        # enough, the schedulers must report the steering plugin armed.
+        for flag, scheduler_info, served in (
+            (True, {"glp_alpha_armed": True}, True),
+            (True, {"glp_alpha_armed": False}, False),
+            (True, {}, False),
+            (False, {"glp_alpha_armed": True}, False),
+        ):
+            with self.subTest(flag=flag, scheduler_info=scheduler_info):
+                info = _call_server_info_with(
+                    ServerArgs(model_path="dummy", glp_alpha_per_request=flag),
+                    scheduler_info={"max_req_input_len": 1024, **scheduler_info},
+                )
+                self.assertIs(info["glp_alpha"]["per_request"], served)
+                self.assertTrue(info["glp_alpha_per_request"] is flag)
 
     def test_supports_inline_system_is_what_messages_acts_on(self):
         # sgl-router's /v1/messages keeps an inline system turn in place on this

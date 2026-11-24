@@ -793,6 +793,23 @@ class TboForwardBatchPreparer:
         else:
             output_dict["mrope_positions"] = None
 
+        # GLP steering rows are token-axis data, like input_ids: split with the
+        # child's own token range. (A per-request steered batch never reaches
+        # TBO -- the steering plugin refuses two-batch overlap -- but the stock
+        # path must still pass the field check below with both fields present.)
+        if batch.glp_alpha_rows is not None:
+            assert batch.glp_alpha_rows.shape[0] == num_tokens, (
+                f"glp_alpha_rows has {batch.glp_alpha_rows.shape[0]} rows, "
+                f"{num_tokens=} {batch=}"
+            )
+            output_dict["glp_alpha_rows"] = batch.glp_alpha_rows[
+                start_token_index:end_token_index
+            ]
+            output_dict["glp_any_steered"] = batch.glp_any_steered
+        else:
+            output_dict["glp_alpha_rows"] = None
+            output_dict["glp_any_steered"] = False
+
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)

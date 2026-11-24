@@ -55,6 +55,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.glp_alpha import GLP_ALPHA_PARAM
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -695,6 +696,17 @@ class AnthropicServing:
             request_data["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
+        if anthropic_request.glp_alpha:
+            # Handed to the scheduler as a custom_params key: it reaches every
+            # pipeline stage with the sampling parameters, and Req turns it into
+            # the per-row vector. Every route refuses the key in a client's
+            # custom_params; this request is built here, after the Messages body
+            # passed its own check, and goes to the chat handler's internals,
+            # not through that refusal. Alpha 0 adds nothing, so an unsteered
+            # request keeps today's body.
+            request_data["custom_params"] = {
+                GLP_ALPHA_PARAM: anthropic_request.glp_alpha
+            }
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:

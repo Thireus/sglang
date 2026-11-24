@@ -24,8 +24,10 @@ import torch
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import is_unlimited_ocr_v2
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.glp_alpha import refusal_at_boot
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_model_inputs,
@@ -33,9 +35,18 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     prepare_cp_forward,
 )
-from sglang.srt.layers.dp_attention import get_eager_max_batch_size, require_mlp_sync
+from sglang.srt.layers.dp_attention import (
+    get_eager_max_batch_size,
+    require_gathered_buffer,
+    require_mlp_sync,
+)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.model_executor.cuda_graph_buffer_registry import build_eager_registry
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    GraphSlot,
+    PaddingPolicy,
+    build_eager_registry,
+)
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     forward_context,
@@ -50,11 +61,14 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_parallel,
+    get_serving,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
@@ -160,6 +174,50 @@ class EagerRunner(BaseRunner):
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
         )
+        if get_serving().glp_alpha_per_request and not mr.is_draft_worker:
+            # Built for every target model runner and before any capture: the
+            # place to refuse the configurations the rows are not wired into.
+            cg_config = get_exec().graph.cuda_graph_config
+            refusal = refusal_at_boot(
+                disaggregated=sa.disaggregation_mode != "null",
+                dllm=sa.dllm_algorithm is not None,
+                ragged_verify_mode=envs.SGLANG_RAGGED_VERIFY_MODE.get(),
+                uno=mr.spec_algorithm.is_uno(),
+                # A plugin's algorithm builds its own target forwards.
+                plugin_speculative=not isinstance(
+                    mr.spec_algorithm, SpeculativeAlgorithm
+                ),
+                context_parallel=get_cp_strategy() is not None,
+                sequence_sharded=get_parallel().attn_tp_size > 1
+                and (
+                    require_gathered_buffer()
+                    or sa.enable_attn_tp_input_scattered
+                    or sa.enable_layernorm_sp
+                ),
+                prefill_cuda_graph=cg_config is not None
+                and cg_config.prefill.backend != Backend.DISABLED,
+                # The CPU graph runner builds its forwards by hand.
+                cpu_graph=torch.device(mr.device).type == "cpu"
+                and get_flags().capture.enable_torch_compile,
+                document_kv_reuse=is_unlimited_ocr_v2(mr.model_config.hf_config),
+                rust_server=envs.SGLANG_RUST_SERVER.get(),
+            )
+            if refusal is not None:
+                raise RuntimeError(refusal)
+            # Per-token steering alpha for every eager target forward (prefill,
+            # eager decode). Sized like the token-axis slots above and copyable
+            # on the same path, so the model reads it as a static buffer view;
+            # bound to a tensor of its own, outside the shared input pool.
+            self._eager_registry.register_slot(
+                GraphSlot(
+                    "glp_alpha_rows",
+                    lambda _bs, tokens: (tokens,),
+                    torch.float32,
+                    axis="tokens",
+                    padding_policy=PaddingPolicy.ZERO,
+                ),
+                bind=torch.zeros(max_num_token, dtype=torch.float32, device=mr.device),
+            )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         if run_warmup:
             self.warmup()

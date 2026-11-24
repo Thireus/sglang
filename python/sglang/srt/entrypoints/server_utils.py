@@ -27,6 +27,12 @@ from urllib.parse import urlparse
 from starlette.routing import Mount
 
 from sglang.srt.environ import envs
+from sglang.srt.glp_alpha import (
+    GLP_ALPHA_MAX,
+    GLP_ALPHA_PARAM,
+    GLP_ALPHA_ROUTE,
+    GLP_ALPHA_STEP,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.runtime_context import describe_kv_events_publisher, get_serving
 from sglang.srt.server_args import redact_server_args_secrets
@@ -212,6 +218,20 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
     result["kv_events"] = describe_kv_events_publisher(server_args)
+    # One stable capability record, so a proxy can publish the value set it
+    # accepts without reading the whole resolved argument dump. per_request
+    # means steered requests are served: the flag is on and the steering
+    # plugin armed every scheduler process that reported (glp_alpha_armed).
+    # The value set is 0 to max_alpha in steps of step (at most two
+    # decimals), and the field is taken on the one route named.
+    result["glp_alpha"] = {
+        "per_request": bool(server_args.glp_alpha_per_request)
+        and scheduler_info.get("glp_alpha_armed") is True,
+        "max_alpha": GLP_ALPHA_MAX,
+        "step": GLP_ALPHA_STEP,
+        "field": GLP_ALPHA_PARAM,
+        "route": GLP_ALPHA_ROUTE,
+    }
     return result
 
 

@@ -111,6 +111,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
     without_schema_identifiers,
 )
+from sglang.srt.glp_alpha import client_custom_params_refusal
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -390,6 +391,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
     async def handle_request(self, request, raw_request):
         if self._doc_splitter is not None:
+            # The splitter answers before the base handler's checks: refuse a
+            # client's glp_alpha here too (see OpenAIServingBase.handle_request).
+            error_msg = client_custom_params_refusal(request.custom_params)
+            if error_msg:
+                return self.create_error_response(error_msg)
             return await self._doc_splitter.handle_request(request, raw_request)
         return await super().handle_request(request, raw_request)
 

@@ -213,6 +213,34 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(converted.routed_dp_rank, 3)
         self.assertEqual(converted.disagg_prefill_dp_rank, 2)
 
+    def test_messages_carries_glp_alpha_into_custom_params(self):
+        """The Anthropic body is rebuilt from a fixed field list; a glp_alpha
+        dropped here never reaches Req, so a per-request steering request would
+        be served stock (or refused as stock on an armed engine). It carries
+        the two-decimal value the engine reads."""
+        for value, carried in ((2.0, 2.0), (2, 2.0), (2.25, 2.25), (0.1 + 0.2, 0.3)):
+            with self.subTest(value=value):
+                converted = self._serving()._convert_to_chat_completion_request(
+                    self._anthropic_request(glp_alpha=value)
+                )
+                self.assertEqual(converted.custom_params, {"glp_alpha": carried})
+
+    def test_messages_without_glp_alpha_keeps_the_stock_body(self):
+        """Alpha 0 must not invent custom_params: an unsteered request stays
+        byte-identical to today's body, whether the field is absent or an
+        explicit 0 (also -0.0)."""
+        for overrides in (
+            {},
+            {"glp_alpha": 0},
+            {"glp_alpha": 0.0},
+            {"glp_alpha": -0.0},
+        ):
+            with self.subTest(overrides=overrides):
+                converted = self._serving()._convert_to_chat_completion_request(
+                    self._anthropic_request(**overrides)
+                )
+                self.assertIsNone(converted.custom_params)
+
     def test_messages_preserves_cache_salt_through_native_conversion(self):
         for stream in (False, True):
             for overrides, expected in (

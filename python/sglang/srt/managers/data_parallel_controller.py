@@ -833,6 +833,13 @@ class DataParallelController:
             for info in self._scheduler_init_infos:
                 if info.get("router_l3_layout"):
                     init_info["router_l3_layout"] = info["router_l3_layout"]
+            if any("glp_alpha_armed" in info for info in self._scheduler_init_infos):
+                # Per-request GLP steering is armed only where every DP
+                # scheduler armed it.
+                init_info["glp_alpha_armed"] = all(
+                    info.get("glp_alpha_armed") is True
+                    for info in self._scheduler_init_infos
+                )
         if layout is not None:
             init_info["hicache_object_layout"] = layout
         return init_info

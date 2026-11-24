@@ -1187,6 +1187,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--glp-alpha-per-request`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accept a per-request GLP steering alpha: the Anthropic Messages field <code>glp_alpha</code>, from 0 to 4.00 with at most two decimals (a value with more is refused, not rounded). Every other route refuses a <code>glp_alpha</code> key in a client's <code>custom_params</code>. The Weightless steering plugin applies it per token row of the target model, and a non-zero alpha gets its own prefix-cache namespace, keyed on its two-decimal value. A non-zero alpha is served only while the plugin is armed in per-request mode, and is refused with beam search, on streaming sessions and on embedding requests. The engine refuses to boot with this flag under disaggregation, dLLM, a ragged verify mode, UNO, a plugin speculative algorithm, context parallelism, attention-TP sequence sharding, prefill CUDA graphs, CPU graphs, Unlimited-OCR v2 or the Rust server. With the flag off a non-zero alpha is refused; an invalid alpha is refused either way.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--reasoning-parser`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Specify the parser for reasoning models. Use `auto` to detect the parser from the model's chat template.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

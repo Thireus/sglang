@@ -29,6 +29,24 @@ class Serving(msgspec.Struct):
         "requests. Disabled by default; unsupported with prefill-decode "
         "disaggregation. Storage has no TTL or size limit.",
     ] = False
+    glp_alpha_per_request: A[
+        bool,
+        "Accept a per-request GLP steering alpha: the Anthropic Messages field "
+        "`glp_alpha`, from 0 to 4.00 with at most two decimals (a value with "
+        "more is refused, not rounded). Every other route refuses a `glp_alpha` "
+        "key in a client's `custom_params`. The Weightless steering plugin "
+        "applies it per token row of the target model, and a non-zero alpha "
+        "gets its own prefix-cache namespace, keyed on its two-decimal value "
+        "(changing alpha re-reads the conversation once). A non-zero alpha is "
+        "served only while the plugin is armed in per-request mode "
+        "(WEIGHTLESS_STEER_PER_REQUEST=1), and is refused with beam search, on "
+        "streaming sessions and on embedding requests. The engine refuses to "
+        "boot with this flag under disaggregation, dLLM, a ragged verify mode, "
+        "UNO, a plugin speculative algorithm, context parallelism, attention-TP "
+        "sequence sharding, prefill CUDA graphs, CPU graphs, Unlimited-OCR v2 "
+        "or SGLANG_RUST_SERVER. With the flag off a non-zero alpha is refused; "
+        "an invalid alpha is refused either way.",
+    ] = False
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,
