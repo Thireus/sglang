@@ -53,6 +53,8 @@ def _handle_pd_request(mode, req):
     )
     req.exit_via = req.send_via = req.kv.retraction_backup = None
     req.kv.holds_kv = req.kv.holds_mamba = False
+    # An unsteered request, as Req reads one without a glp_alpha.
+    req.glp_alpha, req.glp_alpha_error = 0.0, None
     with (
         patch(
             "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",

@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.entrypoints.server_utils import build_server_info
+from sglang.srt.glp_alpha import client_sampling_params_refusal
 from sglang.srt.runtime_context import get_lora, get_serving
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -293,6 +294,13 @@ class RuntimeHandle:
             if is_disconnected_fn is not None
             else None
         )
+        # Only the HTTP Messages route takes glp_alpha; a ValueError reaches
+        # the gRPC client as INVALID_ARGUMENT.
+        glp_alpha_error = client_sampling_params_refusal(
+            req_dict.get("sampling_params")
+        )
+        if glp_alpha_error is not None:
+            raise ValueError(glp_alpha_error)
         if req_type == "generate":
             from sglang.srt.managers.io_struct import GenerateReqInput
 

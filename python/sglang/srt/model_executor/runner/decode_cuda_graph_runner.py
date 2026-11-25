@@ -129,7 +129,13 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
-from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_parallel,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.device_timer import device_timer_ctx
 
@@ -303,6 +309,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _skips_prefilled_inputs = False
     _prefilled_inputs: Optional[tuple] = None
     num_prefilled_input_skips = 0
+    # Set in __init__ on a target runner with --glp-alpha-per-request: the
+    # per-row GLP steering alpha slot.
+    _glp_alpha_slot: Optional[GraphSlot] = None
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
 
@@ -635,6 +644,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     axis="tokens",
                     padding_policy=PaddingPolicy.ZERO,
                 )
+            )
+        if get_serving().glp_alpha_per_request and not model_runner.is_draft_worker:
+            # One fp32 alpha per token row, filled before every replay; the
+            # zero-padded tail runs as alpha 0 (a numeric no-op in the edit).
+            # The capture batch below carries this slot too, so the recorded
+            # graph always contains the steering kernels. Target runners only
+            # (the plugin steers no draft), and bound to a tensor of this
+            # runner's own, so no other runner shares it through the pool.
+            self._glp_alpha_slot = self.buffer_registry.register_slot(
+                GraphSlot(
+                    "glp_alpha_rows",
+                    lambda _bs, tokens: (tokens,),
+                    torch.float32,
+                    axis="tokens",
+                    padding_policy=PaddingPolicy.ZERO,
+                ),
+                bind=torch.zeros(
+                    self.max_num_token, dtype=torch.float32, device=self.device
+                ),
             )
         self.maybe_init_uocr_graph_io(model_runner)
 
@@ -1258,6 +1286,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         mamba_track_mask = (
             _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
         )
+        if self._glp_alpha_slot is not None:
+            # A capture, also one mid-serving, runs on zeros, not on the rows
+            # the last replay left in the slot.
+            self._glp_alpha_slot.buffer.zero_()
 
         attn_backend = self.attn_backend
 
@@ -1300,6 +1332,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            # A captured graph must contain the steering edit, so the capture
+            # batch is armed even though its rows are all alpha 0 (the slot's
+            # initial zeros): the plugin then records the edit and a replay
+            # reads whatever the next fill writes.
+            glp_alpha_rows=(
+                _slot("glp_alpha_rows") if registry.has_slot("glp_alpha_rows") else None
+            ),
+            glp_any_steered=registry.has_slot("glp_alpha_rows"),
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
@@ -2053,6 +2093,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         staged = None
         if self._restage_skip:
             staged, self._staged_inputs = self._staged_inputs, None
+        if self._glp_alpha_slot is not None:
+            # The plan-time fill is not guaranteed to still be in the slot at
+            # replay, so the steering vector is refreshed with the batch the
+            # replay actually runs, also when the restage below is skipped.
+            rows = self._glp_alpha_slot.buffer[: self.raw_num_token]
+            if forward_batch.glp_alpha_rows is None:
+                rows.zero_()
+            else:
+                rows.copy_(forward_batch.glp_alpha_rows[: self.raw_num_token])
         if self._restage_is_redundant(staged, forward_batch):
             return
         # The plan-time load (or the early stage it took) filled these from the very

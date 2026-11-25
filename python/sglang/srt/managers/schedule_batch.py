@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.glp_alpha import alpha_namespace, read_request_alpha
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.req_types import (
@@ -542,6 +543,13 @@ class Req(ReqDllmMixin):
         # The request clips its limits in place; the incoming params stay as
         # received, since pipeline stages relay them onward.
         sampling_params = copy.copy(sampling_params)
+        # Per-request GLP steering alpha. Parsed here, on every pipeline stage,
+        # because both the cache namespace below and the forward's per-row
+        # vector read it; an invalid value is refused by the scheduler, and
+        # reads as 0 (stock) so no cache key is invented for it.
+        self.glp_alpha, self.glp_alpha_error = read_request_alpha(
+            sampling_params.custom_params
+        )
         # Only custom logit processors read "__req__", and the reference is weak
         # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
@@ -561,13 +569,21 @@ class Req(ReqDllmMixin):
             return_hidden_states
         )
 
-        # Extra key for caller-defined request classification.
+        # Extra key for caller-defined request classification. The GLP
+        # namespace goes before the adapter id: mem_cache/events.py reads the
+        # last 32 characters of extra_key as the LoRA id.
+        stock_extra_key = extra_key
+        if self.glp_alpha != 0.0:
+            extra_key = (extra_key or "") + alpha_namespace(self.glp_alpha)
         if lora_id is not None:
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+            stock_extra_key = (stock_extra_key or "") + lora_id
 
         self.extra_key = extra_key
+        # The key at alpha 0, for a request the scheduler refuses for GLP.
+        self._glp_stock_extra_key = stock_extra_key
         self.cache_salt = cache_salt or None
         self._user_cache_salt = self.cache_salt
         self.lora_id = lora_id
@@ -1699,6 +1715,14 @@ class Req(ReqDllmMixin):
         self.logprob_start_len = -1
         self.routed_experts_start_len = 0
         self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
+
+    def reset_glp_alpha(self) -> None:
+        """Back to alpha 0 and the stock cache key, for a request refused for
+        its GLP alpha: its abort pass is then a stock forward, which carries no
+        steered row on any engine. Call it before anything else extends
+        ``extra_key``."""
+        self.glp_alpha = 0.0
+        self.extra_key = self._glp_stock_extra_key
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:

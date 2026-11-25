@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
+from sglang.srt.glp_alpha import GLP_ALPHA_PARAM, read_request_alpha
 
 
 class AnthropicError(BaseModel):
@@ -384,6 +385,12 @@ class AnthropicMessagesRequest(PDRoutingFields):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    # sglang extension: GLP steering strength for this request, 0 to 4.00 with
+    # at most two decimals; the one route that takes it. Absent or 0 is
+    # unsteered; a non-zero value is served only by an engine launched with
+    # --glp-alpha-per-request and an armed steering plugin, and gets its own
+    # prefix-cache namespace.
+    glp_alpha: Optional[float] = None
 
     @field_validator("model")
     @classmethod
@@ -398,6 +405,21 @@ class AnthropicMessagesRequest(PDRoutingFields):
         if v <= 0:
             raise ValueError("max_tokens must be positive")
         return v
+
+    @field_validator("glp_alpha", mode="before")
+    @classmethod
+    def _validate_glp_alpha(cls, v):
+        # The engine's own reader, so the two never disagree: a real JSON
+        # number in range with at most two decimals (never rounded), not a bool
+        # (an int in Python), not a numeric string, and not an int past the
+        # float range. It returns the two-decimal value; its message echoes
+        # nothing but a number.
+        if v is None:
+            return v
+        alpha, error = read_request_alpha({GLP_ALPHA_PARAM: v})
+        if error is not None:
+            raise ValueError(error)
+        return alpha
 
 
 # ---------- Stream deltas ----------

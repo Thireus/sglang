@@ -966,6 +966,8 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             side_effect=scheduler_module._MultimodalInputProcessingError("bad image")
         )
         req = MagicMock()
+        # An unsteered request, as Req reads one without a glp_alpha.
+        req.glp_alpha, req.glp_alpha_error = 0.0, None
         recv_req = SimpleNamespace(
             rid="request-id",
             input_text="prompt",

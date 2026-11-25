@@ -1044,6 +1044,12 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
             # Each PP stage reports only its own L3 pools; give every info the merged layout.
             merge_scheduler_info_layouts(infos)
+            if any("glp_alpha_armed" in info for info in infos):
+                # Per-request GLP steering is armed only where every local
+                # scheduler armed it; the first info is the one published.
+                armed = all(info.get("glp_alpha_armed") is True for info in infos)
+                for info in infos:
+                    info["glp_alpha_armed"] = armed
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:

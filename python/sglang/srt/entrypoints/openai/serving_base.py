@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.glp_alpha import client_custom_params_refusal
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
@@ -85,8 +86,12 @@ class OpenAIServingBase(ABC):
         received_time = monotonic_time()
 
         try:
-            # Validate request
-            error_msg = self._validate_request(request)
+            # Validate request. A client's custom_params may not carry
+            # glp_alpha: only the Messages route takes it, and that route calls
+            # the checks below directly, not through here.
+            error_msg = client_custom_params_refusal(
+                getattr(request, "custom_params", None)
+            ) or self._validate_request(request)
             if error_msg:
                 return self.create_error_response(error_msg)
 

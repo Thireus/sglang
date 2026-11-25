@@ -136,6 +136,7 @@ from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.glp_alpha import client_sampling_params_refusal
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -972,6 +973,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    # Only /v1/messages takes glp_alpha, as a field of its own body.
+    glp_alpha_error = client_sampling_params_refusal(obj.sampling_params)
+    if glp_alpha_error is not None:
+        return ORJSONResponse(status_code=400, content={"error": glp_alpha_error})
     return await serve_generate_request(obj, request)
 
 
@@ -1030,6 +1035,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
         _refuse_decision_layout(obj)
+        _refuse_client_glp_alpha(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
@@ -1043,6 +1049,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
         _refuse_decision_layout(obj)
+        _refuse_client_glp_alpha(obj)
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
@@ -1055,6 +1062,13 @@ def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
     # Only /v1/systemone builds a decision layout, from the prompt it compiles.
     if obj.decision_layout is not None:
         raise ValueError("decision_layout is set only by /v1/systemone")
+
+
+def _refuse_client_glp_alpha(obj: EmbeddingReqInput) -> None:
+    # Only /v1/messages takes glp_alpha, as a field of its own body.
+    glp_alpha_error = client_sampling_params_refusal(obj.sampling_params)
+    if glp_alpha_error is not None:
+        raise ValueError(glp_alpha_error)
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])

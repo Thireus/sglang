@@ -41,6 +41,7 @@ from sglang.kernels.ops.memory.small_copy import write_host_ints
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
+from sglang.srt.glp_alpha import forward_alpha_rows
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
@@ -60,6 +61,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_lora,
     get_parallel,
+    get_serving,
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -559,6 +561,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_is_final_cpu: Optional[List[bool]] = None
     # For LoRA
     lora_ids: Optional[List[str]] = None
+    # GLP steering: one alpha per token row, in batch.reqs order, and whether
+    # any request in this forward is steered. Both come from glp_alpha.py:
+    # with --glp-alpha-per-request on, every target forward carries a vector
+    # (an idle one an empty vector); draft forwards and the flag off carry
+    # None/False. The steering plugin reads them off the forward batch; a
+    # capture sets any_steered True so the recorded graph always contains the
+    # edit.
+    glp_alpha_rows: Optional[torch.Tensor] = None
+    glp_any_steered: bool = False
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
     # A one-request batch's committed KV length, which can lag one verify: a host-side
@@ -984,6 +995,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if isinstance(model_runner, ModelRunner)
             else None
         )
+
+        # One alpha per token row, in batch.reqs order. Alpha 0 is the stock
+        # path. The DSpark draft is never steered (the plugin installs nothing
+        # on a draft worker), so its forwards carry no vector.
+        glp_alpha_rows = None
+        glp_any_steered = False
+        if get_serving().glp_alpha_per_request and not model_runner.is_draft_worker:
+            glp_alpha_rows, glp_any_steered = forward_alpha_rows(
+                batch, device=model_runner.device
+            )
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -1049,6 +1070,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
+            glp_alpha_rows=glp_alpha_rows,
+            glp_any_steered=glp_any_steered,
             rids=[req.rid for req in batch.reqs],
             attention_kv_len_lower_bound=(
                 batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
@@ -1989,6 +2012,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        if self.glp_alpha_rows is not None:
+            # Padded rows are not requests: alpha 0, which the edit turns into
+            # a no-op and which keeps a capturable batch's width consistent.
+            self.glp_alpha_rows = self._pad_tensor_to_size(
+                self.glp_alpha_rows, num_tokens
+            )
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)

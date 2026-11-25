@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Union
 import msgspec
 
 from sglang.srt.environ import envs
+from sglang.srt.glp_alpha import GLP_ALPHA_PARAM, read_request_alpha
 from sglang.srt.sampling.stop_regex import validate_stop_regex
 from sglang.srt.sampling.watermarking.core import (
     WatermarkRequestConfig,
@@ -343,6 +344,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             vocab_size=vocab_size,
             strict=True,
         )
+        # The scheduler's own reader, so an invalid GLP steering alpha is a 400
+        # here and never reaches the scheduler.
+        _, glp_alpha_error = read_request_alpha(self.custom_params)
+        if glp_alpha_error is not None:
+            raise ValueError(f"Invalid {GLP_ALPHA_PARAM}: {glp_alpha_error}")
 
         grammars = [
             self.json_schema,

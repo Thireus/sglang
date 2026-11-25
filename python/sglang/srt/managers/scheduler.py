@@ -125,6 +125,11 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.glp_alpha import (
+    GLP_ALPHA_PARAM,
+    per_request_armed,
+    refusal_for_nonzero_alpha,
+)
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
     get_processor,
@@ -2092,6 +2097,9 @@ class Scheduler(
         if self.rust_server is not None:
             # The main process waits for this process's crash dump.
             result_dict["rust_server_pid"] = os.getpid()
+        if get_serving().glp_alpha_per_request:
+            # The steering plugin arms each process while the weights load.
+            result_dict["glp_alpha_armed"] = per_request_armed()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
         if get_serving().grpc_port is not None and not (
@@ -3297,6 +3305,38 @@ class Scheduler(
         """Extension point for request-local state, including session requests."""
         return Req(*args, **kwargs)
 
+    def _glp_alpha_refusal(
+        self, req: Req, recv_req=None, *, embedding: bool = False
+    ) -> Optional[str]:
+        """Why this request's GLP steering alpha is refused, or None.
+
+        A refused request goes back to alpha 0 and its stock cache key, so its
+        abort pass is a stock forward. Call this before anything else extends
+        ``req.extra_key``."""
+        if req.glp_alpha_error is not None:
+            refusal = f"Invalid {GLP_ALPHA_PARAM}: {req.glp_alpha_error}"
+        elif req.glp_alpha != 0.0:
+            refusal = refusal_for_nonzero_alpha(
+                enabled=get_serving().glp_alpha_per_request,
+                armed=per_request_armed(),
+                disaggregated=self.disaggregation_mode != DisaggregationMode.NULL,
+                dllm=self.dllm_config is not None,
+                beam=(
+                    recv_req is not None
+                    and BeamCoordinator.request_beam_width(recv_req) > 1
+                ),
+                ragged_verify_mode=envs.SGLANG_RAGGED_VERIFY_MODE.get(),
+                # A streaming session lends the previous turn's KV to the next
+                # turn with no cache key in between.
+                streaming_session=req.session is not None and req.session.streaming,
+                embedding=embedding,
+            )
+        else:
+            return None
+        if refusal is not None:
+            req.reset_glp_alpha()
+        return refusal
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -3468,8 +3508,17 @@ class Scheduler(
 
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
+        # Decided before the namespacing below, which a refused request then
+        # gets on its stock key.
+        glp_refusal = self._glp_alpha_refusal(req, recv_req)
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
+
+        if glp_refusal is not None:
+            req.set_finish_with_abort(glp_refusal)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
@@ -3692,6 +3741,11 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if req.glp_alpha != 0.0:
+            # Past every admission check: numbers and the rid only.
+            logger.info(
+                "GLP per-request steering: alpha=%s rid=%s", req.glp_alpha, req.rid
+            )
         self._bind_pp_arrival_prefetch(req, recv_req)
 
         # Expected here too: the grammar queue holds it before it is queued.
@@ -4071,8 +4125,14 @@ class Scheduler(
             decision_layout=recv_req.decision_layout,
         )
         req.tokenizer = self.tokenizer
+        glp_refusal = self._glp_alpha_refusal(req, embedding=True)
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
+
+        if glp_refusal is not None:
+            req.set_finish_with_abort(glp_refusal)
+            self._add_request_to_queue(req)
+            return
 
         if mm_input_error is not None:
             req.set_finish_with_abort(

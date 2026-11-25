@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import empty_context, log_info_on_rank0
@@ -729,6 +730,14 @@ class BaseRunner(ABC):
             if buffers.bootstrap_room_ids_int is not None
             else None
         )
+        # Per-request GLP steering: every forward of a target runner carries
+        # one alpha per token row, all 0 for a dummy (it serves no request), so
+        # the warm-ups run through here carry the vector the plugin reads.
+        glp_alpha_rows = (
+            torch.zeros(num_tokens, dtype=torch.float32, device=mr.device)
+            if get_serving().glp_alpha_per_request and not mr.is_draft_worker
+            else None
+        )
 
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
@@ -766,6 +775,7 @@ class BaseRunner(ABC):
             ),
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
+            glp_alpha_rows=glp_alpha_rows,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
