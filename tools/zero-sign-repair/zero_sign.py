@@ -93,14 +93,22 @@ TYPE_IDS: Dict[str, int] = {v: k for k, v in TYPE_NAMES.items()}
 
 # Types whose blocks carry one explicit sign bit per weight, at a fixed place:
 # type -> (block bytes per 256 weights, offset of the 32 sign bytes in a block).
-# Bit j of sign byte g is the sign of weight 8 * g + j of the block (1 = negative).
-#   block_iq2_s: d (2), qs[64] = 32 grid bytes + 32 sign bytes, qh[8], scales[8]  -> 82, signs at 34
-#   block_iq3_s: d (2), qs[64], qh[8], signs[32], scales[4]                       -> 110, signs at 74
-SIGN_FIELD: Dict[int, Tuple[int, int]] = {22: (82, 34), 21: (110, 74)}
+#   block_iq2_s:  d (2), qs[64] = 32 grid bytes + 32 sign bytes, qh[8], scales[8]  -> 82, signs at 34
+#   block_iq3_s:  d (2), qs[64], qh[8], signs[32], scales[4]                       -> 110, signs at 74
+#   block_iq3_kt: scales[4], ql[64], qh[32]                                        -> 100, signs at 68
+#                 (each IQ3_KT row starts with a 4-byte float scale before its blocks)
+SIGN_FIELD: Dict[int, Tuple[int, int]] = {22: (82, 34), 21: (110, 74), 154: (100, 68)}
+
+# Where weight w (0..255) of a block has its sign bit (1 = negative):
+#   "byte-major": bit w % 8 of sign byte w // 8   (IQ2_S, IQ3_S: signs[g] holds weights 8g .. 8g+7)
+#   "bit-major":  bit w // 32 of sign byte w % 32 (IQ3_KT: qh[g] holds weights g, g+32, ..., g+224;
+#                 ik_llama.cpp dequantize_row_iq3_kt negates y[w] when qh[w % 32] & (1 << (w / 32)))
+SIGN_ORDER: Dict[int, str] = {22: "byte-major", 21: "byte-major", 154: "bit-major"}
 
 # Why the other types cannot be repaired by setting sign bits.
 PARITY_SIGNED = (16, 17, 18)  # IQ2_XXS, IQ2_XS, IQ3_XXS
-TRELLIS = (153, 154, 155, 158)  # IQ2_KT, IQ3_KT, IQ4_KT, IQ1_KT
+# IQ2_KT, IQ4_KT, IQ1_KT (IQ3_KT is a trellis type too, but keeps its signs apart: SIGN_FIELD)
+TRELLIS = (153, 155, 158)
 REFUSAL = {
     "parity": "stores 7 signs per group of 8 weights; the 8th is implied by parity (an even number of "
     "negatives), so the sign of one zero cannot change without changing another weight. "
@@ -386,6 +394,29 @@ def sign_field_mask(t: int, nrows: int, row_bytes: int, header: int = 0) -> np.n
     return m
 
 
+def pack_sign_mask(mask: np.ndarray, t: int, nrows: int, k: int) -> np.ndarray:
+    """Bool [nrows, k] (one flag a weight) -> uint8 [nrows, k / 256, 32] laid out like type t's sign bytes."""
+    if k % QK_K:
+        raise ZeroSignError(f"k = {k} is not a multiple of {QK_K}")
+    nb = k // QK_K
+    m = np.asarray(mask, bool).reshape(nrows, nb, QK_K)
+    if SIGN_ORDER[int(t)] == "bit-major":
+        # [.., byte w % 32, bit w // 32]
+        m = m.reshape(nrows, nb, 8, 32).transpose(0, 1, 3, 2)
+    else:
+        m = m.reshape(nrows, nb, 32, 8)  # [.., byte w // 8, bit w % 8]
+    return np.packbits(m, axis=-1, bitorder="little")[..., 0]
+
+
+def unpack_sign_bytes(s: np.ndarray, t: int) -> np.ndarray:
+    """uint8 [nrows, blocks, 32] sign bytes of type t -> bool [nrows, blocks * 256], True = negative."""
+    nrows, nb = s.shape[:2]
+    bits = np.unpackbits(s[..., None], axis=-1, bitorder="little").astype(bool)
+    if SIGN_ORDER[int(t)] == "bit-major":
+        bits = bits.transpose(0, 1, 3, 2)  # [.., bit w // 32, byte w % 32]
+    return bits.reshape(nrows, nb * QK_K)
+
+
 def apply_zero_signs(
     blob: np.ndarray,
     t: int,
@@ -398,13 +429,8 @@ def apply_zero_signs(
 ) -> Tuple[int, int]:
     """Set, in place, the sign bit of every weight in ``zero``: negative where ``neg``, positive elsewhere.
     Every other bit is left as it was. Idempotent. Returns (bits set, bits cleared)."""
-    if k % QK_K:
-        raise ZeroSignError(f"k = {k} is not a multiple of {QK_K}")
-    nb = k // QK_K
-    zb = np.packbits(zero.reshape(nrows, nb, 32, 8), axis=-1, bitorder="little")[..., 0]
-    nbits = np.packbits(
-        (neg & zero).reshape(nrows, nb, 32, 8), axis=-1, bitorder="little"
-    )[..., 0]
+    zb = pack_sign_mask(zero, t, nrows, k)
+    nbits = pack_sign_mask(np.asarray(neg, bool) & zero, t, nrows, k)
     s = sign_view(blob, t, nrows, row_bytes, header)
     old = s.copy()
     s[...] = (s & ~zb) | nbits

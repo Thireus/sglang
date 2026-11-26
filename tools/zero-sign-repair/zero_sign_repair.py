@@ -17,8 +17,8 @@ Rules (--rule):
   auto       (default) source when 25-75 % of the source's zeros are -0 (native MXFP4 / NVFP4
              checkpoints and floats dequantised from them), alternate otherwise.
 
-Types: IQ2_S and IQ3_S (one sign bit per weight). Refused, with the reason: IQ2_XXS, IQ2_XS, IQ3_XXS
-(parity-signed), IQ2_KT, IQ3_KT, IQ4_KT, IQ1_KT (trellis), anything else (no known sign field).
+Types: IQ2_S, IQ3_S and IQ3_KT (one sign bit per weight). Refused, with the reason: IQ2_XXS, IQ2_XS,
+IQ3_XXS (parity-signed), IQ2_KT, IQ4_KT, IQ1_KT (trellis), anything else (no known sign field).
 
 Safety: a file is rewritten as <file>.zsrepair.partial and renamed over the old name only after a
 verification pass has re-read it (|offset| <= --max-offset for every matrix, NMSE unchanged, no byte outside

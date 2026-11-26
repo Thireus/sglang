@@ -12,14 +12,11 @@ from __future__ import annotations
 
 import torch
 
+# The value tables have one source, the numpy reference of every ggml type.
+from sglang.test.kernels.ggml_quant_reference import IQ2NL_VALUES, IQ4K_VALUES
+
 # ggml type id -> (row header bytes, block bytes per 256 values)
 ROW_LAYOUT = {22: (0, 82), 144: (4, 136), 145: (2, 70)}
-
-IQ4K_VALUES = (
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-    -123, -100, -79, -61, -45, -31, -18, -6, 5, 17, 29, 42, 57, 73, 93, 117,
-)  # fmt: skip
-IQ2NL_VALUES = (-31, -13, 1, 17, -26, -8, 6, 22)
 
 _IQ2S_GRID = None
 

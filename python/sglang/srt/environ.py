@@ -2078,6 +2078,20 @@ class Envs:
     # two projections took 1.63 ms at 1 row, 0.48 ms at 8 (RTX 5090, IQ2_S). The
     # output does not depend on it (bit-identical at 1, 2, 4, 8, 16 and 32).
     SGLANG_GGUF_MOE_VEC_ROWS_PER_BLOCK = EnvInt(8)
+    # GGUF model path: the quant types served by dequantising on the GPU at every
+    # call and multiplying dense (kernels/ops/quantization/gguf_dequantize.py), for
+    # want of a matmul kernel of their own: Q6_0, Q8_KV, Q8_K_R8, IQ1_BN, IQ2_BN,
+    # IQ2_K to IQ6_K, IQ2_KS, IQ3_KS, IQ4_KS, IQ4_KSS, IQ5_KS, IQ2_KL, IQ1_KT to
+    # IQ4_KT, IQ1_S_R4, IQ1_M_R4 and the row-interleaved repacks of these. "all"
+    # serves every one of them, "none" refuses them at load as before, a comma
+    # separated list of names serves only those. The packed weights stay resident;
+    # a decode step dequantises every such tensor once, so it is the slow way to
+    # serve a type and the one that works for all of them.
+    SGLANG_GGUF_DEQUANT_TYPES = EnvStr("all")
+    # The scratch buffer those calls dequantise into, one a device and dtype: a
+    # tensor larger than this many MiB of dense weights is dequantised and
+    # multiplied in runs of rows.
+    SGLANG_GGUF_DEQUANT_SCRATCH_MB = EnvInt(1024)
     # MMQ serves a batch of more than this many tokens, the vector kernels the rest.
     # MMQ rounds a row's sum in another order than the vector kernels (at most 2
     # bf16 ulp per element), so moving it changes the bits of the batches in

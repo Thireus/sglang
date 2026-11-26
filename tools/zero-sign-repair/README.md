@@ -6,7 +6,7 @@ _The tools work on the hot/cold checkpoints that SGLang loads (hot experts in na
 
 ## In one minute
 
-- The ggml quantisers of IQ2_S and IQ3_S have no zero level, and they write every exact zero with a **positive** sign.
+- The ggml quantisers of IQ2_S and IQ3_S have no zero level, and they write every exact zero with a **positive** sign. IQ3_KT does the same for nearly all of them (a few decode to exactly 0).
 - With 11 % of exact zeros, every row of every matrix ends up with a small positive bias: about **+5.6 % of the mean weight magnitude** for IQ2_S.
 - The usual quality number of a quantised matrix, its NMSE, does not change at all, so nothing looks wrong, but the model breaks: on DeepSeek-V4.1-Flash the damaged checkpoint read a corpus KLD of **4.99**, the repaired one **0.056**.
 - The fix: give each such weight the sign of its source zero (MXFP4 and NVFP4 have +0 and -0), or alternate the signs when the source only has +0. The bias goes to about 0, the NMSE stays the same to the last digit.
@@ -54,7 +54,7 @@ The type decides the rest. Measured on DeepSeek-V4.1-Flash experts (MXFP4 source
 |---|---:|---|---|---|---|
 | IQ2_S | 2.5625 | +0.0561 to +0.0572 | 100 % | affected | repairs it (its bytes equal those of the repaired checkpoint measured below, checked on a full layer) |
 | IQ3_S | 3.4375 | +0.0247 to +0.0252 | 100 % | affected | repairs it (one sign bit per weight, like IQ2_S; tested on matrices, not on a served model) |
-| IQ3_KT | 3.1313 | +0.0214 to +0.0220 | 94 % (6 % decode to 0) | affected | refuses: trellis code, no sign bits; requantise |
+| IQ3_KT | 3.1313 | +0.0214 to +0.0220 | 94 % (6 % decode to 0) | affected | repairs it (a trellis code for the magnitudes, but one sign bit per weight in its own field; tested on 72 real expert matrices, not on a served model) |
 | IQ2_XXS | 2.0625 | +0.0204 to +0.0210 | 67 % | affected | refuses: parity-signed; requantise |
 | IQ2_XS | 2.3125 | +0.0191 to +0.0198 | 67 % | affected | refuses: parity-signed; requantise |
 | IQ3_XXS | 3.0625 | +0.0092 to +0.0094 | 67 % | affected | refuses: parity-signed; requantise |
@@ -182,7 +182,7 @@ What it did, for each cold matrix:
 
 1. read the source matrix and find its exact zeros, with their sign (`+0` / `-0`);
 2. pick the rule (`--rule auto`, the default): the source's own sign when 25-75 % of the zeros are -0 (native MXFP4 / NVFP4 checkpoints), else the alternating rule (sources with +0 only, see the questions below);
-3. set the sign bit of those weights, and of no other weight; grid indices and scales are untouched;
+3. set the sign bit of those weights, and of no other weight; grid indices and scales are untouched (where the bit sits: IQ2_S and IQ3_S keep weight w of a 256-weight block in bit w % 8 of sign byte w / 8; IQ3_KT keeps it in bit w / 32 of byte w % 32 of its `qh` field, block byte 68, after the 4-byte scale that starts each row);
 4. re-read the written file and verify every matrix: |offset| <= 0.005, NMSE unchanged, no byte outside the sign fields changed. Only then is the file renamed into place.
 
 Every matrix goes into `$FIXED/zero-sign-repair.jsonl` (offset before and after, bits set, rule). `hotcold.json` gets the new sha256 of the cold files and tensors and a `zero_sign_repair` record. Interrupted? Run the same command again: the repair is idempotent.
@@ -281,7 +281,7 @@ You should see `OK`, in seconds. Without `IK_LIBGGML` the tests that need libggm
 
 ## Limits
 
-- Repairs IQ2_S and IQ3_S only (one explicit sign bit per weight). The IQ3_S repair is tested on synthetic matrices and on one real DeepSeek-V4.1-Flash expert matrix (offset +0.0246 -> -0.00001, NMSE unchanged), not on a full IQ3_S checkpoint or in the engine.
+- Repairs IQ2_S, IQ3_S and IQ3_KT only (one explicit sign bit per weight). The IQ3_S repair is tested on synthetic matrices and on one real DeepSeek-V4.1-Flash expert matrix (offset +0.0246 -> -0.00001, NMSE unchanged), not on a full IQ3_S checkpoint or in the engine. The IQ3_KT repair is tested on synthetic matrices and on 72 real DeepSeek-V4.1-Flash expert matrices (offset +0.0217, from +0.0209 to +0.0226, -> -0.000004, from -0.00015 to +0.00013; NMSE 0.025879 unchanged; every other weight unchanged), not on a full checkpoint or in the engine: SGLang has no IQ3_KT kernel yet.
 - The source must be available: the tool needs to know where the exact zeros were. Without the source the zeros cannot be told apart from small weights.
 - Hot/cold checkpoints: the source is read with the expert names `layers.{L}.ffn.experts.{E}.{w}` (MXFP4 `weight` + `scale`, or a BF16 / F16 / F32 `weight`); `--source-pattern` changes the pattern.
 - GGUF: tested on files written by this tool's own small writer and on a real MXFP4 GGUF tensor written by llama.cpp tooling (as the source); not yet on a quantised GGUF written by `llama-quantize`. The reader was cross-checked against `gguf-py` on 212 real tensors (same offsets, types, shapes, sizes).

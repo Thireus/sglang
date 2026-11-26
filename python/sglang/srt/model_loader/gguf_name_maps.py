@@ -24,7 +24,8 @@ GGUF tensor left out of the map is skipped by ``gguf_quant_weights_iterator``,
 which is how dummy tensors are dropped.
 """
 
-from typing import TYPE_CHECKING, Callable, Dict, Sequence
+import re
+from typing import TYPE_CHECKING, Callable, Dict, List, Sequence
 
 from transformers import PretrainedConfig
 
@@ -227,6 +228,15 @@ def _permute_head_blocks(
     return torch.cat([tensor[:offset], body], dim=0)
 
 
+_OUT_PROJ_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.linear_attn\.out_proj$")
+
+
+def _layer_key(name: str):
+    """The decoder layer index of a Gated-DeltaNet out_proj name, else None."""
+    m = _OUT_PROJ_RE.search(name)
+    return None if m is None else int(m.group(1))
+
+
 class Qwen3_5GGUFWeightTransform:
     """Turn llama.cpp's Gated-DeltaNet weight conventions into HF's.
 
@@ -256,12 +266,39 @@ class Qwen3_5GGUFWeightTransform:
             (h % group) * self.num_k_heads + h // group for h in range(self.num_v_heads)
         ]
         self.counts = {}
+        # out_proj parameter stems whose packed columns stay in the file's order
+        self.input_order_kept = set()
 
     def _count(self, what: str):
         self.counts[what] = self.counts.get(what, 0) + 1
 
+    def out_proj_input_columns(self) -> List[int]:
+        """The run-time gather that feeds an out_proj kept in llama.cpp's order.
+
+        Column ``c`` of the gathered input is column ``cols[c]`` of the HF-order
+        input: value head ``p`` of the file holds HF value head ``h`` with
+        ``gguf_index_of_hf_head[h] == p``.
+        """
+        hf_head_of_gguf = [0] * self.num_v_heads
+        for h, p in enumerate(self.gguf_index_of_hf_head):
+            hf_head_of_gguf[p] = h
+        d = self.head_v_dim
+        return [
+            hf_head_of_gguf[p] * d + j
+            for p in range(self.num_v_heads)
+            for j in range(d)
+        ]
+
     def _permute_columns(self, name: str, tensor, weight_type):
-        """Permute value-head groups along the INPUT dim of out_proj."""
+        """Permute value-head groups along the INPUT dim of out_proj.
+
+        Unquantised columns, and the packed columns of a type whose block
+        divides the value head dim and that has no row header, are moved here:
+        the bytes of each head are contiguous in every row. Any other type is
+        left in the file's head order, and its layer gathers its INPUT into
+        that order at run time instead (``finish_loading``), so no packed byte
+        has to move.
+        """
         import torch
 
         index = self.gguf_index_of_hf_head
@@ -277,26 +314,64 @@ class Qwen3_5GGUFWeightTransform:
                 .contiguous()
             )
 
-        import gguf
+        from sglang.srt.model_loader.gguf_ik.types import by_id, row_size
 
-        quant = gguf.GGMLQuantizationType(int(weight_type))
-        block_size, type_size = gguf.GGML_QUANT_SIZES[quant]
-        if self.head_v_dim % block_size:
-            raise NotImplementedError(
-                f"{name}: value head dim {self.head_v_dim} is not a multiple of "
-                f"the {quant.name} block size {block_size}, so llama.cpp's "
-                "value-head order cannot be undone without requantising. "
-                "Re-quantise this tensor with a type whose block size divides "
-                f"{self.head_v_dim} (e.g. Q8_0)."
-            )
-        group_bytes = (self.head_v_dim // block_size) * type_size
-        if tensor.shape[1] != self.num_v_heads * group_bytes:
+        quant = by_id(int(weight_type))
+        expected = row_size(quant, self.value_dim)
+        if tensor.shape[1] != expected:
             raise ValueError(
                 f"{name}: {tensor.shape[1]} bytes per row, expected "
-                f"{self.num_v_heads * group_bytes} for {quant.name}"
+                f"{expected} for {quant.name}"
             )
+        if quant.row_meta or self.head_v_dim % quant.blck_size:
+            # A block (or the row header) spans more than one value head.
+            stem = name.rpartition(".")[0]
+            if _layer_key(stem) is None:
+                raise ValueError(f"{name}: no decoder layer index in the name")
+            self.input_order_kept.add(stem)
+            self._count("out_proj_input_order")
+            return tensor
+        group_bytes = (self.head_v_dim // quant.blck_size) * quant.type_size
         out = tensor.reshape(tensor.shape[0], self.num_v_heads, group_bytes)
         return out[:, list(index), :].reshape(tensor.shape[0], -1).contiguous()
+
+    def finish_loading(self, model) -> None:
+        """Give every out_proj left in the file's head order its input gather.
+
+        Called by the GGUF loader once all weights are in. The gather is a long
+        tensor on the layer's device that ``GGUFLinearMethod.apply`` reads.
+        """
+        if not self.input_order_kept:
+            return
+        import torch
+
+        from sglang.srt.layers.quantization.gguf import GGUFLinearMethod
+
+        wanted = {_layer_key(stem) for stem in self.input_order_kept} - {None}
+        cols = None
+        for module_name, module in model.named_modules():
+            if _layer_key(module_name) not in wanted:
+                continue
+            if not isinstance(getattr(module, "quant_method", None), GGUFLinearMethod):
+                raise NotImplementedError(
+                    f"{module_name}: its weight is kept in llama.cpp's value-head "
+                    "order, which only the GGUF linear method can read"
+                )
+            if module.input_size_per_partition != module.input_size:
+                raise NotImplementedError(
+                    f"{module_name}: a quant block spans two value heads, so the "
+                    "head order is undone on the layer input at run time; with "
+                    "that input split over tensor-parallel ranks it would move "
+                    "values between ranks. Serve this file with --tp-size 1, or "
+                    "re-quantise its ssm_out tensors with a type of 32-value "
+                    "blocks (e.g. Q8_0)."
+                )
+            if cols is None:
+                cols = self.out_proj_input_columns()
+            module.gguf_input_index = torch.tensor(
+                cols, dtype=torch.long, device=module.qweight.device
+            )
+            self._count("out_proj_input_gather")
 
     def __call__(self, name: str, tensor, weight_type):
         import torch
