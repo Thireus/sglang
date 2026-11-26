@@ -229,7 +229,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
 from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
-    resolve_min_free_slots,
+    read_pp_min_free_slots,
+    resolve_min_free_slots_rule,
 )
 from sglang.srt.managers.mm_utils import duplicate_pad_mm_input_ids
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -600,6 +601,8 @@ class Scheduler(
         self.enable_hisparse = get_memory().enable_hisparse
         self.attn_dp_enabled = get_parallel().attn_dp_enabled
         self.enable_unified_memory = get_memory().enable_unified_memory
+        # Refuse a malformed SGLANG_PP_DSPARK_MIN_FREE_SLOTS before the model loads.
+        read_pp_min_free_slots()
 
         # Init model configs
         self.init_model_config()
@@ -1201,6 +1204,31 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
+    def _init_min_free_slots_delayer(self):
+        """Build the admission hold from the launch and log which rule is in force."""
+        # DFlash auto-enables the legacy formula; other workloads opt in via
+        # --min-free-slots-delay. Built independently of the prefill delayer.
+        # Under PP, SGLANG_PP_DSPARK_MIN_FREE_SLOTS replaces the DFlash default.
+        self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
+        min_free_slots, min_free_slots_why = resolve_min_free_slots_rule(
+            get_schedule().min_free_slots_delay,
+            self.max_running_requests,
+            is_dflash_family=self.spec_algorithm.is_dflash_family(),
+            pp_size=get_parallel().pp_size,
+            pp_micro_batch_cap=get_parallel().pp_max_micro_batch_size,
+            pp_value=read_pp_min_free_slots(),
+        )
+        if min_free_slots is not None:
+            self.min_free_slots_delayer = MinFreeSlotsDelayer(
+                min_free_slots=min_free_slots
+            )
+            logger.info(
+                "Admission hold: a running batch admits only with at least "
+                f"{min_free_slots} free slots ({min_free_slots_why})"
+            )
+        else:
+            logger.info(f"Admission hold: off ({min_free_slots_why})")
+
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
@@ -1303,18 +1331,6 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        # DFlash auto-enables the legacy formula; other workloads opt in via
-        # --min-free-slots-delay. Built independently of the prefill delayer.
-        self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
-        min_free_slots = resolve_min_free_slots(
-            get_schedule().min_free_slots_delay,
-            self.max_running_requests,
-            is_dflash_family=self.spec_algorithm.is_dflash_family(),
-        )
-        if min_free_slots is not None:
-            self.min_free_slots_delayer = MinFreeSlotsDelayer(
-                min_free_slots=min_free_slots
-            )
         if not get_parallel().pp_max_micro_batch_size:
             get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
@@ -1322,6 +1338,7 @@ class Scheduler(
                     self.max_running_requests // get_parallel().pp_size, 1
                 ),
             )
+        self._init_min_free_slots_delayer()
 
         self.tp_group = get_parallel().tp_group
         self.tp_cpu_group = self.tp_group.cpu_group

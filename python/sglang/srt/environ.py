@@ -711,6 +711,12 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # A DFlash-family algorithm (DSpark) under PP: the min-free-slots admission
+    # hold per micro-batch, in place of its default (--min-free-slots-delay is
+    # refused under PP). Unset keeps the default; <= 1 admits whenever the
+    # micro-batch has a free slot; N >= 2 waits until N of its slots are free.
+    # Anything but a whole number stops the launch (read_pp_min_free_slots).
+    SGLANG_PP_DSPARK_MIN_FREE_SLOTS = EnvInt(None)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

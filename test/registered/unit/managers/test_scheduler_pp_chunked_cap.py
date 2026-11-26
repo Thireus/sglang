@@ -9,6 +9,8 @@ the cap. The last chunk now waits for a micro-batch with room; earlier chunks ru
 anywhere, as before.
 """
 
+import inspect
+import os
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -20,8 +22,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -32,6 +35,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -151,6 +155,31 @@ class _PriorityReq(_Req):
 
     def fulfilled_storage_hit_len(self, prefix_len):
         return 0
+
+
+class _WaitingReq(_Req):
+    """A fresh request on its way through admission."""
+
+    def init_next_round_input(self, tree_cache=None, **kwargs):
+        self.next_round_inputs += 1
+
+
+class _AdmitAdder(PrefillAdder):
+    """Admits whatever the scheduler's own gates let through: the hold and the
+    micro-batch cap are the scheduler's, not the adder's."""
+
+    def __init__(self, *args, **kwargs):
+        self.can_run_list = []
+        self.preempt_list = []
+        self.new_chunked_req = None
+        self.rem_chunk_tokens = CHUNK
+
+    def budget_state(self):
+        return AddReqResult.CONTINUE
+
+    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+        self.can_run_list.append(req)
+        return AddReqResult.CONTINUE
 
 
 def _filter_reqs(batch, keep_indices=None, **kwargs):
@@ -343,6 +372,150 @@ class TestScheduler(CustomTestCase):
         self.assertEqual(running.reqs, members, "a running request was preempted")
         self.assertEqual(list(s.waiting_queue), [waiting])
         self.assertTrue(running.batch_is_full)
+
+
+class TestDSparkAdmissionHold(CustomTestCase):
+    """The admission hold of a DFlash-family algorithm (DSpark) under PP.
+
+    Its default threshold, min(4, max(2, (27 + 5) // 6)) = 4, counts free slots of
+    one micro-batch of 9: a micro-batch running 6 or more admits nobody.
+    SGLANG_PP_DSPARK_MIN_FREE_SLOTS replaces it; unset keeps it."""
+
+    SWITCH = "SGLANG_PP_DSPARK_MIN_FREE_SLOTS"
+
+    setUp = TestScheduler.setUp
+    _scheduler = TestScheduler._scheduler
+    _pass = TestScheduler._pass
+
+    def _launch(self, waiting, switch):
+        """A scheduler wired by the real start-up code for DSpark on pp 3, with
+        the switch as the launch environment gives it (None = unset)."""
+        s = self._scheduler(None, waiting=waiting)
+        s.spec_algorithm = SpeculativeAlgorithm.DSPARK
+        s.enable_unified_cache_external_linker = False
+        s.get_prefill_adder_class = lambda: _AdmitAdder
+        # Rows are not the limit here: only the micro-batch cap is.
+        s.req_to_token_pool = SimpleNamespace(available_size=lambda: 1 << 10)
+        parallel = SimpleNamespace(
+            pp_size=NUM_MICRO_BATCHES, pp_max_micro_batch_size=CAP
+        )
+        env = {} if switch is None else {self.SWITCH: switch}
+        with (
+            patch.dict(os.environ, env),
+            patch("sglang.srt.managers.scheduler.get_parallel", return_value=parallel),
+            self.assertLogs("sglang.srt.managers.scheduler", "INFO") as logs,
+        ):
+            if switch is None:
+                os.environ.pop(self.SWITCH, None)
+            self.assertEqual(
+                envs.SGLANG_PP_DSPARK_MIN_FREE_SLOTS.get(),
+                (None if switch is None else int(switch)),
+            )
+            s._init_min_free_slots_delayer()
+        (line,) = [m for m in logs.output if "Admission hold" in m]
+        return s, line
+
+    @staticmethod
+    def _waiting(n):
+        return [
+            _WaitingReq(f"waiting-{i}", prompt_len=512, holds_row=False)
+            for i in range(n)
+        ]
+
+    def test_unset_holds_a_micro_batch_of_six_as_stock_does(self):
+        waiting = self._waiting(2)
+        s, line = self._launch(waiting, None)
+
+        self.assertEqual(s.min_free_slots_delayer._min_free_slots, 4)
+        self.assertIn("at least 4 free slots", line)
+        self.assertIn("DFlash-family default", line)
+        for running in (6, 7, 8):
+            self.assertIsNone(self._pass(s, _running(running)))
+            self.assertEqual(list(s.waiting_queue), waiting)
+        self.assertEqual(self._pass(s, _running(5)), waiting)
+
+    def test_off_admits_into_any_micro_batch_with_room(self):
+        s, line = self._launch(self._waiting(2), "1")
+
+        self.assertIsNone(s.min_free_slots_delayer)
+        self.assertIn("Admission hold: off", line)
+        self.assertIn(f"{self.SWITCH}=1", line)
+        self.assertIn("stock: 4", line)
+        self.assertEqual(len(self._pass(s, _running(6))), 2)
+
+        s, _ = self._launch(self._waiting(2), "1")
+        built = self._pass(s, _running(CAP - 1))
+        self.assertEqual(len(built), 1, "a micro-batch went over its cap")
+        self.assertEqual(len(s.waiting_queue), 1)
+        self.assertIsNone(self._pass(s, _running(CAP)))
+
+    def test_two_holds_for_two_free_slots(self):
+        s, line = self._launch(self._waiting(2), "2")
+
+        self.assertEqual(s.min_free_slots_delayer._min_free_slots, 2)
+        self.assertIn("at least 2 free slots", line)
+        self.assertIsNone(self._pass(s, _running(CAP - 1)))
+        self.assertEqual(len(self._pass(s, _running(6))), 2)
+
+    def test_boundary_values(self):
+        for switch, threshold, words in (
+            ("0", None, "Admission hold: off"),
+            ("-1", None, "Admission hold: off"),
+            ("9", 9, "at least 9 free slots"),
+            ("10", 9, "capped at the micro-batch size"),
+        ):
+            s, line = self._launch(self._waiting(2), switch)
+            if threshold is None:
+                self.assertIsNone(s.min_free_slots_delayer, switch)
+            else:
+                self.assertEqual(s.min_free_slots_delayer._min_free_slots, threshold)
+            self.assertIn(words, line)
+            self.assertIn(f"{self.SWITCH}={switch}", line)
+
+    def test_a_value_that_is_not_a_whole_number_stops_the_start(self):
+        for switch in ("off", "", "2.5"):
+            s = self._scheduler(None, waiting=self._waiting(2))
+            s.spec_algorithm = SpeculativeAlgorithm.DSPARK
+            parallel = SimpleNamespace(
+                pp_size=NUM_MICRO_BATCHES, pp_max_micro_batch_size=CAP
+            )
+            with (
+                patch.dict(os.environ, {self.SWITCH: switch}),
+                patch(
+                    "sglang.srt.managers.scheduler.get_parallel",
+                    return_value=parallel,
+                ),
+                self.assertRaises(ValueError) as ctx,
+            ):
+                s._init_min_free_slots_delayer()
+            self.assertIn(f"{self.SWITCH}={switch!r}", str(ctx.exception))
+            self.assertIn("not a whole number", str(ctx.exception))
+
+    def test_the_value_is_checked_before_the_model_loads(self):
+        # Every rank's Scheduler.__init__ reads the switch before init_model_worker,
+        # so a bad value stops the launch before minutes of weight loading.
+        source = inspect.getsource(Scheduler.__init__)
+        self.assertIn("read_pp_min_free_slots()", source)
+        self.assertLess(
+            source.index("read_pp_min_free_slots()"),
+            source.index("self.init_model_worker()"),
+        )
+
+    def test_pipeline_of_seven_six_six(self):
+        # 19 long streams running as 7 / 6 / 6 and 2 more requests arriving: stock
+        # keeps both waiting through every pass; off, the next pass admits them.
+        for switch, admitted in ((None, 0), ("1", 2)):
+            s, _ = self._launch(self._waiting(2), switch)
+            slots = [_running(7), _running(6), _running(6)]
+            for step in range(2 * NUM_MICRO_BATCHES):
+                mb = step % NUM_MICRO_BATCHES
+                built = self._pass(s, slots[mb])
+                if built:
+                    slots[mb].reqs.extend(built)
+            sizes = [len(b.reqs) for b in slots]
+            self.assertEqual(sum(sizes) - 19, admitted, f"switch {switch}: {sizes}")
+            self.assertLessEqual(max(sizes), CAP)
+            self.assertEqual(len(s.waiting_queue), 2 - admitted)
 
 
 class TestPrefillAdder(CustomTestCase):
