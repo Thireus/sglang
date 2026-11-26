@@ -71,6 +71,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     GraphSlot,
     PaddingPolicy,
     build_decode_registry,
+    moe_verify_row_mask_slot,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -664,6 +665,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.max_num_token, dtype=torch.float32, device=self.device
                 ),
             )
+        if self._masks_verify_rows():
+            self.buffer_registry.register_slot(moe_verify_row_mask_slot())
+            logger.info(
+                "Target verify graphs read a routed-experts row mask "
+                "(SGLANG_PP_DSPARK_VERIFY_SURVIVAL)."
+            )
         self.maybe_init_uocr_graph_io(model_runner)
 
         # Captures the per-replay attention-metadata prep into a small CUDA
@@ -735,6 +742,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _masks_verify_rows(self) -> bool:
+        """The DSpark relay's scheduled verify (dspark_pp_verify_schedule.py): the
+        target's verify graphs then read a per-row mask for the routed experts."""
+        from sglang.srt.speculative.dspark_components.dspark_pp_verify_schedule import (
+            verify_schedule_enabled,
+        )
+
+        return (
+            verify_schedule_enabled()
+            and not self.model_runner.is_draft_worker
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and self.model_runner.spec_algorithm.is_dspark()
+        )
 
     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
         """Rows reserved for the largest shared logits output."""
@@ -1217,6 +1238,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
         )
         mrope_positions = _slot("mrope_positions")
+        moe_verify_row_mask = None
+        if registry.has_slot("moe_verify_row_mask"):
+            # Captured with every row routed; a replay stages its own mask.
+            moe_verify_row_mask = _slot("moe_verify_row_mask")
+            moe_verify_row_mask.fill_(1)
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         aux_hidden_states_buffer = (
             buffers.aux_hidden_states[:num_tokens]
@@ -1323,6 +1349,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             ragged_verify_layout=capture_ragged_verify_layout,
+            moe_verify_row_mask=moe_verify_row_mask,
             capture_hidden_mode=self.capture_hidden_mode,
             # Maintained only under expert parallelism; None elsewhere so routing
             # does not mask every row against a never-filled zero count.

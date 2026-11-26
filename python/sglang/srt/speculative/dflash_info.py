@@ -56,6 +56,9 @@ class DFlashVerifyInput(SpecInput):
     # part of it this verify writes (`IterationIds.write_ids`).
     iteration_ids: Optional[IterationIds] = None
     iteration_cols: Optional[Cols] = None
+    # int32 [tokens], 1 on the rows whose routed experts run: a scheduled verify
+    # (dspark_pp_verify_schedule.py). None: every row runs.
+    moe_row_mask: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -111,6 +114,8 @@ class DFlashVerifyInput(SpecInput):
             iteration_ids=self.iteration_ids,
             write_cols=self.iteration_cols,
         )
+        if self.moe_row_mask is not None:
+            verify_forward_batch.moe_verify_row_mask = self.moe_row_mask
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner

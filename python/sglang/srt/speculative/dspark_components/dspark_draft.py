@@ -25,6 +25,10 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_pp_verify_schedule import (
+    scheduled_verify_lens,
+    verify_survival_threshold,
+)
 from sglang.srt.speculative.online_acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
@@ -90,6 +94,9 @@ class DraftProposal(msgspec.Struct, frozen=True):
     # [bs, gamma + 1] ``[anchor | draft tokens]`` from the draft graph tail; None
     # when the caller builds them.
     verify_ids: Optional[torch.Tensor] = None
+    # [bs] rows to verify of each block, from the confidence head under the relay's
+    # scheduled verify (dspark_pp_verify_schedule.py); None: the whole block.
+    verify_lens: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -482,6 +489,7 @@ class DraftBlockProposer:
         draft_block_ids = fwd.draft_block_ids
 
         confidence = confidence_raw = acceptance_features = verify_ids = None
+        verify_lens = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -510,6 +518,8 @@ class DraftBlockProposer:
             elif draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
+            if draft_sampler.verify_lens_out is not None:
+                verify_lens = draft_sampler.verify_lens_out[:bs]
             if draft_sampler.verify_ids is not None:
                 verify_ids = draft_sampler.verify_ids[:bs]
         else:
@@ -543,6 +553,9 @@ class DraftBlockProposer:
                     draft_tokens=draft_block.draft_tokens,
                     confidence_features=confidence_features,
                 )
+                survival = verify_survival_threshold()
+                if survival > 0.0:
+                    verify_lens = scheduled_verify_lens(confidence, survival)
         proposal_block_ids = (
             draft_block_ids
             if self.sample_from_anchor
@@ -556,6 +569,7 @@ class DraftBlockProposer:
             acceptance_features=acceptance_features,
             folded=folded,
             verify_ids=verify_ids,
+            verify_lens=verify_lens,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:

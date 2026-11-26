@@ -30,6 +30,11 @@ class DSparkPPRelayInput(PPSpecRelayInput):
     ``has_chain`` says, per request, whether the last stage drafted for this row. It
     is host state decided by the relay's own keys, so reading it never waits on a GPU.
     The topology of the base class stays None: a DSpark block is a chain.
+
+    ``verify_lens`` is the rows each request verifies of its block, int64 ``[bs]`` on
+    the rows' device, when the last stage scheduled them
+    (dspark_pp_verify_schedule.py); None means every chain is verified whole. It
+    follows the rows through filter, merge, adopt and reindex.
     """
 
     def __init__(
@@ -41,10 +46,12 @@ class DSparkPPRelayInput(PPSpecRelayInput):
         *,
         has_chain: Optional[List[bool]] = None,
         alloc_state: Optional[DFlashDraftInputV2] = None,
+        verify_lens: Optional[torch.Tensor] = None,
     ):
         assert parents is None and top_scores is None, "a DSpark block is a chain"
         super().__init__(rids=rids, tokens=tokens)
         self.has_chain = [False] * len(rids) if has_chain is None else list(has_chain)
+        self.verify_lens = verify_lens
         # spec_prepare_for_decode calls prepare_for_decode on the DFlash family's
         # spec_info; the allocation it does is this object's.
         self.alloc_state = (
@@ -64,6 +71,8 @@ class DSparkPPRelayInput(PPSpecRelayInput):
     ) -> None:
         keep = new_indices_cpu if new_indices_cpu is not None else new_indices.tolist()
         self.has_chain = [self.has_chain[i] for i in keep]
+        if self.verify_lens is not None:
+            self.verify_lens = self.verify_lens[new_indices]
         super().filter_batch(new_indices, new_indices_cpu)
         # prepare_for_decode rebuilds it for the rows that run next.
         self.alloc_state.nxt_kv_lens_cpu = None
@@ -75,7 +84,12 @@ class DSparkPPRelayInput(PPSpecRelayInput):
         if not self.rids:
             self.rids, self.tokens = list(other.rids), other.tokens
             self.has_chain = list(other.has_chain)
+            self.verify_lens = other.verify_lens
             return
+        if self.verify_lens is not None or other.verify_lens is not None:
+            self.verify_lens = torch.cat(
+                [self._lens_or_whole(), other._lens_or_whole().to(self.tokens.device)]
+            )
         self.rids = self.rids + list(other.rids)
         self.tokens = torch.cat([self.tokens, other.tokens])
         self.has_chain = self.has_chain + list(other.has_chain)
@@ -94,6 +108,12 @@ class DSparkPPRelayInput(PPSpecRelayInput):
             [0 if r is None else r for r in rows], dtype=torch.long, device=device
         )
         keep = torch.tensor([r is None for r in rows], dtype=torch.bool, device=device)
+        if self.verify_lens is not None or relayed.verify_lens is not None:
+            theirs = relayed._lens_or_whole().to(device)[take]
+            if all(r is not None for r in rows):
+                self.verify_lens = None if relayed.verify_lens is None else theirs
+            else:
+                self.verify_lens = torch.where(keep, self._lens_or_whole(), theirs)
         self.tokens = torch.where(
             keep.unsqueeze(1), self.tokens, relayed.tokens.to(device)[take]
         )
@@ -111,6 +131,17 @@ class DSparkPPRelayInput(PPSpecRelayInput):
             tokens=self.tokens[take],
             has_chain=[self.has_chain[r] for r in rows],
             alloc_state=self.alloc_state,
+            verify_lens=None if self.verify_lens is None else self.verify_lens[take],
+        )
+
+    def _lens_or_whole(self) -> torch.Tensor:
+        if self.verify_lens is not None:
+            return self.verify_lens
+        return torch.full(
+            (len(self.rids),),
+            self.tokens.shape[1],
+            dtype=torch.int64,
+            device=self.tokens.device,
         )
 
     def runs_plain(self, batch: ScheduleBatch, *, verify_max_bs: int = 0) -> bool:
@@ -121,16 +152,20 @@ class DSparkPPRelayInput(PPSpecRelayInput):
         return verify_max_bs > 0 and len(self.rids) > verify_max_bs
 
     def verify_cutoff(self) -> Optional[torch.Tensor]:
-        """Per-row verify length when some row carries no chain: its zeros are not
-        drafts, so that row commits the bonus alone. None when every row has one."""
+        """Per-row verify length, or None when every row verifies its whole block. A
+        row without a chain commits the bonus alone (its zeros are not drafts); a row
+        with a scheduled length verifies that many rows of its block."""
         if all(self.has_chain):
-            return None
+            return self.verify_lens
         width = self.tokens.shape[1]
-        return torch.tensor(
+        chained = torch.tensor(
             [width if c else 1 for c in self.has_chain],
             dtype=torch.int64,
             device=self.tokens.device,
         )
+        if self.verify_lens is None:
+            return chained
+        return torch.minimum(self.verify_lens, chained)
 
 
 def clamp_window_to_context(
@@ -196,7 +231,9 @@ def prepare_plain_round(batch: ScheduleBatch, relay: DSparkPPRelayInput, runner_
     return plan
 
 
-def relay_verify_input(batch: ScheduleBatch, verify_ids_2d, verify_window, width: int):
+def relay_verify_input(
+    batch: ScheduleBatch, verify_ids_2d, verify_window, width: int, row_mask=None
+):
     """The verify input of a round, the same on every stage (the static verify of
     TargetVerifyExecutor.run_non_compact). Runs inside forward isolation."""
     batch.out_cache_loc = verify_window.verify_cache_loc
@@ -208,4 +245,5 @@ def relay_verify_input(batch: ScheduleBatch, verify_ids_2d, verify_window, width
         capture_hidden_mode=CaptureHiddenMode.FULL,
         live_seq_lens_cpu=batch.seq_lens_cpu,
         iteration_ids=verify_window.iteration_ids,
+        moe_row_mask=row_mask,
     )

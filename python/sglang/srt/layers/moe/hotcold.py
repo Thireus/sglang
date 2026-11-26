@@ -25,6 +25,11 @@ or counted per tier, both sit in the same CUDA graph, and the output is
 ``hot(x) + cold(x)`` with the router weights (the routed scaling factor fused in
 them, as the hot method asks). Both tiers clamp the SwiGLU at ``swiglu_limit``.
 
+A forward may carry a row mask (``ForwardBatch.moe_verify_row_mask``, the scheduled
+DSpark verify): a row whose mask is 0 has every route set to the padded route
+before the split, so both tiers skip it, the split groups none of its routes and
+its output is 0; the other rows keep their bits.
+
 Diagnostics (environ.py): ``SGLANG_DSV41_HOTCOLD_ZERO_COLD`` drops the cold
 tier's output; ``SGLANG_DSV41_HOTCOLD_VERIFY_LOAD`` arms ``arm_recheck`` after the
 loader's shard check, and the first eager forward of the layer (then every
@@ -48,6 +53,7 @@ from torch import nn
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.hotcold import ColdGGUFExperts
+from sglang.srt.model_executor.forward_context import current_moe_row_mask
 from sglang.srt.model_loader.hotcold_manifest import HotColdManifest
 
 logger = logging.getLogger(__name__)
@@ -160,6 +166,8 @@ class HotColdQuantMethod:
 class HotColdFusedMoE(nn.Module):
     supports_deferred_finalize = False
     supports_routed_deferred_finalize = False
+    # layers/moe/row_mask.py: a masked forward is handled here, at the route split.
+    masks_rows_in_route_split = True
 
     def __init__(
         self,
@@ -224,6 +232,17 @@ class HotColdFusedMoE(nn.Module):
             raise AttributeError(name)
         return getattr(hot, name)
 
+    def mask_rows(self, topk_ids: torch.Tensor, row_mask: torch.Tensor):
+        """``topk_ids`` with the padded route (-1) on every route of a row whose
+        ``row_mask`` ([T], 1 or 0) is 0, in topk_ids' dtype: what the split of a
+        masked forward reads, in any of its forms."""
+        if row_mask.shape[0] != topk_ids.shape[0]:
+            raise RuntimeError(
+                f"hot/cold layer {self.layer_id}: a row mask of "
+                f"{row_mask.shape[0]} rows for {topk_ids.shape[0]} routed rows"
+            )
+        return torch.where(row_mask.view(-1, 1) != 0, topk_ids, -1)
+
     def split_routes(self, topk_ids: torch.Tensor):
         """(hot_ids, cold_ids), each [T, top_k] in topk_ids' dtype (cold int32)."""
         if _split_kernel_serves(topk_ids) and envs.SGLANG_HOTCOLD_SPLIT_KERNEL.get():
@@ -282,6 +301,11 @@ class HotColdFusedMoE(nn.Module):
             )
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
+        row_mask = current_moe_row_mask()
+        if row_mask is not None:
+            # A scheduled DSpark verify: the rows it skips take the padded route, so
+            # the split below sends them to neither tier and groups none of them.
+            topk_ids = self.mask_rows(topk_ids, row_mask)
         # On a decode batch the split's launch also groups the cold routes for the
         # cold tier's multi-route kernel (SGLANG_HOTCOLD_DECODE_ALIGN); else the cold
         # tier aligns them itself. The same routes in every block's expert either way.

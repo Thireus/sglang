@@ -92,6 +92,21 @@ def pp_dspark_refusal(cfg: Any, hf_config: Any) -> Optional[str]:
     switch = envs.SGLANG_PP_DSPARK_SWITCH.get()
     if switch not in ("auto", "on", "off"):
         return f"SGLANG_PP_DSPARK_SWITCH must be auto, on or off, got {switch!r}"
+    survival = float(envs.SGLANG_PP_DSPARK_VERIFY_SURVIVAL.get() or 0.0)
+    if not 0.0 <= survival <= 1.0:
+        return f"SGLANG_PP_DSPARK_VERIFY_SURVIVAL is 0 (off) to 1, got {survival}"
+    if survival > 0.0 and envs.SGLANG_SIMULATE_ACC_LEN.get() > 0:
+        # A simulated length would commit rows the scheduled verify skipped.
+        return (
+            "SGLANG_PP_DSPARK_VERIFY_SURVIVAL does not run with SGLANG_SIMULATE_ACC_LEN"
+        )
+    if survival > 0.0 and envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
+        # The schedule reads the draft's trained confidence head, which that
+        # switch leaves out of the draft.
+        return (
+            "SGLANG_PP_DSPARK_VERIFY_SURVIVAL does not run with "
+            "SGLANG_DSPARK_USE_ONLINE_ESTIMATOR"
+        )
     return None
 
 

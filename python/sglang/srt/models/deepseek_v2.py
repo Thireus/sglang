@@ -121,6 +121,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.row_mask import mask_plain_routes
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -1286,6 +1287,8 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     **topk_kwargs,
                 )
+        # A scheduled DSpark verify: the rows it skips route to no expert.
+        topk_output = mask_plain_routes(self.experts, topk_output)
         # Issued after the router so the main chain stays on the main stream at replay.
         routed_pre_quant_input = pre_quant_input
         if should_quant_routed_input_mxfp8:
@@ -1475,6 +1478,8 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     **topk_kwargs,
                 )
+            # A scheduled DSpark verify: the rows it skips route to no expert.
+            topk_output = mask_plain_routes(self.experts, topk_output)
         else:
             pre_quant_input = None
             shared_output = None

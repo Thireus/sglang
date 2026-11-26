@@ -311,6 +311,7 @@ class TargetVerifyExecutor:
         verify_window: VerifyWindow,
         sampling_info,
         pp_proxy_tensors=None,
+        moe_row_mask: Optional[torch.Tensor] = None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -324,6 +325,7 @@ class TargetVerifyExecutor:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
             iteration_ids=verify_window.iteration_ids,
+            moe_row_mask=moe_row_mask,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
